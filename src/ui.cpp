@@ -30,7 +30,8 @@ static OscType synth_osc    = OscType::SQUARE;
 static int     synth_octave = 4;
 static bool    scale_snap   = false;
 
-static int tab_index = 0;  // 0 = grid, 1 = synth
+static int  tab_index = 0;  // 0 = grid, 1 = synth
+static bool seq_mode  = false;
 
 static const char* track_names[TRACKS] = {"k", "s", "h", "c"};
 
@@ -94,13 +95,15 @@ static Element render_grid_view() {
     lines.push_back(hbox({
         text("bitjams") | bold | color(COL_PURPLE),
         text(head_buf)         | color(COL_PURPLE),
+        text(seq_mode ? "  [seq]" : "  [step]") | color(COL_DIM),
     }));
 
     // step numbers
     {
         Elements row;
-        row.push_back(text("   ") | color(COL_DIM));
+        row.push_back(text("  ") | color(COL_DIM));
         for (int s = 0; s < STEPS; ++s) {
+            if (s == 9) row.push_back(text(" ") | color(COL_DIM));
             char buf[8];
             if (s < loop_len) std::snprintf(buf, sizeof(buf), " %2d", s + 1);
             else              std::snprintf(buf, sizeof(buf), "   ");
@@ -115,7 +118,7 @@ static Element render_grid_view() {
         row.push_back(text("   "));
         for (int s = 0; s < STEPS; ++s) {
             if (s == ps && is_playing)
-                row.push_back(text("  ▼") | color(COL_HEAD));
+                row.push_back(text(" ▼ ") | color(COL_HEAD));
             else
                 row.push_back(text("   "));
         }
@@ -127,20 +130,21 @@ static Element render_grid_view() {
         Elements row;
         row.push_back(text(std::string(track_names[t]) + "  ") | color(COL_PURPLE));
         for (int s = 0; s < STEPS; ++s) {
-            bool active  = grid[t][s];
-            bool is_cur  = (t == cursor_track && s == cursor_step);
-            bool in_loop = (s < loop_len);
+            bool active      = grid[t][s];
+            bool highlighted = t == cursor_track && (seq_mode
+                ? (s >= window_start && s < window_start + 8)
+                : (s == cursor_step));
+            bool in_loop     = (s < loop_len);
             if (!in_loop) {
-                row.push_back(text("  ·") | color(COL_DIM));
-            } else if (is_cur) {
-                row.push_back(text("  "));
-                row.push_back(text(active ? "■" : "·") | color(COL_PURPLE) | inverted);
+                row.push_back(text(" · ") | color(COL_DIM));
+            } else if (highlighted) {
+                row.push_back(text(active ? " ■ " : " · ") | color(COL_PURPLE) | inverted);
             } else if (active) {
-                Element e = text("  ■") | color(COL_BRIGHT);
+                Element e = text(" ■ ") | color(COL_BRIGHT);
                 if (s == ps && is_playing) e = e | bold;
                 row.push_back(e);
             } else {
-                row.push_back(text("  ·") | color(COL_DIM));
+                row.push_back(text(" · ") | color(COL_DIM));
             }
         }
         lines.push_back(hbox(std::move(row)));
@@ -148,9 +152,15 @@ static Element render_grid_view() {
 
     // blank + help bar
     lines.push_back(text(""));
-    lines.push_back(text("  spc:toggle  1-4:fill interval  arrows:move"
-                         "  p:play  +/-:bpm  [/]:steps  c:clear  tab:synth  q:quit")
-                    | color(COL_DIM));
+    if (seq_mode) {
+        lines.push_back(text("  1-8:toggle step  arrows:move  p:play  +/-:bpm  [/]:steps"
+                             "  c:clear row  C:clear all  s:step mode  tab:synth  q:quit")
+                        | color(COL_DIM));
+    } else {
+        lines.push_back(text("  spc:toggle step  1-9:fill interval  arrows:move  p:play  +/-:bpm  [/]:steps"
+                             "  c:clear row  C:clear all  s:seq mode  tab:synth  q:quit")
+                        | color(COL_DIM));
+    }
 
     return vbox(std::move(lines));
 }
@@ -238,7 +248,7 @@ static Element render_synth_view() {
     lines.push_back(text(""));
 
     // help bar
-    lines.push_back(text("  z:oct▼  x:oct▲  n:scale  ↑↓:osc  p:play  +/-:bpm  [/]:steps  tab:grid  q:quit")
+    lines.push_back(text("  z:oct▼  x:oct▲  n:scale  ↑↓:osc  spc:play  +/-:bpm  [/]:steps  tab:grid  q:quit")
                     | color(COL_DIM));
 
     // extra blank to match grid view height
@@ -327,22 +337,40 @@ Component build_ui(ScreenInteractive& screen) {
                 }
             }
         } else {
-            // grid mode
-            if (e == Event::ArrowUp)    { cursor_track = (cursor_track - 1 + TRACKS) % TRACKS; return true; }
-            if (e == Event::ArrowDown)  { cursor_track = (cursor_track + 1) % TRACKS; return true; }
-            if (e == Event::ArrowLeft)  { cursor_step  = (cursor_step  - 1 + STEPS)  % STEPS;  return true; }
-            if (e == Event::ArrowRight) { cursor_step  = (cursor_step  + 1) % STEPS;           return true; }
-            if (e == Event::Character(' ')) {
-                grid[cursor_track][cursor_step] = !grid[cursor_track][cursor_step];
+            // grid mode — shared keyboard
+            if (e == Event::ArrowUp)   { cursor_track = (cursor_track - 1 + TRACKS) % TRACKS; return true; }
+            if (e == Event::ArrowDown) { cursor_track = (cursor_track + 1) % TRACKS; return true; }
+            if (e == Event::Character('s')) { seq_mode = !seq_mode; return true; }
+            if (e == Event::Character('c')) {
+                std::memset(grid[cursor_track], 0, sizeof(grid[cursor_track]));
                 return true;
             }
-            if (e == Event::Character('1')) { fill_pattern(1); return true; }
-            if (e == Event::Character('2')) { fill_pattern(2); return true; }
-            if (e == Event::Character('3')) { fill_pattern(3); return true; }
-            if (e == Event::Character('4')) { fill_pattern(4); return true; }
-            if (e == Event::Character('c') || e == Event::Character('C')) {
+            if (e == Event::Character('C')) {
                 std::memset(grid, 0, sizeof(grid));
                 return true;
+            }
+
+            if (seq_mode) {
+                // sequencer sub-mode: 8-step window, 1-8 toggle steps
+                if (e == Event::ArrowLeft)  { window_start = (window_start - 8 + 16) % 16; return true; }
+                if (e == Event::ArrowRight) { window_start = (window_start + 8) % 16;      return true; }
+                if (e.is_character() && e.character().size() == 1) {
+                    char c = e.character()[0];
+                    if (c >= '1' && c <= '8') {
+                        int s = window_start + (c - '1');
+                        grid[cursor_track][s] = !grid[cursor_track][s];
+                        return true;
+                    }
+                }
+            } else {
+                // step sub-mode: cursor moves ±1, space toggles step, 1-9 fills
+                if (e == Event::ArrowLeft)  { cursor_step = (cursor_step - 1 + STEPS) % STEPS; return true; }
+                if (e == Event::ArrowRight) { cursor_step = (cursor_step + 1) % STEPS;          return true; }
+                if (e == Event::Character(' ')) { grid[cursor_track][cursor_step] = !grid[cursor_track][cursor_step]; return true; }
+                if (e.is_character() && e.character().size() == 1) {
+                    char c = e.character()[0];
+                    if (c >= '1' && c <= '9') { fill_pattern(c - '0', cursor_step); return true; }
+                }
             }
         }
 

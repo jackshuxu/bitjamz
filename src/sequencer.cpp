@@ -13,6 +13,7 @@ std::atomic<bool> trig[TRACKS] = {};
 
 int cursor_track = 0;
 int cursor_step  = 0;
+int window_start = 0;
 int bpm          = 120;
 int loop_len     = 16;
 
@@ -54,8 +55,8 @@ bool in_pentatonic(int st) {
 
 //fill helpers
 
-void fill_pattern(int interval) {
-    for (int s = cursor_step; s < loop_len; s += interval)
+void fill_pattern(int interval, int start) {
+    for (int s = start; s < loop_len; s += interval)
         grid[cursor_track][s] = true;
 }
 

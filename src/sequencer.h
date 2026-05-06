@@ -17,6 +17,7 @@ extern std::atomic<bool> trig[TRACKS];
 // UI-mutable sequencer parameters
 extern int cursor_track;
 extern int cursor_step;
+extern int window_start;
 extern int bpm;
 extern int loop_len;
 
@@ -27,7 +28,7 @@ int   key_to_semitone(char c);
 bool  in_pentatonic(int st);
 
 // pattern fill
-void fill_pattern(int interval);
+void fill_pattern(int interval, int start);
 
 // timing thread entry point
 void timing_thread();
