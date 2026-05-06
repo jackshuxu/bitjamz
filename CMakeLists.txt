@@ -4,18 +4,34 @@ project(bitjams CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_executable(bitjams src/main.cpp)
+include(FetchContent)
+FetchContent_Declare(ftxui
+    GIT_REPOSITORY https://github.com/ArthurSonzogni/FTXUI.git
+    GIT_TAG        v6.1.9
+)
+FetchContent_MakeAvailable(ftxui)
+
+add_executable(bitjams
+    src/main.cpp
+    src/audio.cpp
+    src/sequencer.cpp
+    src/ui.cpp
+)
 
 target_include_directories(bitjams PRIVATE include)
 
+target_link_libraries(bitjams PRIVATE
+    ftxui::component  # transitively pulls in ftxui::dom and ftxui::screen
+)
+
 if(APPLE)
-    target_link_libraries(bitjams
+    target_link_libraries(bitjams PRIVATE
         "-framework CoreAudio"
         "-framework AudioToolbox"
         "-framework CoreFoundation"
     )
 elseif(UNIX)
-    target_link_libraries(bitjams pthread dl m)
+    target_link_libraries(bitjams PRIVATE pthread dl m)
 endif()
 
 target_compile_options(bitjams PRIVATE -O2)
