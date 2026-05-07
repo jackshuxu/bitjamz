@@ -217,12 +217,13 @@ static float render_synth_voice(int idx) {
 
 //audio callback
 
-void audio_callback(ma_device* /*dev*/, void* out, const void* /*in*/, ma_uint32 frames) {
+void audio_callback(ma_device* dev, void* out, const void* /*in*/, ma_uint32 frames) {
     float* buf = (float*)out;
+    SessionState* state = static_cast<SessionState*>(dev->pUserData);
 
     // sequencer fires: dispatch per track type
     for (int t = 0; t < TRACKS; ++t) {
-        if (!trig[t].exchange(false)) continue;
+        if (!state->trig[t].exchange(false)) continue;
         const TrackDef& td = TRACK_DEFS[t];
         if (td.type == TrackType::DRUM) {
             switch (td.drum_kind) {
@@ -237,7 +238,7 @@ void audio_callback(ma_device* /*dev*/, void* out, const void* /*in*/, ma_uint32
             }
         } else {
             // TODO: piano roll - per-step pitch + velocity
-            trigger_synth(td.melodic_idx, track_root_hz[t]);
+            trigger_synth(td.melodic_idx, state->track_root_hz[t]);
         }
     }
 

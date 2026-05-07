@@ -1,36 +1,31 @@
 #include "ui.h"
 
-#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
-#include <string>
-#include <vector>
-
-#include <ftxui/dom/elements.hpp>
+#include <memory>
+#include <thread>
 
 #include "audio.h"
 #include "sequencer.h"
 
-using namespace ftxui;
-
 void session() {
-    SessionState state;
+    auto state = std::make_shared<SessionState>();
+
     // default pattern on the drum tracks (matches the MPC layout)
-    // track 0 = kick  (v): quarter notes
-    // track 1 = snare (b): backbeat
-    // track 3 = chat  (m): eighth notes
     static const bool kick_row[STEPS]  = {1,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0};
     static const bool snare_row[STEPS] = {0,0,1,0,0,0,1,0,0,0,1,0,0,0,1,0};
     static const bool chat_row[STEPS]  = {1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0};
-    std::memcpy(state.grid[0], kick_row,  sizeof(kick_row));
-    std::memcpy(state.grid[1], snare_row, sizeof(snare_row));
-    std::memcpy(state.grid[3], chat_row,  sizeof(chat_row));
+    std::memcpy(state->grid[0], kick_row,  sizeof(kick_row));
+    std::memcpy(state->grid[1], snare_row, sizeof(snare_row));
+    std::memcpy(state->grid[3], chat_row,  sizeof(chat_row));
 
     ma_device_config cfg = ma_device_config_init(ma_device_type_playback);
     cfg.playback.format   = ma_format_f32;
     cfg.playback.channels = 2;
     cfg.sampleRate        = SAMPLE_RATE;
     cfg.dataCallback      = audio_callback;
+    cfg.pUserData         = state.get();
 
     ma_device dev;
     if (ma_device_init(nullptr, &cfg, &dev) != MA_SUCCESS) {
@@ -39,21 +34,21 @@ void session() {
     }
     ma_device_start(&dev);
 
-    std::thread timer(timing_thread);
+    std::thread timer(timing_thread, std::ref(*state));
 
     auto screen = ftxui::ScreenInteractive::Fullscreen();
     screen.TrackMouse(false);
 
-    std::thread refresher([&screen, &state] {
-        while (state.running.load()) {
+    std::thread refresher([&screen, state] {
+        while (state->running.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(33));
             screen.PostEvent(ftxui::Event::Custom);
         }
     });
 
-    screen.Loop(build_ui(screen));
+    screen.Loop(build_ui(screen, *state));
 
-    state.running.store(false);
+    state->running.store(false);
 
     refresher.join();
     timer.join();

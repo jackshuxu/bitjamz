@@ -13,13 +13,10 @@ int loop_len     = 16;
 // note_to_freq(0) = 440 * 2^(-9/12) = 261.6256 Hz = C4
 static const float C4_HZ = 440.f * std::pow(2.f, -9.f / 12.f);
 
-struct RootInit {
-    RootInit() {
-        for (int t = 0; t < TRACKS; ++t)
-            if (TRACK_DEFS[t].type == TrackType::MELODIC) track_root_hz[t] = C4_HZ;
-    }
-};
-static RootInit _root_init;
+SessionState::SessionState() {
+    for (int t = 0; t < TRACKS; ++t)
+        if (TRACK_DEFS[t].type == TrackType::MELODIC) track_root_hz[t] = C4_HZ;
+}
 
 //music helpers
 
@@ -62,23 +59,23 @@ int track_for_mpc_key(char c) {
     return -1;
 }
 
-void fill_pattern(int interval, int start) {
-    for (int s = start; s < loop_len; s += interval)
-        grid[cursor_track][s] = true;
+void fill_pattern(SessionState& s, int interval, int start) {
+    for (int step = start; step < loop_len; step += interval)
+        s.grid[cursor_track][step] = true;
 }
 
 //timing thread: sequencer clock
 
-void timing_thread() {
+void timing_thread(SessionState& s) {
     using clk = std::chrono::steady_clock;
     auto next = clk::now();
-    while (running.load()) {
-        next += std::chrono::microseconds((int)(60'000'000.0 / bpm / 4));
+    while (s.running.load()) {
+        next += std::chrono::microseconds((int)(60'000'000.0 / s.bpm / 4));
         std::this_thread::sleep_until(next);
-        if (!playing.load()) continue;
-        int s = play_step.load();
+        if (!s.playing.load()) continue;
+        int step = s.play_step.load();
         for (int t = 0; t < TRACKS; ++t)
-            if (track_active[t] && grid[t][s]) trig[t].store(true);
-        play_step.store((s + 1) % loop_len);
+            if (s.track_active[t] && s.grid[t][step]) s.trig[t].store(true);
+        s.play_step.store((step + 1) % loop_len);
     }
 }

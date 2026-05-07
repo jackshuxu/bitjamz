@@ -37,34 +37,34 @@ static bool     seq_mode  = false; // GRID sub-mode: 8-step window
 
 //helpers
 
-static int count_active_tracks() {
+static int count_active_tracks(SessionState& s) {
     int c = 0;
-    for (int t = 0; t < TRACKS; ++t) if (track_active[t]) ++c;
+    for (int t = 0; t < TRACKS; ++t) if (s.track_active[t]) ++c;
     return c;
 }
 
-static void cycle_cursor_to_active(int dir) {
-    if (count_active_tracks() == 0) return;
+static void cycle_cursor_to_active(SessionState& s, int dir) {
+    if (count_active_tracks(s) == 0) return;
     int t = cursor_track;
     for (int i = 0; i < TRACKS; ++i) {
         t = (t + dir + TRACKS) % TRACKS;
-        if (track_active[t]) { cursor_track = t; return; }
+        if (s.track_active[t]) { cursor_track = t; return; }
     }
 }
 
-static void ensure_cursor_visible() {
-    if (track_active[cursor_track]) return;
-    cycle_cursor_to_active(+1);
+static void ensure_cursor_visible(SessionState& s) {
+    if (s.track_active[cursor_track]) return;
+    cycle_cursor_to_active(s, +1);
 }
 
 // activate the next inactive track (wrapping); set cursor on it.
-static void show_next_hidden() {
+static void show_next_hidden(SessionState& s) {
     int start = (cursor_track + 1) % TRACKS;
     int t     = start;
     do {
-        if (!track_active[t]) {
-            track_active[t] = true;
-            cursor_track    = t;
+        if (!s.track_active[t]) {
+            s.track_active[t] = true;
+            cursor_track      = t;
             return;
         }
         t = (t + 1) % TRACKS;
@@ -72,10 +72,10 @@ static void show_next_hidden() {
 }
 
 // hide cursor track, then move cursor to next visible (skip if only one visible)
-static void hide_cursor_track() {
-    if (count_active_tracks() <= 1) return;
-    track_active[cursor_track] = false;
-    cycle_cursor_to_active(+1);
+static void hide_cursor_track(SessionState& s) {
+    if (count_active_tracks(s) <= 1) return;
+    s.track_active[cursor_track] = false;
+    cycle_cursor_to_active(s, +1);
 }
 
 //stereometer
@@ -140,9 +140,9 @@ static Element render_track_title(int t, bool focused) {
     return e;
 }
 
-static Element render_grid_view() {
-    int  ps         = play_step.load();
-    bool is_playing = playing.load();
+static Element render_grid_view(SessionState& s) {
+    int  ps         = s.play_step.load();
+    bool is_playing = s.playing.load();
 
     Elements lines;
 
@@ -154,7 +154,7 @@ static Element render_grid_view() {
             (seq_mode                          ) ? "  [seq]"   :
                                                    "  [step]";
         std::snprintf(head_buf, sizeof(head_buf), "  bpm: %d  steps: %d  %s",
-                      bpm, loop_len, is_playing ? "▶" : "■");
+                      s.bpm, loop_len, is_playing ? "▶" : "■");
         lines.push_back(hbox({
             text("bitjams") | bold | color(COL_PURPLE),
             text(head_buf)         | color(COL_PURPLE),
@@ -166,11 +166,11 @@ static Element render_grid_view() {
     {
         Elements row;
         row.push_back(text(TITLE_PAD) | color(COL_DIM));
-        for (int s = 0; s < STEPS; ++s) {
-            if (s == 9) row.push_back(text(" ") | color(COL_DIM));
+        for (int step = 0; step < STEPS; ++step) {
+            if (step == 9) row.push_back(text(" ") | color(COL_DIM));
             char buf[8];
-            if (s < loop_len) std::snprintf(buf, sizeof(buf), " %2d", s + 1);
-            else              std::snprintf(buf, sizeof(buf), "   ");
+            if (step < loop_len) std::snprintf(buf, sizeof(buf), " %2d", step + 1);
+            else                 std::snprintf(buf, sizeof(buf), "   ");
             row.push_back(text(buf) | color(COL_DIM));
         }
         lines.push_back(hbox(std::move(row)));
@@ -180,8 +180,8 @@ static Element render_grid_view() {
     {
         Elements row;
         row.push_back(text(std::string(TITLE_COL_WIDTH, ' ')));
-        for (int s = 0; s < STEPS; ++s) {
-            if (s == ps && is_playing)
+        for (int step = 0; step < STEPS; ++step) {
+            if (step == ps && is_playing)
                 row.push_back(text(" ▼ ") | color(COL_HEAD));
             else
                 row.push_back(text("   "));
@@ -195,21 +195,21 @@ static Element render_grid_view() {
         bool title_focused = (nav_state == NavState::TITLE_FOCUS) && (t == cursor_track);
         Elements row;
         row.push_back(render_track_title(t, title_focused));
-        for (int s = 0; s < STEPS; ++s) {
-            bool active      = grid[t][s];
+        for (int step = 0; step < STEPS; ++step) {
+            bool active      = s.grid[t][step];
             bool highlighted = (nav_state == NavState::GRID)
                             && (t == cursor_track)
                             && (seq_mode
-                                ? (s >= window_start && s < window_start + 8)
-                                : (s == cursor_step));
-            bool in_loop     = (s < loop_len);
+                                ? (step >= window_start && step < window_start + 8)
+                                : (step == cursor_step));
+            bool in_loop     = (step < loop_len);
             if (!in_loop) {
                 row.push_back(text(" · ") | color(COL_DIM));
             } else if (highlighted) {
                 row.push_back(text(active ? " ■ " : " · ") | color(COL_PURPLE) | inverted);
             } else if (active) {
                 Element e = text(" ■ ") | color(COL_BRIGHT);
-                if (s == ps && is_playing) e = e | bold;
+                if (step == ps && is_playing) e = e | bold;
                 row.push_back(e);
             } else {
                 row.push_back(text(" · ") | color(COL_DIM));
@@ -219,7 +219,7 @@ static Element render_grid_view() {
     };
 
     for (int t = 0; t < TRACKS; ++t)
-        if (track_active[t]) lines.push_back(render_track_row(t));
+        if (s.track_active[t]) lines.push_back(render_track_row(t));
 
     // help bar
     lines.push_back(text(""));
@@ -242,7 +242,7 @@ static Element render_grid_view() {
 
 //synth page (drum, display only)
 
-static Element render_drum_synth_page(int t) {
+static Element render_drum_synth_page(SessionState& s, int t) {
     const TrackDef& td = TRACK_DEFS[t];
     const DrumParams& p = DRUM_PARAMS[td.drum_kind];
 
@@ -250,7 +250,7 @@ static Element render_drum_synth_page(int t) {
 
     char head_buf[80];
     std::snprintf(head_buf, sizeof(head_buf), "  bpm: %d  steps: %d  %s  ",
-                  bpm, loop_len, playing.load() ? "▶" : "■");
+                  s.bpm, loop_len, s.playing.load() ? "▶" : "■");
     lines.push_back(hbox({
         text("bitjams") | bold | color(COL_PURPLE),
         text(head_buf)         | color(COL_PURPLE),
@@ -301,15 +301,15 @@ static Element draw_key_el(const char* label, int semitone) {
     return text(std::string("[") + label + "]") | color(key_col(semitone));
 }
 
-static Element render_melodic_synth_page(int t) {
+static Element render_melodic_synth_page(SessionState& s, int t) {
     const TrackDef& td = TRACK_DEFS[t];
-    bool is_playing = playing.load();
+    bool is_playing = s.playing.load();
 
     Elements lines;
 
     char head_buf[80];
     std::snprintf(head_buf, sizeof(head_buf), "  bpm: %d  steps: %d  %s  ",
-                  bpm, loop_len, is_playing ? "▶" : "■");
+                  s.bpm, loop_len, is_playing ? "▶" : "■");
     lines.push_back(hbox({
         text("bitjams")           | bold | color(COL_PURPLE),
         text(head_buf)                   | color(COL_PURPLE),
@@ -380,7 +380,7 @@ static Element render_melodic_synth_page(int t) {
 
 //input handling
 
-static void play_synth_key_for_track(int t, int semitone) {
+static void play_synth_key_for_tra ck(int t, int semitone) {
     if (TRACK_DEFS[t].type != TrackType::MELODIC) return;
     int abs_st = (synth_octave - 4) * 12 + semitone;
     if (scale_snap) abs_st = snap_pentatonic(abs_st);
@@ -388,25 +388,25 @@ static void play_synth_key_for_track(int t, int semitone) {
 }
 
 // trigger from MPC pad: fire the track's voice at its root pitch (or drum).
-static void trigger_track_live(int t) {
-    if (!track_active[t]) return;
+static void trigger_track_live(SessionState& s, int t) {
+    if (!s.track_active[t]) return;
     if (TRACK_DEFS[t].type == TrackType::MELODIC) {
-        synth_trig_freq[TRACK_DEFS[t].melodic_idx].store(track_root_hz[t]);
+        synth_trig_freq[TRACK_DEFS[t].melodic_idx].store(s.track_root_hz[t]);
     } else {
-        trig[t].store(true);
+        s.trig[t].store(true);
     }
 }
 
-Component build_ui(ScreenInteractive& screen) {
-    auto root = Renderer([] {
+Component build_ui(ScreenInteractive& screen, SessionState& state) {
+    auto root = Renderer([&state] {
         Element page;
         if (nav_state == NavState::SYNTH_PAGE) {
-            ensure_cursor_visible();
+            ensure_cursor_visible(state);
             page = (TRACK_DEFS[cursor_track].type == TrackType::MELODIC)
-                 ? render_melodic_synth_page(cursor_track)
-                 : render_drum_synth_page(cursor_track);
+                 ? render_melodic_synth_page(state, cursor_track)
+                 : render_drum_synth_page(state, cursor_track);
         } else {
-            page = render_grid_view();
+            page = render_grid_view(state);
         }
         return vbox({
             render_visualizer(),
@@ -414,25 +414,25 @@ Component build_ui(ScreenInteractive& screen) {
         });
     });
 
-    auto with_events = CatchEvent(root, [&screen](Event e) -> bool {
+    auto with_events = CatchEvent(root, [&screen, &state](Event e) -> bool {
         // global quit
         if (e == Event::Character('q') || e == Event::Character('Q')) {
-            running.store(false);
+            state.running.store(false);
             screen.Exit();
             return true;
         }
 
         // global play / bpm / loop_len
         if (e == Event::Character('p') || e == Event::Character('P')) {
-            playing.store(!playing.load());
-            if (!playing.load()) play_step.store(0);
+            state.playing.store(!state.playing.load());
+            if (!state.playing.load()) state.play_step.store(0);
             return true;
         }
         if (e == Event::Character('+') || e == Event::Character('=')) {
-            bpm = std::min(300, bpm + 5); return true;
+            state.bpm = std::min(300, state.bpm + 5); return true;
         }
         if (e == Event::Character('-')) {
-            bpm = std::max(40, bpm - 5); return true;
+            state.bpm = std::max(40, state.bpm - 5); return true;
         }
         if (e == Event::Character(']')) {
             loop_len = std::min(16, loop_len + 1); return true;
@@ -463,7 +463,7 @@ Component build_ui(ScreenInteractive& screen) {
                 if (e.is_character() && e.character().size() == 1) {
                     char c = e.character()[0];
                     int st = key_to_semitone(c);
-                    if (st >= 0) { play_synth_key_for_track(cursor_track, st); return true; }
+                    if (st >= 0) { play_synth_key_for_track(state, cursor_track, st); return true; }
                     if (c == 'z') { synth_octave = std::max(1, synth_octave - 1); return true; }
                     if (c == 'x') { synth_octave = std::min(7, synth_octave + 1); return true; }
                     if (c == 'n') { scale_snap = !scale_snap; return true; }
@@ -473,7 +473,7 @@ Component build_ui(ScreenInteractive& screen) {
                 // audition any track without leaving the page
                 if (e.is_character() && e.character().size() == 1) {
                     int t = track_for_mpc_key(e.character()[0]);
-                    if (t >= 0) { trigger_track_live(t); return true; }
+                    if (t >= 0) { trigger_track_live(state, t); return true; }
                 }
             }
             return false;
@@ -489,19 +489,19 @@ Component build_ui(ScreenInteractive& screen) {
                 nav_state = NavState::SYNTH_PAGE;
                 return true;
             }
-            if (e == Event::ArrowUp)   { cycle_cursor_to_active(-1); return true; }
-            if (e == Event::ArrowDown) { cycle_cursor_to_active(+1); return true; }
+            if (e == Event::ArrowUp)   { cycle_cursor_to_active(state, -1); return true; }
+            if (e == Event::ArrowDown) { cycle_cursor_to_active(state, +1); return true; }
             // MPC keys still trigger (no focus move; user is navigating)
             if (e.is_character() && e.character().size() == 1) {
                 int t = track_for_mpc_key(e.character()[0]);
-                if (t >= 0) { trigger_track_live(t); return true; }
+                if (t >= 0) { trigger_track_live(state, t); return true; }
             }
             return false;
         }
 
         // ---- GRID (default) ----
         if (e == Event::Tab) {
-            ensure_cursor_visible();
+            ensure_cursor_visible(state);
             nav_state = NavState::TITLE_FOCUS;
             return true;
         }
@@ -510,28 +510,28 @@ Component build_ui(ScreenInteractive& screen) {
         if (e.is_character() && e.character().size() == 1) {
             char c = e.character()[0];
             int t = track_for_mpc_key(c);
-            if (t >= 0 && track_active[t]) {
-                trigger_track_live(t);
+            if (t >= 0 && state.track_active[t]) {
+                trigger_track_live(state, t);
                 cursor_track = t;
                 return true;
             }
         }
 
         // show/hide
-        if (e == Event::Character('a')) { show_next_hidden(); return true; }
-        if (e == Event::Character('d')) { hide_cursor_track(); return true; }
+        if (e == Event::Character('a')) { show_next_hidden(state); return true; }
+        if (e == Event::Character('d')) { hide_cursor_track(state); return true; }
 
         // track navigation (cycles only visible tracks)
-        if (e == Event::ArrowUp)   { cycle_cursor_to_active(-1); return true; }
-        if (e == Event::ArrowDown) { cycle_cursor_to_active(+1); return true; }
+        if (e == Event::ArrowUp)   { cycle_cursor_to_active(state, -1); return true; }
+        if (e == Event::ArrowDown) { cycle_cursor_to_active(state, +1); return true; }
 
         if (e == Event::Character('s')) { seq_mode = !seq_mode; return true; }
         if (e == Event::Character('c')) {
-            std::memset(grid[cursor_track], 0, sizeof(grid[cursor_track]));
+            std::memset(state.grid[cursor_track], 0, sizeof(state.grid[cursor_track]));
             return true;
         }
         if (e == Event::Character('C')) {
-            std::memset(grid, 0, sizeof(grid));
+            std::memset(state.grid, 0, sizeof(state.grid));
             return true;
         }
 
@@ -541,8 +541,8 @@ Component build_ui(ScreenInteractive& screen) {
             if (e.is_character() && e.character().size() == 1) {
                 char c = e.character()[0];
                 if (c >= '1' && c <= '8') {
-                    int s = window_start + (c - '1');
-                    grid[cursor_track][s] = !grid[cursor_track][s];
+                    int step = window_start + (c - '1');
+                    state.grid[cursor_track][step] = !state.grid[cursor_track][step];
                     return true;
                 }
             }
@@ -550,12 +550,12 @@ Component build_ui(ScreenInteractive& screen) {
             if (e == Event::ArrowLeft)  { cursor_step = (cursor_step - 1 + STEPS) % STEPS; return true; }
             if (e == Event::ArrowRight) { cursor_step = (cursor_step + 1) % STEPS;          return true; }
             if (e == Event::Character(' ')) {
-                grid[cursor_track][cursor_step] = !grid[cursor_track][cursor_step];
+                state.grid[cursor_track][cursor_step] = !state.grid[cursor_track][cursor_step];
                 return true;
             }
             if (e.is_character() && e.character().size() == 1) {
                 char c = e.character()[0];
-                if (c >= '1' && c <= '9') { fill_pattern(c - '0', cursor_step); return true; }
+                if (c >= '1' && c <= '9') { fill_pattern(state, c - '0', cursor_step); return true; }
             }
         }
 
