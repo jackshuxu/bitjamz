@@ -4,43 +4,10 @@
 #include <cmath>
 #include <thread>
 
-// MPC pad layout: core kit on top, extended drums, melodic on bottom.
-const TrackDef TRACK_DEFS[TRACKS] = {
-    // core drums: v b n m
-    { "kick",  'v', TrackType::DRUM, DK_KICK,       -1 },
-    { "snare", 'b', TrackType::DRUM, DK_SNARE,      -1 },
-    { "clap",  'n', TrackType::DRUM, DK_CLAP,       -1 },
-    { "chat",  'm', TrackType::DRUM, DK_CLOSED_HAT, -1 },
-    // extended drums: f g h j
-    { "ohat",  'f', TrackType::DRUM, DK_OPEN_HAT,   -1 },
-    { "cowb",  'g', TrackType::DRUM, DK_COWBELL,    -1 },
-    { "tom",   'h', TrackType::DRUM, DK_TOM,        -1 },
-    { "cymb",  'j', TrackType::DRUM, DK_CYMBAL,     -1 },
-    // melodic: r t y u
-    { "lead",  'r', TrackType::MELODIC, -1, 0 },
-    { "bass",  't', TrackType::MELODIC, -1, 1 },
-    { "chord", 'y', TrackType::MELODIC, -1, 2 },
-    { "drone", 'u', TrackType::MELODIC, -1, 3 },
-};
-
-bool              grid[TRACKS][STEPS] = {};
-bool              track_active[TRACKS] = {
-    true, true, true, true,
-    true, true, true, true,
-    true, true, true, true,
-};
-float             track_root_hz[TRACKS] = {};
-
-std::atomic<int>  play_step{0};
-std::atomic<bool> running{true};
-std::atomic<bool> playing{true};
-
-std::atomic<bool> trig[TRACKS] = {};
 
 int cursor_track = 0;
 int cursor_step  = 0;
 int window_start = 0;
-int bpm          = 120;
 int loop_len     = 16;
 
 // note_to_freq(0) = 440 * 2^(-9/12) = 261.6256 Hz = C4
