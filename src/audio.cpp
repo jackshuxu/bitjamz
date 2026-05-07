@@ -4,7 +4,7 @@
 #include <cmath>
 #include <cstdint>
 
-#include "sequencer.h"
+#include "session.h"
 
 StereoSample     vis_buf[VIS_BUF];
 std::atomic<int> vis_wp{0};

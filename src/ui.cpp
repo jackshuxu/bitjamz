@@ -1,6 +1,7 @@
 #include "ui.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -9,9 +10,63 @@
 #include <ftxui/dom/elements.hpp>
 
 #include "audio.h"
-#include "sequencer.h"
+#include "session.h"
 
 using namespace ftxui;
+
+// ---- ui-local cursor + nav state -------------------------------------------
+
+static int cursor_track = 0;
+static int cursor_step  = 0;
+static int window_start = 0;
+
+// ---- ui-local music helpers (only the piano keyboard page uses these) ------
+
+// semitone offset from C4 -> Hz  (0=C4~261.6, 9=A4=440)
+static float note_to_freq(int st) {
+    return 440.f * std::pow(2.f, (st - 9.f) / 12.f);
+}
+
+static const int PENTA_MAP[12] = {0,0,3,3,3,5,5,7,7,10,10,10};
+static int snap_pentatonic(int semitone) {
+    int oct = semitone / 12;
+    int s   = semitone % 12;
+    if (s < 0) { s += 12; --oct; }
+    return oct * 12 + PENTA_MAP[s];
+}
+
+// piano-keyboard key -> semitone offset from C in current octave (0..14), or -1
+static int key_to_semitone(char c) {
+    switch (c) {
+        case 'a': return 0;   case 'w': return 1;
+        case 's': return 2;   case 'e': return 3;
+        case 'd': return 4;   case 'f': return 5;
+        case 't': return 6;   case 'g': return 7;
+        case 'y': return 8;   case 'h': return 9;
+        case 'u': return 10;  case 'j': return 11;
+        case 'k': return 12;  case 'o': return 13;
+        case 'l': return 14;
+        default:  return -1;
+    }
+}
+
+static bool in_pentatonic(int st) {
+    int s = ((st % 12) + 12) % 12;
+    return s==0 || s==3 || s==5 || s==7 || s==10;
+}
+
+// MPC key -> track index (0..TRACKS-1) or -1
+static int track_for_mpc_key(char c) {
+    for (int t = 0; t < TRACKS; ++t)
+        if (TRACK_DEFS[t].key == c) return t;
+    return -1;
+}
+
+// pattern fill: stamp every Nth step on the cursor's track
+static void fill_pattern(SessionState& s, int interval, int start) {
+    for (int step = start; step < s.loop_len; step += interval)
+        s.grid[cursor_track][step] = true;
+}
 
 //color palette
 
@@ -154,7 +209,7 @@ static Element render_grid_view(SessionState& s) {
             (seq_mode                          ) ? "  [seq]"   :
                                                    "  [step]";
         std::snprintf(head_buf, sizeof(head_buf), "  bpm: %d  steps: %d  %s",
-                      s.bpm, loop_len, is_playing ? "▶" : "■");
+                      s.bpm, s.loop_len, is_playing ? "▶" : "■");
         lines.push_back(hbox({
             text("bitjams") | bold | color(COL_PURPLE),
             text(head_buf)         | color(COL_PURPLE),
@@ -169,8 +224,8 @@ static Element render_grid_view(SessionState& s) {
         for (int step = 0; step < STEPS; ++step) {
             if (step == 9) row.push_back(text(" ") | color(COL_DIM));
             char buf[8];
-            if (step < loop_len) std::snprintf(buf, sizeof(buf), " %2d", step + 1);
-            else                 std::snprintf(buf, sizeof(buf), "   ");
+            if (step < s.loop_len) std::snprintf(buf, sizeof(buf), " %2d", step + 1);
+            else                   std::snprintf(buf, sizeof(buf), "   ");
             row.push_back(text(buf) | color(COL_DIM));
         }
         lines.push_back(hbox(std::move(row)));
@@ -202,7 +257,7 @@ static Element render_grid_view(SessionState& s) {
                             && (seq_mode
                                 ? (step >= window_start && step < window_start + 8)
                                 : (step == cursor_step));
-            bool in_loop     = (step < loop_len);
+            bool in_loop     = (step < s.loop_len);
             if (!in_loop) {
                 row.push_back(text(" · ") | color(COL_DIM));
             } else if (highlighted) {
@@ -250,7 +305,7 @@ static Element render_drum_synth_page(SessionState& s, int t) {
 
     char head_buf[80];
     std::snprintf(head_buf, sizeof(head_buf), "  bpm: %d  steps: %d  %s  ",
-                  s.bpm, loop_len, s.playing.load() ? "▶" : "■");
+                  s.bpm, s.loop_len, s.playing.load() ? "▶" : "■");
     lines.push_back(hbox({
         text("bitjams") | bold | color(COL_PURPLE),
         text(head_buf)         | color(COL_PURPLE),
@@ -309,7 +364,7 @@ static Element render_melodic_synth_page(SessionState& s, int t) {
 
     char head_buf[80];
     std::snprintf(head_buf, sizeof(head_buf), "  bpm: %d  steps: %d  %s  ",
-                  s.bpm, loop_len, is_playing ? "▶" : "■");
+                  s.bpm, s.loop_len, is_playing ? "▶" : "■");
     lines.push_back(hbox({
         text("bitjams")           | bold | color(COL_PURPLE),
         text(head_buf)                   | color(COL_PURPLE),
@@ -435,10 +490,10 @@ Component build_ui(ScreenInteractive& screen, SessionState& state) {
             state.bpm = std::max(40, state.bpm - 5); return true;
         }
         if (e == Event::Character(']')) {
-            loop_len = std::min(16, loop_len + 1); return true;
+            state.loop_len = std::min(16, state.loop_len + 1); return true;
         }
         if (e == Event::Character('[')) {
-            loop_len = std::max(1, loop_len - 1); return true;
+            state.loop_len = std::max(1, state.loop_len - 1); return true;
         }
 
         // ---- SYNTH_PAGE ----

@@ -14,7 +14,6 @@ FetchContent_MakeAvailable(ftxui)
 add_executable(bitjams
     src/main.cpp
     src/audio.cpp
-    src/sequencer.cpp
     src/session.cpp
     src/ui.cpp
 )

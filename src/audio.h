@@ -3,7 +3,7 @@
 #include <atomic>
 
 #include "miniaudio.h"
-#include "sequencer.h"
+#include "session.h"
 
 inline constexpr int SAMPLE_RATE = 44100;
 inline constexpr int VIS_BUF     = 8192;

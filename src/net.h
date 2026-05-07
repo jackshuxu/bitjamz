@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <memory>
 
-#include "sequencer.h"
+#include "session.h"
 
 // Single compile-time port for all session connections.
 inline constexpr uint16_t NET_PORT = 47474;

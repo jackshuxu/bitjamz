@@ -1,56 +1,27 @@
-#include "ui.h"
+#include "session.h"
 
 #include <chrono>
-#include <cstdio>
-#include <cstring>
-#include <memory>
+#include <cmath>
 #include <thread>
 
-#include "audio.h"
-#include "sequencer.h"
+// note_to_freq(0) = 440 * 2^(-9/12) = 261.6256 Hz = C4
+static const float C4_HZ = 440.f * std::pow(2.f, -9.f / 12.f);
 
-void session() {
-    auto state = std::make_shared<SessionState>();
+SessionState::SessionState() {
+    for (int t = 0; t < TRACKS; ++t)
+        if (TRACK_DEFS[t].type == TrackType::MELODIC) track_root_hz[t] = C4_HZ;
+}
 
-    // default pattern on the drum tracks (matches the MPC layout)
-    static const bool kick_row[STEPS]  = {1,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0};
-    static const bool snare_row[STEPS] = {0,0,1,0,0,0,1,0,0,0,1,0,0,0,1,0};
-    static const bool chat_row[STEPS]  = {1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0};
-    std::memcpy(state->grid[0], kick_row,  sizeof(kick_row));
-    std::memcpy(state->grid[1], snare_row, sizeof(snare_row));
-    std::memcpy(state->grid[3], chat_row,  sizeof(chat_row));
-
-    ma_device_config cfg = ma_device_config_init(ma_device_type_playback);
-    cfg.playback.format   = ma_format_f32;
-    cfg.playback.channels = 2;
-    cfg.sampleRate        = SAMPLE_RATE;
-    cfg.dataCallback      = audio_callback;
-    cfg.pUserData         = state.get();
-
-    ma_device dev;
-    if (ma_device_init(nullptr, &cfg, &dev) != MA_SUCCESS) {
-        std::fprintf(stderr, "Failed to init audio device\n");
-        return;
+void timing_thread(SessionState& s) {
+    using clk = std::chrono::steady_clock;
+    auto next = clk::now();
+    while (s.running.load()) {
+        next += std::chrono::microseconds((int)(60'000'000.0 / s.bpm / 4));
+        std::this_thread::sleep_until(next);
+        if (!s.playing.load()) continue;
+        int step = s.play_step.load();
+        for (int t = 0; t < TRACKS; ++t)
+            if (s.track_active[t] && s.grid[t][step]) s.trig[t].store(true);
+        s.play_step.store((step + 1) % s.loop_len);
     }
-    ma_device_start(&dev);
-
-    std::thread timer(timing_thread, std::ref(*state));
-
-    auto screen = ftxui::ScreenInteractive::Fullscreen();
-    screen.TrackMouse(false);
-
-    std::thread refresher([&screen, state] {
-        while (state->running.load()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(33));
-            screen.PostEvent(ftxui::Event::Custom);
-        }
-    });
-
-    screen.Loop(build_ui(screen, *state));
-
-    state->running.store(false);
-
-    refresher.join();
-    timer.join();
-    ma_device_uninit(&dev);
 }
