@@ -380,7 +380,7 @@ static Element render_melodic_synth_page(SessionState& s, int t) {
 
 //input handling
 
-static void play_synth_key_for_tra ck(int t, int semitone) {
+static void play_synth_key_for_track(int t, int semitone) {
     if (TRACK_DEFS[t].type != TrackType::MELODIC) return;
     int abs_st = (synth_octave - 4) * 12 + semitone;
     if (scale_snap) abs_st = snap_pentatonic(abs_st);
@@ -463,7 +463,7 @@ Component build_ui(ScreenInteractive& screen, SessionState& state) {
                 if (e.is_character() && e.character().size() == 1) {
                     char c = e.character()[0];
                     int st = key_to_semitone(c);
-                    if (st >= 0) { play_synth_key_for_track(state, cursor_track, st); return true; }
+                    if (st >= 0) { play_synth_key_for_track(cursor_track, st); return true; }
                     if (c == 'z') { synth_octave = std::max(1, synth_octave - 1); return true; }
                     if (c == 'x') { synth_octave = std::min(7, synth_octave + 1); return true; }
                     if (c == 'n') { scale_snap = !scale_snap; return true; }
