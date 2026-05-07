@@ -15,28 +15,31 @@
 #include "ui.h"
 
 int main() {
-    bool preset[TRACKS][STEPS] = {
-        {1,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0},
-        {0,0,1,0,0,0,1,0,0,0,1,0,0,0,1,0},
-        {1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0},
-        {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
-    };
-    std::memcpy(grid, preset, sizeof(grid));
+    // default pattern on the drum tracks (matches the MPC layout)
+    // track 0 = kick  (v): quarter notes
+    // track 1 = snare (b): backbeat
+    // track 3 = chat  (m): eighth notes
+    static const bool kick_row[STEPS]  = {1,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0};
+    static const bool snare_row[STEPS] = {0,0,1,0,0,0,1,0,0,0,1,0,0,0,1,0};
+    static const bool chat_row[STEPS]  = {1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0};
+    std::memcpy(grid[0], kick_row,  sizeof(kick_row));
+    std::memcpy(grid[1], snare_row, sizeof(snare_row));
+    std::memcpy(grid[3], chat_row,  sizeof(chat_row));
 
-    ma_device_config cfg = ma_device_config_init(ma_device_type_playback); // miniaudio's "connection" object to the OS audio system
+    ma_device_config cfg = ma_device_config_init(ma_device_type_playback);
     cfg.playback.format   = ma_format_f32;
     cfg.playback.channels = 2;
     cfg.sampleRate        = SAMPLE_RATE;
-    cfg.dataCallback      = audio_callback; // callback function the device will call when it needs more samples
+    cfg.dataCallback      = audio_callback;
 
     ma_device dev;
     if (ma_device_init(nullptr, &cfg, &dev) != MA_SUCCESS) {
         std::fprintf(stderr, "Failed to init audio device\n");
         return 1;
     }
-    ma_device_start(&dev); //tells the OS to begin streaming. The OS spawns a real-time audio thread
+    ma_device_start(&dev);
 
-    std::thread timer(timing_thread); //sleeps until the next tick -> read play_step -> set trig[t] = true -> advances play_step
+    std::thread timer(timing_thread);
 
     auto screen = ftxui::ScreenInteractive::Fullscreen();
     screen.TrackMouse(false);
@@ -50,7 +53,6 @@ int main() {
 
     screen.Loop(build_ui(screen));
 
-    // ensure refresher exits even if Loop returned via screen.Exit() without our q-handler
     running.store(false);
 
     refresher.join();

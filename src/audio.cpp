@@ -9,15 +9,44 @@
 StereoSample     vis_buf[VIS_BUF];
 std::atomic<int> vis_wp{0};
 
-std::atomic<float> synth_trig_freq{-1.f};
+std::atomic<float> synth_trig_freq[MELODIC_VOICES] = {
+    std::atomic<float>{-1.f}, std::atomic<float>{-1.f},
+    std::atomic<float>{-1.f}, std::atomic<float>{-1.f},
+};
 std::atomic<int>   synth_osc_atom{0};
 
-static constexpr float TRACK_PAN[TRACKS] = { 0.f, 0.30f, -0.30f, 0.10f };
+// Per-track stereo placement (lightly varied to keep things from collapsing to mono).
+static constexpr float TRACK_PAN[TRACKS] = {
+     0.00f,  0.05f, -0.05f,  0.00f,   // core drums: kick, snare, clap, chat
+    -0.30f,  0.30f, -0.15f,  0.15f,   // extended drums: ohat, cowb, tom, cymb
+    -0.20f,  0.20f, -0.10f,  0.10f,   // melodic: lead, bass, chord, drone
+};
 
-//drums engine
+const DrumParams DRUM_PARAMS[DRUM_KINDS] = {
+    /* DK_KICK       */ { "kick",         180.f, 0.300f, 0.00f },
+    /* DK_SNARE      */ { "snare",        200.f, 0.180f, 0.70f },
+    /* DK_CLAP       */ { "clap",           0.f, 0.120f, 1.00f },
+    /* DK_CLOSED_HAT */ { "closed_hat",  8000.f, 0.050f, 1.00f },
+    /* DK_OPEN_HAT   */ { "open_hat",    8000.f, 0.300f, 1.00f },
+    /* DK_COWBELL    */ { "cowbell",      540.f, 0.250f, 0.00f },
+    /* DK_TOM        */ { "tom",          140.f, 0.350f, 0.00f },
+    /* DK_CYMBAL     */ { "cymbal",      9000.f, 0.800f, 1.00f },
+};
 
-struct Voice { bool active; float phase, env, t, freq, env_dur; };
-static Voice voices[TRACKS];
+//drum engine
+
+struct DrumVoice {
+    bool  active;
+    float cycle_phase;
+    float aux_phase;        // cowbell second osc
+    float level_env;
+    float elapsed_s;
+    float base_pitch_hz;
+    float decay_seconds;
+    float filter_prev_in;
+    float filter_prev_out;
+};
+static DrumVoice drum_voices[DRUM_KINDS];
 
 static uint32_t lcg_state = 0x12345678u;
 static inline float noise() {
@@ -25,73 +54,165 @@ static inline float noise() {
     return (float)(int32_t)lcg_state / 2147483648.f;
 }
 
-static void trigger_voice(int track) {
-    Voice& v = voices[track];
-    v.active = true; v.t = 0.f; v.env = 1.f; v.phase = 0.f;
-    switch (track) {
-        case 0: v.freq=180.f;  v.env_dur=0.300f; break;
-        case 1: v.freq=200.f;  v.env_dur=0.180f; break;
-        case 2: v.freq=8000.f; v.env_dur=0.050f; break;
-        case 3: v.freq=0.f;    v.env_dur=0.120f; break;
-    }
+static void trigger_drum(int kind) {
+    DrumVoice& v        = drum_voices[kind];
+    v.active            = true;
+    v.cycle_phase       = 0.f;
+    v.aux_phase         = 0.f;
+    v.elapsed_s         = 0.f;
+    v.level_env         = 1.f;
+    v.base_pitch_hz     = DRUM_PARAMS[kind].base_pitch_hz;
+    v.decay_seconds     = DRUM_PARAMS[kind].decay_seconds;
+    v.filter_prev_in    = 0.f;
+    v.filter_prev_out   = 0.f;
 }
 
-static float render_voice(int track) {
-    Voice& v = voices[track];
-    if (!v.active) return 0.f;
+static void trigger_kick()       { trigger_drum(DK_KICK); }
+static void trigger_snare()      { trigger_drum(DK_SNARE); }
+static void trigger_clap()       { trigger_drum(DK_CLAP); }
+static void trigger_closed_hat() { trigger_drum(DK_CLOSED_HAT); }
+static void trigger_open_hat()   { trigger_drum(DK_OPEN_HAT); }
+static void trigger_cowbell()    { trigger_drum(DK_COWBELL); }
+static void trigger_tom()        { trigger_drum(DK_TOM); }
+static void trigger_cymbal()     { trigger_drum(DK_CYMBAL); }
+
+static float render_drum_voice(int kind) {
+    DrumVoice& voice = drum_voices[kind];
+    if (!voice.active) return 0.f;
+
     const float dt = 1.f / SAMPLE_RATE;
-    v.env = std::max(0.f, 1.f - v.t / v.env_dur);
-    if (v.env <= 0.f) { v.active = false; return 0.f; }
-    float s = 0.f;
-    if (track == 0) {
-        float freq = 40.f + (180.f - 40.f) * std::max(0.f, 1.f - v.t / 0.030f);
-        v.phase += freq * dt;
-        if (v.phase > 1.f) v.phase -= 1.f;
-        s = std::sin(v.phase * 2.f * (float)M_PI);
-    } else if (track == 1) {
-        v.phase += v.freq * dt;
-        if (v.phase > 1.f) v.phase -= 1.f;
-        s = noise() * 0.7f + ((v.phase < 0.5f) ? 1.f : -1.f) * 0.3f;
-    } else if (track == 2) {
-        static float hp_in = 0.f, hp_out = 0.f;
-        float n = noise();
-        float hp = 0.97f * (hp_out + n - hp_in);
-        hp_in = n; hp_out = hp;
-        s = hp;
-    } else {
-        for (int b = 0; b < 3; ++b) {
-            float bt = v.t - b * 0.008f;
-            if (bt >= 0.f && bt < 0.015f)
-                s += noise() * (1.f - bt / 0.015f);
+
+    voice.level_env = std::max(0.f, 1.f - voice.elapsed_s / voice.decay_seconds);
+    if (voice.level_env <= 0.f) {
+        voice.active = false;
+        return 0.f;
+    }
+
+    float sample = 0.f;
+    switch (kind) {
+        case DK_KICK: {
+            // sine body with a fast pitch drop from base_pitch_hz down to 40 Hz
+            float p = 40.f + (voice.base_pitch_hz - 40.f)
+                          * std::max(0.f, 1.f - voice.elapsed_s / 0.030f);
+            voice.cycle_phase += p * dt;
+            if (voice.cycle_phase > 1.f) voice.cycle_phase -= 1.f;
+            sample = std::sin(voice.cycle_phase * 2.f * (float)M_PI);
+            break;
+        }
+        case DK_SNARE: {
+            // noise rattle + quiet square shell
+            voice.cycle_phase += voice.base_pitch_hz * dt;
+            if (voice.cycle_phase > 1.f) voice.cycle_phase -= 1.f;
+            sample = noise() * 0.7f
+                   + ((voice.cycle_phase < 0.5f) ? 1.f : -1.f) * 0.3f;
+            break;
+        }
+        case DK_CLAP: {
+            // three short staggered noise bursts
+            for (int b = 0; b < 3; ++b) {
+                float te = voice.elapsed_s - b * 0.008f;
+                if (te >= 0.f && te < 0.015f)
+                    sample += noise() * (1.f - te / 0.015f);
+            }
+            break;
+        }
+        case DK_CLOSED_HAT: {
+            // high-passed noise, short decay (handled by decay_seconds)
+            float w = noise();
+            float h = 0.97f * (voice.filter_prev_out + w - voice.filter_prev_in);
+            voice.filter_prev_in  = w;
+            voice.filter_prev_out = h;
+            sample = h;
+            break;
+        }
+        case DK_OPEN_HAT: {
+            // high-passed noise, long decay
+            float w = noise();
+            float h = 0.97f * (voice.filter_prev_out + w - voice.filter_prev_in);
+            voice.filter_prev_in  = w;
+            voice.filter_prev_out = h;
+            sample = h;
+            break;
+        }
+        case DK_COWBELL: {
+            // two square oscillators at ~540 and ~810 Hz mixed, gives a metallic clang
+            voice.cycle_phase += voice.base_pitch_hz * dt;
+            if (voice.cycle_phase > 1.f) voice.cycle_phase -= 1.f;
+            voice.aux_phase += voice.base_pitch_hz * 1.5f * dt;
+            if (voice.aux_phase > 1.f) voice.aux_phase -= 1.f;
+            float a = (voice.cycle_phase < 0.5f) ? 1.f : -1.f;
+            float b = (voice.aux_phase   < 0.5f) ? 1.f : -1.f;
+            sample = (a + b) * 0.5f;
+            break;
+        }
+        case DK_TOM: {
+            // sine body with a slower pitch drop than the kick, mid frequency
+            float p = 80.f + (voice.base_pitch_hz - 80.f)
+                          * std::max(0.f, 1.f - voice.elapsed_s / 0.060f);
+            voice.cycle_phase += p * dt;
+            if (voice.cycle_phase > 1.f) voice.cycle_phase -= 1.f;
+            sample = std::sin(voice.cycle_phase * 2.f * (float)M_PI);
+            break;
+        }
+        case DK_CYMBAL: {
+            // bright high-passed noise, long decay
+            float w = noise();
+            float h = 0.98f * (voice.filter_prev_out + w - voice.filter_prev_in);
+            voice.filter_prev_in  = w;
+            voice.filter_prev_out = h;
+            sample = h;
+            break;
         }
     }
-    s = (float)(int8_t)(s * 127.f) / 127.f;
-    v.t += dt;
-    return s * v.env;
+
+    // bit-crush down to 8-bit for that lo-fi pocket-operator edge
+    sample = (float)(int8_t)(sample * 127.f) / 127.f;
+
+    voice.elapsed_s += dt;
+    return sample * voice.level_env;
 }
 
-//melodic synth engine
+//melodic synth engine (per-track)
 
-struct SynthVoice { bool active; float phase, env, t, freq; };
-static SynthVoice synth_voice = {};
+struct SynthVoice {
+    bool  active;
+    float cycle_phase;
+    float level_env;
+    float elapsed_s;
+    float pitch_hz;
+};
+static SynthVoice synth_voices[MELODIC_VOICES] = {};
 
-static float render_synth_voice() {
-    if (!synth_voice.active) return 0.f;
+static void trigger_synth(int idx, float pitch_hz) {
+    synth_voices[idx] = { true, 0.f, 1.f, 0.f, pitch_hz };
+}
+
+static float render_synth_voice(int idx) {
+    SynthVoice& v = synth_voices[idx];
+    if (!v.active) return 0.f;
+
     const float dt = 1.f / SAMPLE_RATE;
-    synth_voice.env = std::max(0.f, 1.f - synth_voice.t / 0.5f);
-    if (synth_voice.env <= 0.f) { synth_voice.active = false; return 0.f; }
-    synth_voice.phase += synth_voice.freq * dt;
-    if (synth_voice.phase > 1.f) synth_voice.phase -= 1.f;
-    float s = 0.f;
-    switch (synth_osc_atom.load(std::memory_order_relaxed)) {
-        case 0: s = (synth_voice.phase < 0.5f) ? 1.f : -1.f; break;
-        case 1: s = 2.f * synth_voice.phase - 1.f; break;
-        case 2: s = 2.f * std::abs(2.f * synth_voice.phase - 1.f) - 1.f; break;
-        case 3: s = std::sin(synth_voice.phase * 2.f * (float)M_PI); break;
+
+    v.level_env = std::max(0.f, 1.f - v.elapsed_s / 0.5f);
+    if (v.level_env <= 0.f) {
+        v.active = false;
+        return 0.f;
     }
-    s = (float)(int8_t)(s * 127.f) / 127.f;
-    synth_voice.t += dt;
-    return s * synth_voice.env * 0.4f;
+
+    v.cycle_phase += v.pitch_hz * dt;
+    if (v.cycle_phase > 1.f) v.cycle_phase -= 1.f;
+
+    float sample = 0.f;
+    switch (synth_osc_atom.load(std::memory_order_relaxed)) {
+        case 0: sample = (v.cycle_phase < 0.5f) ? 1.f : -1.f; break;             // square
+        case 1: sample = 2.f * v.cycle_phase - 1.f; break;                       // saw
+        case 2: sample = 2.f * std::abs(2.f * v.cycle_phase - 1.f) - 1.f; break; // triangle
+        case 3: sample = std::sin(v.cycle_phase * 2.f * (float)M_PI); break;     // sine
+    }
+
+    sample = (float)(int8_t)(sample * 127.f) / 127.f;
+    v.elapsed_s += dt;
+    return sample * v.level_env * 0.4f;
 }
 
 //audio callback
@@ -99,27 +220,56 @@ static float render_synth_voice() {
 void audio_callback(ma_device* /*dev*/, void* out, const void* /*in*/, ma_uint32 frames) {
     float* buf = (float*)out;
 
-    for (int t = 0; t < TRACKS; ++t) //for each track: read & clear, trigger voice
-        if (trig[t].exchange(false))
-            trigger_voice(t);
+    // sequencer fires: dispatch per track type
+    for (int t = 0; t < TRACKS; ++t) {
+        if (!trig[t].exchange(false)) continue;
+        const TrackDef& td = TRACK_DEFS[t];
+        if (td.type == TrackType::DRUM) {
+            switch (td.drum_kind) {
+                case DK_KICK:       trigger_kick();       break;
+                case DK_SNARE:      trigger_snare();      break;
+                case DK_CLAP:       trigger_clap();       break;
+                case DK_CLOSED_HAT: trigger_closed_hat(); break;
+                case DK_OPEN_HAT:   trigger_open_hat();   break;
+                case DK_COWBELL:    trigger_cowbell();    break;
+                case DK_TOM:        trigger_tom();        break;
+                case DK_CYMBAL:     trigger_cymbal();     break;
+            }
+        } else {
+            // TODO: piano roll - per-step pitch + velocity
+            trigger_synth(td.melodic_idx, track_root_hz[t]);
+        }
+    }
 
-    float f = synth_trig_freq.exchange(-1.f);
-    if (f > 0.f) {
-        synth_voice = { true, 0.f, 1.f, 0.f, f };
+    // live-play melodic triggers
+    for (int m = 0; m < MELODIC_VOICES; ++m) {
+        float f = synth_trig_freq[m].exchange(-1.f);
+        if (f > 0.f) trigger_synth(m, f);
     }
 
     int wp = vis_wp.load(std::memory_order_relaxed);
 
     for (ma_uint32 i = 0; i < frames; ++i) {
         float mix_l = 0.f, mix_r = 0.f;
+
+        // drums: render once per kind, pan by the (single) track that owns that kind
         for (int t = 0; t < TRACKS; ++t) {
-            float v     = render_voice(t);
-            float angle = (TRACK_PAN[t] + 1.f) * (float)M_PI * 0.25f;
-            mix_l += v * std::cos(angle);
-            mix_r += v * std::sin(angle);
+            const TrackDef& td = TRACK_DEFS[t];
+            if (td.type != TrackType::DRUM) continue;
+            float v = render_drum_voice(td.drum_kind);
+            float a = (TRACK_PAN[t] + 1.f) * (float)M_PI * 0.25f;
+            mix_l += v * std::cos(a);
+            mix_r += v * std::sin(a);
         }
-        float sv = render_synth_voice();
-        mix_l += sv; mix_r += sv;
+        // melodic voices
+        for (int t = 0; t < TRACKS; ++t) {
+            const TrackDef& td = TRACK_DEFS[t];
+            if (td.type != TrackType::MELODIC) continue;
+            float v = render_synth_voice(td.melodic_idx);
+            float a = (TRACK_PAN[t] + 1.f) * (float)M_PI * 0.25f;
+            mix_l += v * std::cos(a);
+            mix_r += v * std::sin(a);
+        }
 
         float l = (float)(int8_t)(mix_l * 127.f) / 127.f * 0.25f;
         float r = (float)(int8_t)(mix_r * 127.f) / 127.f * 0.25f;
