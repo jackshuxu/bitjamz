@@ -47,6 +47,9 @@ int Network::connect_to_server(uint32_t address_num, uint16_t room) {
     send(sock, &success_code, 1, 0);
     std::cout << "Connected to room!" << std::endl;
 
+    // Need to add loop for receiving information
+    // Perhaps we also kick off a thread here that handles sending updates
+
     return 0;
 }
 
@@ -81,6 +84,7 @@ void Network::client_handler(int client_sock) {
         return;
     }
 
+    // Room exists, send notif
     uint8_t success_code = App::STATUS_SUCCESS;
     send(client_sock, &success_code, 1, 0);
     
@@ -99,6 +103,7 @@ void Network::client_handler(int client_sock) {
     auto interval = std::chrono::milliseconds(NET_FLUSH_MS);
     auto next_wakeup = std::chrono::steady_clock::now() + interval;
 
+    // Loop sending updates
     while (true) {
         if (state->has_updates.load()) {
             std::cout << "has updates" << std::endl;

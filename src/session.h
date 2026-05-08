@@ -162,7 +162,7 @@ public:
     std::atomic<uint16_t> dirty[TRACKS] = {};
 
     std::mutex diff_mutex; // Might not be necessary I think only one thread is managing diff state
-    MsgState state_struct;
+    MsgState state_struct {};
     MsgDiff diff {};
 };
 

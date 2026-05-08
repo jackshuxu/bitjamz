@@ -29,6 +29,8 @@
 // Runs one full bitjams session end-to-end: owns the SessionState,
 // starts the audio device, the timing thread, and the ftxui event loop,
 // and tears them all down on exit.
+
+// is_shared determines whether a session is public or private (yet to be used)
 static void main_session(bool is_shared) {
     std::cout << "Before\n";
 
@@ -36,6 +38,7 @@ static void main_session(bool is_shared) {
     //    uint16_t session_id = SessionState::generate_unique_id();
     //}
 
+    // init state struct
     uint16_t init_src_dirty[TRACKS]= {0};
     init_src_dirty[0] = 0x1111; // Kick
     init_src_dirty[1] = 0x4444; // Snare
