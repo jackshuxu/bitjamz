@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <set>
 
 // Anything used by more than one module (audio, ui, net, main) lives here.
 // Per-module helpers live in that module's own .cpp as file-locals.
@@ -68,7 +69,12 @@ inline constexpr TrackDef TRACK_DEFS[TRACKS] = {
 //        session_id, dirty
 class SessionState {
 public:
-    SessionState();
+    SessionState(bool is_shared);
+    ~SessionState();
+    uint16_t generate_unique_id();
+
+    static std::set<uint16_t> active_rooms;
+    static std::mutex registry_mutex;
 
     // --- networking bookkeeping ---
     uint16_t session_id = 0;

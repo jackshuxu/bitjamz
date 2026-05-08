@@ -6,6 +6,15 @@
 #include <cstring>
 #include <memory>
 #include <thread>
+#include <string>
+#include <sys/socket.h>
+#include <thread>
+#include <fstream>
+#include <poll.h>
+#include <iostream>
+#include <optional>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 
 #include <ftxui/component/event.hpp>
 #include <ftxui/component/screen_interactive.hpp>
@@ -13,12 +22,18 @@
 #include "audio.h"
 #include "session.h"
 #include "ui.h"
+#include "network.h"
+
+namespace App {
+    inline std::atomic<bool> running{true};
+    uint16_t global_port = 1234;
+}
 
 // Runs one full bitjams session end-to-end: owns the SessionState,
 // starts the audio device, the timing thread, and the ftxui event loop,
 // and tears them all down on exit.
-static void main_session() {
-    auto state = std::make_shared<SessionState>();
+static void main_session(bool is_shared) {
+    auto state = std::make_shared<SessionState>(is_shared);
 
     // default pattern on the drum tracks (matches the MPC layout)
     static const bool kick_row[STEPS]  = {1,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0};
@@ -63,9 +78,147 @@ static void main_session() {
     ma_device_uninit(&dev);
 }
 
+std::optional<uint32_t> string_to_IPv4(const std::string& ip_str) {
+    struct in_addr addr;
+    
+    if (inet_pton(AF_INET, ip_str.c_str(), &addr) != 1) {
+        // Invalid IP address
+        return std::nullopt;
+    }
+    
+    return ntohl(addr.s_addr);  // Convert from network to host byte order
+}
+
+int establish_connection(uint32_t address_num, uint16_t room) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    
+    if (sock < 0) {
+        std::perror("Socket creation failed");
+        return -1;
+    }
+
+    struct sockaddr_in serv_addr;
+    std::memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(App::global_port);
+    serv_addr.sin_addr.s_addr = htonl(address_num);
+
+    // This is a blocking call
+    if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
+        std::perror("Connection failed");
+        close(sock);
+        return -1;
+    }
+
+    std::cout << "Connected! Sending join request for room " << room << "...\n";
+
+    // Expected to get response back from host as to whether a valid room was selected
+    send(sock, &room, sizeof(room), 0);
+
+    return 0;
+}
+
+void execute_repl_command(std::string repl_command) {
+    if (repl_command.empty()) {
+        return;
+    }
+
+    std::stringstream tok_stream(repl_command);
+    std::vector<std::string> toks;
+    std::string tok;
+
+    while (tok_stream >> tok) {
+        toks.push_back(tok);
+    }
+
+    char command = toks[0][0];
+
+    switch (command) {
+        case 's': {
+            if (toks.size() > 1) {
+                std::cout << "usage: s\n";
+            }
+
+
+            main_session(true);
+
+            break;
+        }
+        case 'p': {
+            if (toks.size() > 1) {
+                std::cout << "usage: p\n";
+            }
+
+            main_session(false);
+
+            break;
+        }
+        case 'c': {
+            if (toks.size() < 3) {
+                std::cout << "usage: c <ip> <room>\n";
+                break;
+            }
+            
+            std::string address_string = toks[1];
+            std::optional<uint32_t> address_num = string_to_IPv4(address_string);
+
+            if (!address_num.has_value()) {
+                std::cout << "invalid address provided\n";
+            } else {
+                uint16_t room = std::stoi(toks[2]);
+                establish_connection(address_num.value(), room);
+            }
+            /*try {
+            } catch (true) {
+                std::cout << "Invalid room number\n";
+            }*/
+
+            break;
+        }
+        case 'q': {
+            if (toks.size() > 1) {
+                std::cout << "usage: q\n";
+
+                break;
+            }    
+
+            // TO-DO: Some state teardown alongside global bool
+            App::running.store(false);
+
+            break;
+        }
+        case 'h': {
+            std::cout << "s            : Starts a new public session and assigns room number.\n";
+            std::cout << "p            : Starts a new private session.\n";
+            std::cout << "c <ip> <room>: Attempts to connect to the desired ip address' room number.\n";
+            std::cout << "q            : Quit application.\n";
+            std::cout << "h            : Help menu (Yer lookin' at it).\n";
+            break;
+        }
+        default: {
+            std::cout << "Invalid command. Type h for a list of valid commands.\n";
+            break;
+        }
+    }
+}
+
+void repl_handler() {
+    std::string repl_command;
+
+    while (App::running.load()) {
+        std::getline(std::cin, repl_command);
+        execute_repl_command(repl_command);
+    }
+}
+
 int main() {
     // TODO: startup page (solo / host / join) lands here, then dispatches
     // into main_session with the chosen networking mode.
-    main_session();
+    std::cout << "Welcome to TUI-DAW-Network Application!\n";
+    std::cout << "Enter your first command (press h for help menu)" << std::endl;
+
+    //std::jthread receive_connections_thread(receive_connections);
+    repl_handler();
+
     return 0;
 }
