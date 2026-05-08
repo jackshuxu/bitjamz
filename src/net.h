@@ -1,4 +1,4 @@
-#pragma once
+/*#pragma once
 
 #include <cstdint>
 #include <memory>
@@ -59,3 +59,4 @@ struct __attribute__((packed)) MsgDiff {
 void net_host(std::shared_ptr<SessionState> state, uint16_t port);
 void net_join(std::shared_ptr<SessionState> state, const char* ip, uint16_t port);
 void net_stop();
+*/

@@ -15,6 +15,8 @@
 #include <optional>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <stop_token>
+#include <format>
 
 #include <ftxui/component/event.hpp>
 #include <ftxui/component/screen_interactive.hpp>
@@ -24,16 +26,26 @@
 #include "ui.h"
 #include "network.h"
 
-namespace App {
-    inline std::atomic<bool> running{true};
-    uint16_t global_port = 1234;
-}
-
 // Runs one full bitjams session end-to-end: owns the SessionState,
 // starts the audio device, the timing thread, and the ftxui event loop,
 // and tears them all down on exit.
 static void main_session(bool is_shared) {
-    auto state = std::make_shared<SessionState>(is_shared);
+    std::cout << "Before\n";
+
+    //if (is_shared) {
+    //    uint16_t session_id = SessionState::generate_unique_id();
+    //}
+
+    uint16_t init_src_dirty[TRACKS]= {0};
+    init_src_dirty[0] = 0x1111; // Kick
+    init_src_dirty[1] = 0x4444; // Snare
+    init_src_dirty[3] = 0x5555; // Chat
+    int32_t init_bpm = 120;
+    uint16_t init_track_active = 0xFFFF;
+    MsgState init_state(init_bpm, 0, init_track_active, init_src_dirty);
+    
+    auto state = std::make_shared<SessionState>(init_state, is_shared);
+    std::cout << "After\n";
 
     // default pattern on the drum tracks (matches the MPC layout)
     static const bool kick_row[STEPS]  = {1,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0};
@@ -89,35 +101,6 @@ std::optional<uint32_t> string_to_IPv4(const std::string& ip_str) {
     return ntohl(addr.s_addr);  // Convert from network to host byte order
 }
 
-int establish_connection(uint32_t address_num, uint16_t room) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    
-    if (sock < 0) {
-        std::perror("Socket creation failed");
-        return -1;
-    }
-
-    struct sockaddr_in serv_addr;
-    std::memset(&serv_addr, 0, sizeof(serv_addr));
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(App::global_port);
-    serv_addr.sin_addr.s_addr = htonl(address_num);
-
-    // This is a blocking call
-    if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-        std::perror("Connection failed");
-        close(sock);
-        return -1;
-    }
-
-    std::cout << "Connected! Sending join request for room " << room << "...\n";
-
-    // Expected to get response back from host as to whether a valid room was selected
-    send(sock, &room, sizeof(room), 0);
-
-    return 0;
-}
-
 void execute_repl_command(std::string repl_command) {
     if (repl_command.empty()) {
         return;
@@ -138,7 +121,6 @@ void execute_repl_command(std::string repl_command) {
             if (toks.size() > 1) {
                 std::cout << "usage: s\n";
             }
-
 
             main_session(true);
 
@@ -166,12 +148,8 @@ void execute_repl_command(std::string repl_command) {
                 std::cout << "invalid address provided\n";
             } else {
                 uint16_t room = std::stoi(toks[2]);
-                establish_connection(address_num.value(), room);
+                Network::connect_to_server(address_num.value(), room);
             }
-            /*try {
-            } catch (true) {
-                std::cout << "Invalid room number\n";
-            }*/
 
             break;
         }
@@ -217,8 +195,9 @@ int main() {
     std::cout << "Welcome to TUI-DAW-Network Application!\n";
     std::cout << "Enter your first command (press h for help menu)" << std::endl;
 
-    //std::jthread receive_connections_thread(receive_connections);
+    std::thread receive_connections_thread(Network::receive_connections);
     repl_handler();
+    receive_connections_thread.join();
 
     return 0;
 }

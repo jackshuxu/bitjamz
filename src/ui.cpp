@@ -6,6 +6,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <mutex>
 
 #include <ftxui/dom/elements.hpp>
 
@@ -64,8 +65,15 @@ static int track_for_mpc_key(char c) {
 
 // pattern fill: stamp every Nth step on the cursor's track
 static void fill_pattern(SessionState& s, int interval, int start) {
-    for (int step = start; step < s.loop_len; step += interval)
+    uint16_t fill_mask = 0;
+
+    for (int step = start; step < s.loop_len; step += interval) {
         s.grid[cursor_track][step] = true;
+        fill_mask |= (1 << step);
+    }
+
+    s.diff.dirty[cursor_track] |= fill_mask;
+    s.has_updates.store(true);
 }
 
 //color palette
@@ -453,6 +461,8 @@ static void trigger_track_live(SessionState& s, int t) {
 }
 
 Component build_ui(ScreenInteractive& screen, SessionState& state) {
+    std::lock_guard<std::mutex> lock(state.diff_mutex);
+
     auto root = Renderer([&state] {
         Element page;
         if (nav_state == NavState::SYNTH_PAGE) {
@@ -484,10 +494,20 @@ Component build_ui(ScreenInteractive& screen, SessionState& state) {
             return true;
         }
         if (e == Event::Character('+') || e == Event::Character('=')) {
-            state.bpm = std::min(300, state.bpm + 5); return true;
+            state.bpm = std::min(300, state.bpm + 5); 
+            state.diff.bpm_present = true;
+            state.diff.bpm = state.bpm;
+            state.has_updates = true;
+
+            return true;
         }
         if (e == Event::Character('-')) {
-            state.bpm = std::max(40, state.bpm - 5); return true;
+            state.bpm = std::max(40, state.bpm - 5); 
+            state.diff.bpm_present = true;
+            state.diff.bpm = state.bpm;
+            state.has_updates = true;
+
+            return true;
         }
         if (e == Event::Character(']')) {
             state.loop_len = std::min(16, state.loop_len + 1); return true;
@@ -583,10 +603,22 @@ Component build_ui(ScreenInteractive& screen, SessionState& state) {
         if (e == Event::Character('s')) { seq_mode = !seq_mode; return true; }
         if (e == Event::Character('c')) {
             std::memset(state.grid[cursor_track], 0, sizeof(state.grid[cursor_track]));
+
+            state.diff.edited_tracks_mask |= (1 << cursor_track);
+            state.diff.dirty[cursor_track] = 0;
+            state.has_updates.store(true);
+
             return true;
         }
         if (e == Event::Character('C')) {
             std::memset(state.grid, 0, sizeof(state.grid));
+
+            state.diff.edited_tracks_mask = (1 << TRACKS) - 1;
+            for (int t = 0; t < TRACKS; t++) {
+                state.diff.dirty[t] = 0;
+            }
+            state.has_updates.store(true);
+
             return true;
         }
 
@@ -598,6 +630,15 @@ Component build_ui(ScreenInteractive& screen, SessionState& state) {
                 if (c >= '1' && c <= '8') {
                     int step = window_start + (c - '1');
                     state.grid[cursor_track][step] = !state.grid[cursor_track][step];
+
+                    if (state.grid[cursor_track][step]) {
+                        state.diff.dirty[cursor_track] |= (1 << step);
+                    } else {
+                        state.diff.dirty[cursor_track] &= ~(1 << step);
+                    }
+
+                    state.diff.edited_tracks_mask |= (1 << cursor_track);
+
                     return true;
                 }
             }
@@ -606,11 +647,24 @@ Component build_ui(ScreenInteractive& screen, SessionState& state) {
             if (e == Event::ArrowRight) { cursor_step = (cursor_step + 1) % STEPS;          return true; }
             if (e == Event::Character(' ')) {
                 state.grid[cursor_track][cursor_step] = !state.grid[cursor_track][cursor_step];
+
+                if (state.grid[cursor_track][cursor_step]) {
+                    state.diff.dirty[cursor_track] |= (1 << cursor_step);
+                } else {
+                    state.diff.dirty[cursor_track] &= ~(1 << cursor_step);
+                }
+
+                state.diff.edited_tracks_mask |= (1 << cursor_track);
+
                 return true;
             }
             if (e.is_character() && e.character().size() == 1) {
                 char c = e.character()[0];
-                if (c >= '1' && c <= '9') { fill_pattern(state, c - '0', cursor_step); return true; }
+                if (c >= '1' && c <= '9') { 
+                    fill_pattern(state, c - '0', cursor_step);
+
+                    return true;
+                }
             }
         }
 

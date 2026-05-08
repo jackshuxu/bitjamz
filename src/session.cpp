@@ -5,11 +5,13 @@
 #include <thread>
 #include <set>
 #include <iostream>
+#include <memory>
+#include <map>
 
 // note_to_freq(0) = 440 * 2^(-9/12) = 261.6256 Hz = C4
 static const float C4_HZ = 440.f * std::pow(2.f, -9.f / 12.f);
 
-std::set<uint16_t> SessionState::active_rooms;
+std::map<uint16_t, SessionState*> SessionState::active_rooms;
 std::mutex SessionState::registry_mutex;
 
 uint16_t SessionState::generate_unique_id() {
@@ -18,18 +20,32 @@ uint16_t SessionState::generate_unique_id() {
     uint16_t candidate = 1; // Starting room number
     
     // Find the first ID that isn't currently in the set
-    while (active_rooms.find(candidate) != active_rooms.end()) {
+    while (active_rooms.contains(candidate)) {
         candidate++;
     }
 
     std::cout << "room created: " << candidate << std::endl;
     
-    active_rooms.insert(candidate);
+    active_rooms[candidate] = this;
+
     return candidate;
 }
 
-SessionState::SessionState(bool is_shared) {
-    session_id = generate_unique_id();
+SessionState::SessionState(MsgState& state, bool is_shared) {
+    session_id = state.session_id;
+    bpm = state.bpm;
+    
+    for (int t = 0; t < TRACKS; ++t) {
+        track_active[t] = (state.track_active >> t) & 1;
+
+        // Sync the Atomic Bitmask used for networking
+        dirty[t].store(state.dirty[t]);
+
+        // Unpack the bitmask into the 2D boolean grid
+        for (int s = 0; s < STEPS; ++s) {
+            grid[t][s] = (state.dirty[t] & (1 << s)) != 0;
+        }
+    }
 
     for (int t = 0; t < TRACKS; ++t)
         if (TRACK_DEFS[t].type == TrackType::MELODIC) track_root_hz[t] = C4_HZ;
