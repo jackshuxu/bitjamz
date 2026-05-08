@@ -67,14 +67,20 @@ inline constexpr TrackDef TRACK_DEFS[TRACKS] = {
 // host to a joiner immediately after a successful handshake. Replaces the
 // joiner's local state entirely.
 struct __attribute__((packed)) MsgState {
+    MsgState() {
+        session_id = 0;
+        bpm = 120;
+        track_active = 0xFFFF;
+    }
+
     MsgState(int32_t bpm, uint16_t session_id, uint16_t track_active, uint16_t const src_dirty[TRACKS]):
         bpm(bpm), session_id(session_id), track_active(track_active) {
             std::copy(src_dirty, src_dirty + TRACKS, dirty);
         }
     uint16_t session_id;
-    int32_t  bpm = 120;
-    uint16_t track_active = 0xFFFF;       // 0/1 per track
-    uint16_t dirty[TRACKS];               // 0/1 per cell with bitpacking
+    int32_t  bpm;
+    uint16_t track_active;       // 0/1 per track
+    uint16_t dirty[TRACKS];      // 0/1 per cell
 };
 
 // One changed cell carried inside a MsgDiff payload.
@@ -156,6 +162,7 @@ public:
     std::atomic<uint16_t> dirty[TRACKS] = {};
 
     std::mutex diff_mutex; // Might not be necessary I think only one thread is managing diff state
+    MsgState state_struct;
     MsgDiff diff {};
 };
 

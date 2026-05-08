@@ -32,6 +32,7 @@ uint16_t SessionState::generate_unique_id() {
 }
 
 SessionState::SessionState(MsgState& state, bool is_shared) {
+    std::memcpy(&state_struct, &state, sizeof(MsgState));
     session_id = state.session_id;
     bpm = state.bpm;
     

@@ -93,6 +93,9 @@ void Network::client_handler(int client_sock) {
     }
     
     SessionState* state = SessionState::active_rooms[requested_room];
+    // Sending initial state
+    send(client_sock, &(state->state_struct), sizeof(MsgState), 0);
+
     auto interval = std::chrono::milliseconds(NET_FLUSH_MS);
     auto next_wakeup = std::chrono::steady_clock::now() + interval;
 
