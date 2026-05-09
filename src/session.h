@@ -72,31 +72,14 @@ struct __attribute__((packed)) MsgState {
 static_assert(sizeof(MsgState) == 2 + 4 + TRACKS + TRACKS * STEPS,
               "MsgState packed size unexpected");
 
-// TODO(milestone-2): live diff propagation
-//
-// // One changed cell carried inside a MsgDiff payload.
-// struct __attribute__((packed)) DiffCell {
-//     uint8_t track; // 0..TRACKS-1
-//     uint8_t step;  // 0..STEPS-1
-//     uint8_t value; // 0/1
-// };
-//
-// // Maximum cells that can ride in a single diff. Equal to one full grid
-// // because the dirty bitmask claims at most one bit per cell per flush.
-// inline constexpr int DIFF_MAX_CELLS = TRACKS * STEPS;
-//
-// // Incremental edit batch. Sent on every flush window where any field
-// // changed.
-// struct __attribute__((packed)) MsgDiff {
-//     uint16_t edited_tracks_mask;
-//     uint16_t dirty[TRACKS];
-//
-//     uint8_t  bpm_present;          // 0/1
-//     int32_t  bpm;                  // valid iff bpm_present
-//
-//     uint8_t  track_active_present; // 0/1
-//     uint16_t track_active_mask;    // bit t = track_active[t]; valid iff present
-// };
+// MSG_EDIT wire format (milestone 2): see network.h. Sparse edit batch sent
+// every NET_FLUSH_MS window when there's anything to ship. Layout:
+//   uint8_t  cell_count
+//   { uint8_t track, uint8_t step, uint8_t value }[cell_count]
+//   uint8_t  bpm_present
+//   int32_t  bpm                       (network byte order; always present)
+//   uint8_t  track_active_present
+//   uint16_t track_active_mask         (network byte order; always present)
 
 // One bitjams session.
 //
@@ -141,10 +124,34 @@ public:
 
     // --- networking bookkeeping ---
     // One bitmask per track, one bit per step. UI sets bits via fetch_or
-    // when it edits a cell; the milestone-2 flush thread will claim them
-    // via exchange(0) every NET_FLUSH_MS to construct outbound diffs. They
-    // accumulate harmlessly in solo mode.
+    // when it edits a cell; the flush thread claims them via exchange(0)
+    // every NET_FLUSH_MS to construct outbound MSG_EDIT packets. On host,
+    // recv threads also OR in bits when applying inbound peer edits, so
+    // relays go out via the same flush path. Accumulates harmlessly in
+    // solo mode.
     std::atomic<uint16_t> dirty[TRACKS] = {};
+
+    // True iff this peer is a connected joiner. Set by Network::join() after
+    // a successful handshake. Cleared by the joiner recv thread on EOF /
+    // socket error; the joiner flush thread checks it and exits when it
+    // falls. Always false on host and in solo mode.
+    std::atomic<bool> network_alive{false};
+
+    // Joiner-side optimistic-edit guard. Bit set when the flush thread has
+    // claimed an outbound cell from `dirty` but the host's echo hasn't come
+    // back yet. recv path uses Rule Y: if bit set, accept inbound and clear;
+    // if not set, normal apply.
+    std::atomic<uint16_t> in_flight[TRACKS] = {};
+
+    // Scalar sync (bpm + track_active). Same Rule Y semantics as cells.
+    std::atomic<bool>     bpm_dirty{false};
+    std::atomic<bool>     bpm_in_flight{false};
+    std::atomic<uint16_t> track_active_dirty{0};
+    std::atomic<uint16_t> track_active_in_flight{0};
+
+    // Joiner-only label: lets the UI render "solo (host left)" once
+    // network_alive falls. Set true in Network::join().
+    bool is_joiner = false;
 };
 
 // Solo / host default constructor wrapper. Builds a SessionState with the

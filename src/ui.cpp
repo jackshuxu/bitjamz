@@ -126,6 +126,8 @@ static void show_next_hidden(SessionState& s) {
     do {
         if (!s.track_active[t]) {
             s.track_active[t] = true;
+            s.track_active_dirty.fetch_or(static_cast<uint16_t>(1) << t,
+                                          std::memory_order_relaxed);
             cursor_track      = t;
             return;
         }
@@ -137,6 +139,8 @@ static void show_next_hidden(SessionState& s) {
 static void hide_cursor_track(SessionState& s) {
     if (count_active_tracks(s) <= 1) return;
     s.track_active[cursor_track] = false;
+    s.track_active_dirty.fetch_or(static_cast<uint16_t>(1) << cursor_track,
+                                  std::memory_order_relaxed);
     cycle_cursor_to_active(s, +1);
 }
 
@@ -217,11 +221,22 @@ static Element render_grid_view(SessionState& s) {
                                                    "  [step]";
         std::snprintf(head_buf, sizeof(head_buf), "  bpm: %d  steps: %d  %s",
                       s.bpm, s.loop_len, is_playing ? "▶" : "■");
-        lines.push_back(hbox({
+
+        Elements header = {
             text("bitjams") | bold | color(COL_PURPLE),
             text(head_buf)         | color(COL_PURPLE),
             text(mode_label)       | color(COL_DIM),
-        }));
+        };
+        if (s.session_id != 0) {
+            std::string room_label = "  ROOM " + std::to_string(s.session_id);
+            if (s.is_joiner && !s.network_alive.load()) {
+                room_label += " — solo (host left)";
+                header.push_back(text(room_label) | color(COL_DIM));
+            } else {
+                header.push_back(text(room_label) | color(COL_DIM));
+            }
+        }
+        lines.push_back(hbox(std::move(header)));
     }
 
     // step numbers (offset by TITLE_COL_WIDTH-1 so digits align with cells)
@@ -492,10 +507,12 @@ Component build_session_ui(ScreenInteractive& screen, SessionState& state) {
         }
         if (e == Event::Character('+') || e == Event::Character('=')) {
             state.bpm = std::min(300, state.bpm + 5);
+            state.bpm_dirty.store(true, std::memory_order_relaxed);
             return true;
         }
         if (e == Event::Character('-')) {
             state.bpm = std::max(40, state.bpm - 5);
+            state.bpm_dirty.store(true, std::memory_order_relaxed);
             return true;
         }
         if (e == Event::Character(']')) {

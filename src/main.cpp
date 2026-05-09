@@ -127,6 +127,7 @@ int main() {
                     break;
                 }
                 main_session(state);
+                Network::stop();
                 break;
             }
         }
