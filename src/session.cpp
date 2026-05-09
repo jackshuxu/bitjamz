@@ -9,7 +9,6 @@
 static const float C4_HZ = 440.f * std::pow(2.f, -9.f / 12.f);
 
 SessionState::SessionState() {
-    // bpm, grid, track_active already initialized in declarations above.
     for (int t = 0; t < TRACKS; ++t) {
         if (TRACK_DEFS[t].type == TrackType::MELODIC) {
             track_root_hz[t] = C4_HZ;

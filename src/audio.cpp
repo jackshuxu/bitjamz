@@ -33,8 +33,6 @@ const DrumParams DRUM_PARAMS[DRUM_KINDS] = {
     /* DK_CYMBAL     */ { "cymbal",      9000.f, 0.800f, 1.00f },
 };
 
-//drum engine
-
 struct DrumVoice {
     bool  active;
     float cycle_phase;
@@ -172,8 +170,6 @@ static float render_drum_voice(int kind) {
     return sample * voice.level_env;
 }
 
-//melodic synth engine (per-track)
-
 struct SynthVoice {
     bool  active;
     float cycle_phase;
@@ -215,13 +211,10 @@ static float render_synth_voice(int idx) {
     return sample * v.level_env * 0.4f;
 }
 
-//audio callback
-
 void audio_callback(ma_device* dev, void* out, const void* /*in*/, ma_uint32 frames) {
     float* buf = (float*)out;
     SessionState* state = static_cast<SessionState*>(dev->pUserData);
 
-    // sequencer fires: dispatch per track type
     for (int t = 0; t < TRACKS; ++t) {
         if (!state->trig[t].exchange(false)) continue;
         const TrackDef& td = TRACK_DEFS[t];
@@ -242,7 +235,6 @@ void audio_callback(ma_device* dev, void* out, const void* /*in*/, ma_uint32 fra
         }
     }
 
-    // live-play melodic triggers
     for (int m = 0; m < MELODIC_VOICES; ++m) {
         float f = synth_trig_freq[m].exchange(-1.f);
         if (f > 0.f) trigger_synth(m, f);
@@ -262,7 +254,6 @@ void audio_callback(ma_device* dev, void* out, const void* /*in*/, ma_uint32 fra
             mix_l += v * std::cos(a);
             mix_r += v * std::sin(a);
         }
-        // melodic voices
         for (int t = 0; t < TRACKS; ++t) {
             const TrackDef& td = TRACK_DEFS[t];
             if (td.type != TrackType::MELODIC) continue;

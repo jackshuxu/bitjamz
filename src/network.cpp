@@ -252,7 +252,6 @@ void per_peer_handler(int sock, std::shared_ptr<SessionState> state, std::shared
         return;
     }
 
-    // Register this peer for the host flush thread to broadcast to.
     {
         std::lock_guard<std::mutex> lk(g_peers_mutex);
         peer->sock = sock;

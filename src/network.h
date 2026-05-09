@@ -4,13 +4,13 @@
 #include "session.h"
 
 inline constexpr uint16_t NET_PORT     = 47474;
-inline constexpr int      NET_FLUSH_MS = 50;  // unused this milestone
+inline constexpr int      NET_FLUSH_MS = 50;
 
 enum MsgType : uint8_t {
     MSG_HANDSHAKE      = 0x00,
     MSG_HANDSHAKE_FAIL = 0x01,
     MSG_STATE          = 0x02,
-    MSG_EDIT           = 0x03,  // milestone 2: sparse edit batch
+    MSG_EDIT           = 0x03,
 };
 
 class Network {

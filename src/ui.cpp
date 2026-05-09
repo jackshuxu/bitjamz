@@ -15,8 +15,6 @@
 
 using namespace ftxui;
 
-// ---- ui-local cursor + nav state -------------------------------------------
-
 static int cursor_track = 0;
 static int cursor_step  = 0;
 static int window_start = 0;
@@ -75,15 +73,11 @@ static void fill_pattern(SessionState& s, int interval, int start) {
     s.dirty[cursor_track].fetch_or(fill_mask, std::memory_order_relaxed);
 }
 
-//color palette
-
 static const Color COL_PURPLE = Color::RGB(125,  86, 244);
 static const Color COL_DIM    = Color::RGB( 60,  40, 120);
 static const Color COL_BRIGHT = Color::RGB(200, 180, 255);
 static const Color COL_HEAD   = Color::RGB(255, 220, 100);
 static const Color COL_GREEN  = Color::RGB( 80, 220, 120);
-
-//ui state
 
 enum class OscType { SQUARE, SAW, TRIANGLE, SINE };
 static constexpr int OSC_COUNT = 4;
@@ -96,8 +90,6 @@ static bool    scale_snap   = false;
 enum class NavState { GRID, TITLE_FOCUS, SYNTH_PAGE };
 static NavState nav_state = NavState::GRID;
 static bool     seq_mode  = false; // GRID sub-mode: 8-step window
-
-//helpers
 
 static int count_active_tracks(SessionState& s) {
     int c = 0;
@@ -144,8 +136,6 @@ static void hide_cursor_track(SessionState& s) {
     cycle_cursor_to_active(s, +1);
 }
 
-//stereometer
-
 static constexpr int VIS_W = 3 + STEPS * 3;
 static constexpr int VIS_H = 7;
 
@@ -189,10 +179,6 @@ static Element render_visualizer() {
     return vbox(std::move(rows));
 }
 
-//grid view
-
-// Title column = "[NNNNN](k) " (11 chars). Step rows align so column header,
-// playhead, and track rows all share the same step-cell origin.
 static constexpr int  TITLE_COL_WIDTH = 11;
 static constexpr char TITLE_PAD[]     = "          "; // 10 spaces (TITLE_COL_WIDTH - 1)
 
@@ -253,7 +239,6 @@ static Element render_grid_view(SessionState& s) {
         lines.push_back(hbox(std::move(row)));
     }
 
-    // playhead row
     {
         Elements row;
         row.push_back(text(std::string(TITLE_COL_WIDTH, ' ')));
@@ -266,8 +251,6 @@ static Element render_grid_view(SessionState& s) {
         lines.push_back(hbox(std::move(row)));
     }
 
-    // visible tracks grouped (melodic / mid drums / bottom drums) with
-    // blank separator rows between non-empty groups
     auto render_track_row = [&](int t) {
         bool title_focused = (nav_state == NavState::TITLE_FOCUS) && (t == cursor_track);
         Elements row;
@@ -298,7 +281,6 @@ static Element render_grid_view(SessionState& s) {
     for (int t = 0; t < TRACKS; ++t)
         if (s.track_active[t]) lines.push_back(render_track_row(t));
 
-    // help bar
     lines.push_back(text(""));
     if (nav_state == NavState::TITLE_FOCUS) {
         lines.push_back(text("  ↑↓:track  enter:open synth  tab/esc:back  rtyufghjvbnm:trigger"
@@ -316,8 +298,6 @@ static Element render_grid_view(SessionState& s) {
 
     return vbox(std::move(lines));
 }
-
-//synth page (drum, display only)
 
 static Element render_drum_synth_page(SessionState& s, int t) {
     const TrackDef& td = TRACK_DEFS[t];
@@ -366,8 +346,6 @@ static Element render_drum_synth_page(SessionState& s, int t) {
 
     return vbox(std::move(lines));
 }
-
-//synth page (melodic, piano keyboard)
 
 static Color key_col(int semitone) {
     if (!scale_snap) return COL_PURPLE;
@@ -418,7 +396,6 @@ static Element render_melodic_synth_page(SessionState& s, int t) {
 
     lines.push_back(text(""));
 
-    // black-key row
     {
         Elements row;
         row.push_back(text(" "));
@@ -433,7 +410,6 @@ static Element render_melodic_synth_page(SessionState& s, int t) {
         lines.push_back(hbox(std::move(row)));
     }
 
-    // white-key row
     {
         Elements row;
         row.push_back(draw_key_el("a",  0));
@@ -454,8 +430,6 @@ static Element render_melodic_synth_page(SessionState& s, int t) {
 
     return vbox(std::move(lines));
 }
-
-//input handling
 
 static void play_synth_key_for_track(int t, int semitone) {
     if (TRACK_DEFS[t].type != TrackType::MELODIC) return;
@@ -492,14 +466,12 @@ Component build_session_ui(ScreenInteractive& screen, SessionState& state) {
     });
 
     auto with_events = CatchEvent(root, [&screen, &state](Event e) -> bool {
-        // global quit
         if (e == Event::Character('q') || e == Event::Character('Q')) {
             state.running.store(false);
             screen.Exit();
             return true;
         }
 
-        // global play / bpm / loop_len
         if (e == Event::Character('p') || e == Event::Character('P')) {
             state.playing.store(!state.playing.load());
             if (!state.playing.load()) state.play_step.store(0);
@@ -598,7 +570,6 @@ Component build_session_ui(ScreenInteractive& screen, SessionState& state) {
             }
         }
 
-        // show/hide
         if (e == Event::Character('a')) { show_next_hidden(state); return true; }
         if (e == Event::Character('d')) { hide_cursor_track(state); return true; }
 
@@ -661,9 +632,6 @@ Component build_session_ui(ScreenInteractive& screen, SessionState& state) {
 // Startup page
 // ---------------------------------------------------------------------------
 
-// Slanted block-letter "BITJAMS". 5 lines tall, 59 columns wide. Each row
-// shifted 1 column left from the row above so the whole word leans forward
-// like an italic. Single purple color. Reads decisively at >= 80 cols.
 static const char* const BITJAMS_LOGO[] = {
     "    ██████╗ ██╗████████╗     ██╗ █████╗ ███╗   ███╗███████╗",
     "   ██╔══██╗██║╚══██╔══╝     ██║██╔══██╗████╗ ████║██╔════╝",
@@ -673,11 +641,8 @@ static const char* const BITJAMS_LOGO[] = {
 };
 static constexpr int BITJAMS_LOGO_LINES = sizeof(BITJAMS_LOGO) / sizeof(BITJAMS_LOGO[0]);
 
-// Dimmer purple for the underline accent below the logo.
 static const Color COL_PURPLE_DIM = Color::RGB(80, 55, 160);
 
-// Glyph row drawn under the logo for a bit of visual flair. Slanted to
-// echo the logo's lean.
 static const char* const BITJAMS_LOGO_UNDERLINE =
     "       ──── ──── ──── ──── ──── ──── ──── ────";
 
@@ -757,10 +722,6 @@ static Element render_host_info(const StartupCtx& ctx) {
                     | color(COL_PURPLE_DIM));
     return vbox(std::move(lines)) | center;
 }
-
-ftxui::Component build_startup_screens(ftxui::ScreenInteractive& screen,
-                                       const std::string& last_error,
-                                       StartupChoice& result_out);
 
 ftxui::Component build_startup_screens(ftxui::ScreenInteractive& screen,
                                        const std::string& last_error,
