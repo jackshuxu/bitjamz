@@ -2,60 +2,47 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <thread>
-#include <set>
-#include <iostream>
-#include <memory>
-#include <map>
 
 // note_to_freq(0) = 440 * 2^(-9/12) = 261.6256 Hz = C4
 static const float C4_HZ = 440.f * std::pow(2.f, -9.f / 12.f);
 
-std::map<uint16_t, SessionState*> SessionState::active_rooms;
-std::mutex SessionState::registry_mutex;
-
-uint16_t SessionState::generate_unique_id() {
-    std::lock_guard<std::mutex> lock(registry_mutex);
-    
-    uint16_t candidate = 1; // Starting room number
-    
-    // Find the first ID that isn't currently in the set
-    while (active_rooms.contains(candidate)) {
-        candidate++;
-    }
-
-    std::cout << "room created: " << candidate << std::endl;
-    
-    active_rooms[candidate] = this;
-
-    return candidate;
-}
-
-SessionState::SessionState(MsgState& state, bool is_shared) {
-    std::memcpy(&state_struct, &state, sizeof(MsgState));
-    session_id = state.session_id;
-    bpm = state.bpm;
-    
+SessionState::SessionState() {
+    // bpm, grid, track_active already initialized in declarations above.
     for (int t = 0; t < TRACKS; ++t) {
-        track_active[t] = (state.track_active >> t) & 1;
-
-        // Sync the Atomic Bitmask used for networking
-        dirty[t].store(state.dirty[t]);
-
-        // Unpack the bitmask into the 2D boolean grid
-        for (int s = 0; s < STEPS; ++s) {
-            grid[t][s] = (state.dirty[t] & (1 << s)) != 0;
+        if (TRACK_DEFS[t].type == TrackType::MELODIC) {
+            track_root_hz[t] = C4_HZ;
         }
     }
-
-    for (int t = 0; t < TRACKS; ++t)
-        if (TRACK_DEFS[t].type == TrackType::MELODIC) track_root_hz[t] = C4_HZ;
 }
 
-SessionState::~SessionState() {
-    // When a session is destroyed, free up the ID
-    std::lock_guard<std::mutex> lock(registry_mutex);
-    active_rooms.erase(session_id);
+SessionState::SessionState(const MsgState& s) {
+    session_id = s.session_id;
+    bpm        = s.bpm;
+    for (int t = 0; t < TRACKS; ++t) {
+        track_active[t] = (s.track_active[t] != 0);
+        for (int st = 0; st < STEPS; ++st) {
+            grid[t][st] = (s.grid[t][st] != 0);
+        }
+    }
+    // Melodic roots — same C4 init as default ctor.
+    for (int t = 0; t < TRACKS; ++t) {
+        if (TRACK_DEFS[t].type == TrackType::MELODIC) {
+            track_root_hz[t] = C4_HZ;
+        }
+    }
+}
+
+std::shared_ptr<SessionState> make_solo_session_state() {
+    auto s = std::make_shared<SessionState>();
+    static const bool kick_row[STEPS]  = {1,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0};
+    static const bool snare_row[STEPS] = {0,0,1,0,0,0,1,0,0,0,1,0,0,0,1,0};
+    static const bool chat_row[STEPS]  = {1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0};
+    std::memcpy(s->grid[0], kick_row,  sizeof(kick_row));
+    std::memcpy(s->grid[1], snare_row, sizeof(snare_row));
+    std::memcpy(s->grid[3], chat_row,  sizeof(chat_row));
+    return s;
 }
 
 void timing_thread(SessionState& s) {

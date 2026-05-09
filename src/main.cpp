@@ -1,22 +1,19 @@
 #define MA_IMPLEMENTATION
 #include "miniaudio.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <memory>
 #include <thread>
 #include <string>
-#include <sys/socket.h>
-#include <thread>
-#include <fstream>
-#include <poll.h>
-#include <iostream>
-#include <optional>
+
 #include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <netinet/in.h>
-#include <stop_token>
-#include <format>
+#include <sys/socket.h>
 
 #include <ftxui/component/event.hpp>
 #include <ftxui/component/screen_interactive.hpp>
@@ -26,38 +23,41 @@
 #include "ui.h"
 #include "network.h"
 
-// Runs one full bitjams session end-to-end: owns the SessionState,
-// starts the audio device, the timing thread, and the ftxui event loop,
-// and tears them all down on exit.
+namespace App {
+    inline std::atomic<bool> running{true};
+}
 
-// is_shared determines whether a session is public or private (yet to be used)
-static void main_session(bool is_shared) {
-    std::cout << "Before\n";
+// Picks the first non-loopback IPv4 interface address. Falls back to
+// "127.0.0.1" if no LAN interface is up. Used only to print the host's
+// reachable address on the HOST_INFO screen.
+std::string get_local_ipv4() {
+    struct ifaddrs* head = nullptr;
+    if (::getifaddrs(&head) != 0 || head == nullptr) {
+        return "127.0.0.1";
+    }
+    std::string result = "127.0.0.1";
+    for (struct ifaddrs* ifa = head; ifa != nullptr; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == nullptr) continue;
+        if (ifa->ifa_addr->sa_family != AF_INET) continue;
+        if (ifa->ifa_flags & IFF_LOOPBACK) continue;
+        if (!(ifa->ifa_flags & IFF_UP)) continue;
 
-    //if (is_shared) {
-    //    uint16_t session_id = SessionState::generate_unique_id();
-    //}
+        auto* sin = reinterpret_cast<sockaddr_in*>(ifa->ifa_addr);
+        if (sin->sin_addr.s_addr == 0) continue;
 
-    // init state struct
-    uint16_t init_src_dirty[TRACKS]= {0};
-    init_src_dirty[0] = 0x1111; // Kick
-    init_src_dirty[1] = 0x4444; // Snare
-    init_src_dirty[3] = 0x5555; // Chat
-    int32_t init_bpm = 120;
-    uint16_t init_track_active = 0xFFFF;
-    MsgState init_state(init_bpm, 0, init_track_active, init_src_dirty);
-    
-    auto state = std::make_shared<SessionState>(init_state, is_shared);
-    std::cout << "After\n";
+        char buf[INET_ADDRSTRLEN] = {0};
+        if (::inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf)) != nullptr) {
+            result = buf;
+            break;
+        }
+    }
+    ::freeifaddrs(head);
+    return result;
+}
 
-    // default pattern on the drum tracks (matches the MPC layout)
-    static const bool kick_row[STEPS]  = {1,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0};
-    static const bool snare_row[STEPS] = {0,0,1,0,0,0,1,0,0,0,1,0,0,0,1,0};
-    static const bool chat_row[STEPS]  = {1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0};
-    std::memcpy(state->grid[0], kick_row,  sizeof(kick_row));
-    std::memcpy(state->grid[1], snare_row, sizeof(snare_row));
-    std::memcpy(state->grid[3], chat_row,  sizeof(chat_row));
-
+// Runs one full bitjams session end-to-end: owns the SessionState's audio
+// device, timing thread, and ftxui event loop. Returns when the user quits.
+static void main_session(std::shared_ptr<SessionState> state) {
     ma_device_config cfg = ma_device_config_init(ma_device_type_playback);
     cfg.playback.format   = ma_format_f32;
     cfg.playback.channels = 2;
@@ -72,6 +72,7 @@ static void main_session(bool is_shared) {
     }
     ma_device_start(&dev);
 
+    state->running.store(true);
     std::thread timer(timing_thread, std::ref(*state));
 
     auto screen = ftxui::ScreenInteractive::Fullscreen();
@@ -84,123 +85,51 @@ static void main_session(bool is_shared) {
         }
     });
 
-    screen.Loop(build_ui(screen, *state));
+    screen.Loop(build_session_ui(screen, *state));
 
     state->running.store(false);
-
     refresher.join();
     timer.join();
     ma_device_uninit(&dev);
 }
 
-std::optional<uint32_t> string_to_IPv4(const std::string& ip_str) {
-    struct in_addr addr;
-    
-    if (inet_pton(AF_INET, ip_str.c_str(), &addr) != 1) {
-        // Invalid IP address
-        return std::nullopt;
-    }
-    
-    return ntohl(addr.s_addr);  // Convert from network to host byte order
-}
-
-void execute_repl_command(std::string repl_command) {
-    if (repl_command.empty()) {
-        return;
-    }
-
-    std::stringstream tok_stream(repl_command);
-    std::vector<std::string> toks;
-    std::string tok;
-
-    while (tok_stream >> tok) {
-        toks.push_back(tok);
-    }
-
-    char command = toks[0][0];
-
-    switch (command) {
-        case 's': {
-            if (toks.size() > 1) {
-                std::cout << "usage: s\n";
-            }
-
-            main_session(true);
-
-            break;
-        }
-        case 'p': {
-            if (toks.size() > 1) {
-                std::cout << "usage: p\n";
-            }
-
-            main_session(false);
-
-            break;
-        }
-        case 'c': {
-            if (toks.size() < 3) {
-                std::cout << "usage: c <ip> <room>\n";
-                break;
-            }
-            
-            std::string address_string = toks[1];
-            std::optional<uint32_t> address_num = string_to_IPv4(address_string);
-
-            if (!address_num.has_value()) {
-                std::cout << "invalid address provided\n";
-            } else {
-                uint16_t room = std::stoi(toks[2]);
-                Network::connect_to_server(address_num.value(), room);
-            }
-
-            break;
-        }
-        case 'q': {
-            if (toks.size() > 1) {
-                std::cout << "usage: q\n";
-
-                break;
-            }    
-
-            // TO-DO: Some state teardown alongside global bool
-            App::running.store(false);
-
-            break;
-        }
-        case 'h': {
-            std::cout << "s            : Starts a new public session and assigns room number.\n";
-            std::cout << "p            : Starts a new private session.\n";
-            std::cout << "c <ip> <room>: Attempts to connect to the desired ip address' room number.\n";
-            std::cout << "q            : Quit application.\n";
-            std::cout << "h            : Help menu (Yer lookin' at it).\n";
-            break;
-        }
-        default: {
-            std::cout << "Invalid command. Type h for a list of valid commands.\n";
-            break;
-        }
-    }
-}
-
-void repl_handler() {
-    std::string repl_command;
+int main() {
+    std::string last_error;
 
     while (App::running.load()) {
-        std::getline(std::cin, repl_command);
-        execute_repl_command(repl_command);
+        StartupChoice choice = run_startup_page(last_error);
+        last_error.clear();
+
+        switch (choice.mode) {
+            case StartupChoice::QUIT:
+                App::running.store(false);
+                break;
+
+            case StartupChoice::SOLO: {
+                auto state = make_solo_session_state();
+                main_session(state);
+                break;
+            }
+
+            case StartupChoice::HOST: {
+                auto state = make_solo_session_state();
+                state->session_id = choice.room;
+                Network::host(state);
+                main_session(state);
+                Network::stop();
+                break;
+            }
+
+            case StartupChoice::JOIN: {
+                auto state = Network::join(choice.ip.c_str(), choice.room);
+                if (!state) {
+                    last_error = "Could not join — host unreachable or wrong room.";
+                    break;
+                }
+                main_session(state);
+                break;
+            }
+        }
     }
-}
-
-int main() {
-    // TODO: startup page (solo / host / join) lands here, then dispatches
-    // into main_session with the chosen networking mode.
-    std::cout << "Welcome to TUI-DAW-Network Application!\n";
-    std::cout << "Enter your first command (press h for help menu)" << std::endl;
-
-    std::thread receive_connections_thread(Network::receive_connections);
-    repl_handler();
-    receive_connections_thread.join();
-
     return 0;
 }

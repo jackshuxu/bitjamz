@@ -4,9 +4,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <random>
 #include <string>
 #include <vector>
-#include <mutex>
 
 #include <ftxui/dom/elements.hpp>
 
@@ -72,8 +72,7 @@ static void fill_pattern(SessionState& s, int interval, int start) {
         fill_mask |= (1 << step);
     }
 
-    s.diff.dirty[cursor_track] |= fill_mask;
-    s.has_updates.store(true);
+    s.dirty[cursor_track].fetch_or(fill_mask, std::memory_order_relaxed);
 }
 
 //color palette
@@ -460,9 +459,7 @@ static void trigger_track_live(SessionState& s, int t) {
     }
 }
 
-Component build_ui(ScreenInteractive& screen, SessionState& state) {
-    std::lock_guard<std::mutex> lock(state.diff_mutex);
-
+Component build_session_ui(ScreenInteractive& screen, SessionState& state) {
     auto root = Renderer([&state] {
         Element page;
         if (nav_state == NavState::SYNTH_PAGE) {
@@ -494,19 +491,11 @@ Component build_ui(ScreenInteractive& screen, SessionState& state) {
             return true;
         }
         if (e == Event::Character('+') || e == Event::Character('=')) {
-            state.bpm = std::min(300, state.bpm + 5); 
-            state.diff.bpm_present = true;
-            state.diff.bpm = state.bpm;
-            state.has_updates = true;
-
+            state.bpm = std::min(300, state.bpm + 5);
             return true;
         }
         if (e == Event::Character('-')) {
-            state.bpm = std::max(40, state.bpm - 5); 
-            state.diff.bpm_present = true;
-            state.diff.bpm = state.bpm;
-            state.has_updates = true;
-
+            state.bpm = std::max(40, state.bpm - 5);
             return true;
         }
         if (e == Event::Character(']')) {
@@ -603,22 +592,15 @@ Component build_ui(ScreenInteractive& screen, SessionState& state) {
         if (e == Event::Character('s')) { seq_mode = !seq_mode; return true; }
         if (e == Event::Character('c')) {
             std::memset(state.grid[cursor_track], 0, sizeof(state.grid[cursor_track]));
-
-            state.diff.edited_tracks_mask |= (1 << cursor_track);
-            state.diff.dirty[cursor_track] = 0;
-            state.has_updates.store(true);
-
+            // Mark the entire track dirty so milestone-2 flush picks up the clear.
+            state.dirty[cursor_track].fetch_or(0xFFFFu, std::memory_order_relaxed);
             return true;
         }
         if (e == Event::Character('C')) {
             std::memset(state.grid, 0, sizeof(state.grid));
-
-            state.diff.edited_tracks_mask = (1 << TRACKS) - 1;
-            for (int t = 0; t < TRACKS; t++) {
-                state.diff.dirty[t] = 0;
+            for (int t = 0; t < TRACKS; ++t) {
+                state.dirty[t].fetch_or(0xFFFFu, std::memory_order_relaxed);
             }
-            state.has_updates.store(true);
-
             return true;
         }
 
@@ -630,15 +612,7 @@ Component build_ui(ScreenInteractive& screen, SessionState& state) {
                 if (c >= '1' && c <= '8') {
                     int step = window_start + (c - '1');
                     state.grid[cursor_track][step] = !state.grid[cursor_track][step];
-
-                    if (state.grid[cursor_track][step]) {
-                        state.diff.dirty[cursor_track] |= (1 << step);
-                    } else {
-                        state.diff.dirty[cursor_track] &= ~(1 << step);
-                    }
-
-                    state.diff.edited_tracks_mask |= (1 << cursor_track);
-
+                    state.dirty[cursor_track].fetch_or(1u << step, std::memory_order_relaxed);
                     return true;
                 }
             }
@@ -647,15 +621,7 @@ Component build_ui(ScreenInteractive& screen, SessionState& state) {
             if (e == Event::ArrowRight) { cursor_step = (cursor_step + 1) % STEPS;          return true; }
             if (e == Event::Character(' ')) {
                 state.grid[cursor_track][cursor_step] = !state.grid[cursor_track][cursor_step];
-
-                if (state.grid[cursor_track][cursor_step]) {
-                    state.diff.dirty[cursor_track] |= (1 << cursor_step);
-                } else {
-                    state.diff.dirty[cursor_track] &= ~(1 << cursor_step);
-                }
-
-                state.diff.edited_tracks_mask |= (1 << cursor_track);
-
+                state.dirty[cursor_track].fetch_or(1u << cursor_step, std::memory_order_relaxed);
                 return true;
             }
             if (e.is_character() && e.character().size() == 1) {
@@ -672,4 +638,232 @@ Component build_ui(ScreenInteractive& screen, SessionState& state) {
     });
 
     return with_events;
+}
+
+// ---------------------------------------------------------------------------
+// Startup page
+// ---------------------------------------------------------------------------
+
+// Slanted block-letter "BITJAMS". 5 lines tall, 59 columns wide. Each row
+// shifted 1 column left from the row above so the whole word leans forward
+// like an italic. Single purple color. Reads decisively at >= 80 cols.
+static const char* const BITJAMS_LOGO[] = {
+    "    ██████╗ ██╗████████╗     ██╗ █████╗ ███╗   ███╗███████╗",
+    "   ██╔══██╗██║╚══██╔══╝     ██║██╔══██╗████╗ ████║██╔════╝",
+    "  ██████╔╝██║   ██║        ██║███████║██╔████╔██║███████╗ ",
+    " ██╔══██╗██║   ██║   ██   ██║██╔══██║██║╚██╔╝██║╚════██║  ",
+    "██████╔╝██║   ██║   ╚█████╔╝██║  ██║██║ ╚═╝ ██║███████║   ",
+};
+static constexpr int BITJAMS_LOGO_LINES = sizeof(BITJAMS_LOGO) / sizeof(BITJAMS_LOGO[0]);
+
+// Dimmer purple for the underline accent below the logo.
+static const Color COL_PURPLE_DIM = Color::RGB(80, 55, 160);
+
+// Glyph row drawn under the logo for a bit of visual flair. Slanted to
+// echo the logo's lean.
+static const char* const BITJAMS_LOGO_UNDERLINE =
+    "       ──── ──── ──── ──── ──── ──── ──── ────";
+
+static uint16_t generate_room_id() {
+    static std::mt19937 engine(std::random_device{}());
+    std::uniform_int_distribution<uint16_t> dist(1, 65535);
+    return dist(engine);
+}
+
+static Element render_logo() {
+    Elements rows;
+    for (int i = 0; i < BITJAMS_LOGO_LINES; ++i) {
+        rows.push_back(text(BITJAMS_LOGO[i]) | color(COL_PURPLE));
+    }
+    rows.push_back(text(BITJAMS_LOGO_UNDERLINE) | color(COL_PURPLE_DIM));
+    return vbox(std::move(rows));
+}
+
+namespace {
+
+constexpr int LANDING    = 0;
+constexpr int HOST_INFO  = 1;
+constexpr int JOIN_ENTRY = 2;
+
+struct StartupCtx {
+    int           current      = LANDING;
+    uint16_t      room         = 0;
+    std::string   ip_buf;
+    std::string   room_buf;
+    std::string   last_error;
+    StartupChoice* result      = nullptr;
+    ftxui::ScreenInteractive*  screen = nullptr;
+    std::string   local_ip     = "(unknown)";  // display-only
+};
+
+} // namespace
+
+// Picks the first non-loopback IPv4 interface address. Used only for the
+// HOST_INFO confirmation screen. Implementation in main.cpp.
+extern std::string get_local_ipv4();
+
+static Element render_landing(const StartupCtx& ctx) {
+    Elements lines;
+    lines.push_back(render_logo());
+    lines.push_back(text(""));
+    lines.push_back(text(""));
+    lines.push_back(text("    [h]  host a session") | color(COL_PURPLE));
+    lines.push_back(text("    [j]  join a session") | color(COL_PURPLE));
+    lines.push_back(text("    [s]  solo")           | color(COL_PURPLE));
+    lines.push_back(text("    [q]  quit")           | color(COL_PURPLE));
+    if (!ctx.last_error.empty()) {
+        lines.push_back(text(""));
+        lines.push_back(text("  " + ctx.last_error) | color(Color::Red));
+    }
+    return vbox(std::move(lines)) | center;
+}
+
+static Element render_host_info(const StartupCtx& ctx) {
+    char room_buf[16];
+    std::snprintf(room_buf, sizeof(room_buf), "%u", (unsigned)ctx.room);
+
+    Elements lines;
+    lines.push_back(render_logo());
+    lines.push_back(text(""));
+    lines.push_back(text("  hosting on this machine") | color(COL_PURPLE));
+    lines.push_back(text(""));
+    lines.push_back(hbox({
+        text("    ip:    ")   | color(COL_PURPLE_DIM),
+        text(ctx.local_ip)    | color(COL_PURPLE),
+    }));
+    lines.push_back(hbox({
+        text("    room:  ")   | color(COL_PURPLE_DIM),
+        text(room_buf)        | color(COL_PURPLE),
+    }));
+    lines.push_back(text(""));
+    lines.push_back(text("    [enter]  start session    [esc]  back")
+                    | color(COL_PURPLE_DIM));
+    return vbox(std::move(lines)) | center;
+}
+
+ftxui::Component build_startup_screens(ftxui::ScreenInteractive& screen,
+                                       const std::string& last_error,
+                                       StartupChoice& result_out);
+
+ftxui::Component build_startup_screens(ftxui::ScreenInteractive& screen,
+                                       const std::string& last_error,
+                                       StartupChoice& result_out) {
+    auto ctx = std::make_shared<StartupCtx>();
+    ctx->result     = &result_out;
+    ctx->screen     = &screen;
+    ctx->last_error = last_error;
+    ctx->local_ip   = get_local_ipv4();
+
+    auto ip_field   = Input(&ctx->ip_buf,   "192.168.1.42");
+    auto room_field = Input(&ctx->room_buf, "room number");
+    auto join_form  = Container::Vertical({ip_field, room_field});
+
+    // Single renderer that switches by ctx->current. Wraps the join form so
+    // its Input fields receive keystrokes when JOIN_ENTRY is active.
+    auto root = Renderer(join_form, [ctx, ip_field, room_field] {
+        switch (ctx->current) {
+            case HOST_INFO: return render_host_info(*ctx);
+            case JOIN_ENTRY: {
+                Elements lines;
+                lines.push_back(render_logo());
+                lines.push_back(text(""));
+                lines.push_back(text("  join an existing session") | color(COL_PURPLE));
+                lines.push_back(text(""));
+                lines.push_back(hbox({
+                    text("    ip:    ")  | color(COL_PURPLE_DIM),
+                    ip_field->Render()   | color(COL_PURPLE) | size(WIDTH, EQUAL, 24),
+                }));
+                lines.push_back(hbox({
+                    text("    room:  ") | color(COL_PURPLE_DIM),
+                    room_field->Render() | color(COL_PURPLE) | size(WIDTH, EQUAL, 24),
+                }));
+                if (!ctx->last_error.empty()) {
+                    lines.push_back(text(""));
+                    lines.push_back(text("  " + ctx->last_error) | color(Color::Red));
+                }
+                lines.push_back(text(""));
+                lines.push_back(text("    [enter]  join    [esc]  back")
+                                | color(COL_PURPLE_DIM));
+                return vbox(std::move(lines)) | center;
+            }
+            case LANDING:
+            default:
+                return render_landing(*ctx);
+        }
+    });
+
+    auto with_events = CatchEvent(root, [ctx](Event e) -> bool {
+        switch (ctx->current) {
+            case LANDING: {
+                if (e == Event::Character('h') || e == Event::Character('H')) {
+                    ctx->room    = generate_room_id();
+                    ctx->current = HOST_INFO;
+                    return true;
+                }
+                if (e == Event::Character('j') || e == Event::Character('J')) {
+                    ctx->last_error.clear();
+                    ctx->current = JOIN_ENTRY;
+                    return true;
+                }
+                if (e == Event::Character('s') || e == Event::Character('S')) {
+                    *ctx->result = StartupChoice{StartupChoice::SOLO, "", 0};
+                    ctx->screen->Exit();
+                    return true;
+                }
+                if (e == Event::Character('q') || e == Event::Character('Q')) {
+                    *ctx->result = StartupChoice{StartupChoice::QUIT, "", 0};
+                    ctx->screen->Exit();
+                    return true;
+                }
+                return false;
+            }
+            case HOST_INFO: {
+                if (e == Event::Return) {
+                    *ctx->result = StartupChoice{StartupChoice::HOST, "", ctx->room};
+                    ctx->screen->Exit();
+                    return true;
+                }
+                if (e == Event::Escape) {
+                    ctx->current = LANDING;
+                    return true;
+                }
+                return false;
+            }
+            case JOIN_ENTRY: {
+                // Only consume Enter and Escape — let everything else fall
+                // through to the Input fields so they can receive keystrokes.
+                if (e == Event::Return) {
+                    if (ctx->ip_buf.empty() || ctx->room_buf.empty()) return true;
+                    int parsed = 0;
+                    try { parsed = std::stoi(ctx->room_buf); }
+                    catch (...) { return true; }
+                    if (parsed < 1 || parsed > 65535) return true;
+                    *ctx->result = StartupChoice{
+                        StartupChoice::JOIN,
+                        ctx->ip_buf,
+                        static_cast<uint16_t>(parsed)
+                    };
+                    ctx->screen->Exit();
+                    return true;
+                }
+                if (e == Event::Escape) {
+                    ctx->current = LANDING;
+                    return true;
+                }
+                return false;
+            }
+        }
+        return false;
+    });
+
+    return with_events;
+}
+
+StartupChoice run_startup_page(const std::string& last_error) {
+    auto screen = ftxui::ScreenInteractive::Fullscreen();
+    screen.TrackMouse(false);
+    StartupChoice result;
+    auto root = build_startup_screens(screen, last_error, result);
+    screen.Loop(root);
+    return result;
 }

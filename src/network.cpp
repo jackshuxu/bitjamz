@@ -1,152 +1,187 @@
-#include <chrono>
-#include <cmath>
-#include <thread>
-#include <set>
-#include <iostream>
+#include "network.h"
+#include "session.h"
+
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sys/socket.h>
 #include <unistd.h>
+#include <cerrno>
+#include <cstring>
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <vector>
 
-#include "session.h"
-#include "network.h"
+namespace {
 
-int Network::connect_to_server(uint32_t address_num, uint16_t room) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    
-    if (sock < 0) {
-        std::perror("Socket creation failed");
-        return -1;
+std::atomic<bool>          g_stop{false};
+int                        g_listener_fd = -1;
+std::thread                g_listener_thread;
+std::mutex                 g_peers_mutex;
+std::vector<std::thread>   g_peer_threads;
+
+bool send_all(int sock, const void* buf, size_t len) {
+    const auto* p = static_cast<const uint8_t*>(buf);
+    while (len > 0) {
+        ssize_t n = ::send(sock, p, len, 0);
+        if (n <= 0) return false;
+        p   += n;
+        len -= static_cast<size_t>(n);
     }
-
-    struct sockaddr_in serv_addr;
-    std::memset(&serv_addr, 0, sizeof(serv_addr));
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(App::GLOBAL_PORT);
-    serv_addr.sin_addr.s_addr = htonl(address_num);
-
-    // This is a blocking call
-    if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-        std::perror("Connection failed");
-        close(sock);
-        return -1;
-    }
-
-    std::cout << "Connected! Sending join request for room " << room << "...\n";
-
-    // Expected to get response back from host as to whether a valid room was selected
-    send(sock, &room, sizeof(room), 0);
-
-    uint8_t response;
-    recv(sock, &response, 1, 0);
-
-    if (response == App::STATUS_FAILURE) {
-        std::cerr << "Error: Room does not exist!" << std::endl;
-    }
-
-    uint8_t success_code = App::STATUS_SUCCESS;
-    send(sock, &success_code, 1, 0);
-    std::cout << "Connected to room!" << std::endl;
-
-    // Need to add loop for receiving information
-    // Perhaps we also kick off a thread here that handles sending updates
-
-    return 0;
+    return true;
 }
 
-void Network::client_handler(int client_sock) {
-    uint16_t requested_room = 0;
-    int bytes_received = recv(client_sock, &requested_room, sizeof(requested_room), 0);
-    requested_room = ntohs(requested_room);
+bool recv_all(int sock, void* buf, size_t len) {
+    auto* p = static_cast<uint8_t*>(buf);
+    while (len > 0) {
+        ssize_t n = ::recv(sock, p, len, 0);
+        if (n <= 0) return false;
+        p   += n;
+        len -= static_cast<size_t>(n);
+    }
+    return true;
+}
 
-    if (bytes_received <= 0) {
-        std::cout << "Client disconnected before sending room ID.\n";
-        close(client_sock);
+MsgState build_msg_state(const SessionState& s) {
+    MsgState m{};
+    m.session_id = htons(s.session_id);
+    m.bpm        = htonl(s.bpm);
+    for (int t = 0; t < TRACKS; ++t) {
+        m.track_active[t] = s.track_active[t] ? 1 : 0;
+        for (int st = 0; st < STEPS; ++st) {
+            m.grid[t][st] = s.grid[t][st] ? 1 : 0;
+        }
+    }
+    return m;
+}
 
+void apply_msg_state(SessionState& s, const MsgState& m) {
+    s.session_id = ntohs(m.session_id);
+    s.bpm        = ntohl(m.bpm);
+    for (int t = 0; t < TRACKS; ++t) {
+        s.track_active[t] = (m.track_active[t] != 0);
+        for (int st = 0; st < STEPS; ++st) {
+            s.grid[t][st] = (m.grid[t][st] != 0);
+        }
+    }
+}
+
+void per_peer_handler(int sock, std::shared_ptr<SessionState> state) {
+    uint8_t  type = 0;
+    uint16_t room_n = 0;
+    if (!recv_all(sock, &type, 1))                 { ::close(sock); return; }
+    if (type != MSG_HANDSHAKE)                     { ::close(sock); return; }
+    if (!recv_all(sock, &room_n, sizeof(room_n)))  { ::close(sock); return; }
+    uint16_t room = ntohs(room_n);
+
+    if (room != state->session_id) {
+        uint8_t fail = MSG_HANDSHAKE_FAIL;
+        send_all(sock, &fail, 1);
+        ::close(sock);
         return;
     }
 
-    bool room_exists = false;
+    MsgState m = build_msg_state(*state);
+    uint8_t tag = MSG_STATE;
+    send_all(sock, &tag, 1);
+    send_all(sock, &m,   sizeof(m));
+    ::close(sock);
+}
 
-    for (const auto& [key, value] : SessionState::active_rooms) {
-        if (key == requested_room) {
-            room_exists = true;
+void listener_loop(std::shared_ptr<SessionState> state) {
+    while (!g_stop.load()) {
+        sockaddr_in peer{};
+        socklen_t   peer_len = sizeof(peer);
+        int sock = ::accept(g_listener_fd, reinterpret_cast<sockaddr*>(&peer), &peer_len);
+        if (sock < 0) {
+            if (g_stop.load()) break;
+            // Transient accept error: avoid a hot spin loop on EBADF/ECONNABORTED/etc.
+            if (errno == EINTR) continue;
             break;
         }
+        std::lock_guard<std::mutex> lock(g_peers_mutex);
+        g_peer_threads.emplace_back(per_peer_handler, sock, state);
     }
+}
 
-    if (!room_exists) {
-        uint8_t error_code = 0xFF; // Define 0xFF as "Room doesn't exist"
-        send(client_sock, &error_code, 1, 0);
+} // anonymous namespace
 
-        std::cout << "Client's desired room does not exist; closing connection\n";
-        close(client_sock);
+void Network::host(std::shared_ptr<SessionState> state) {
+    g_stop.store(false);
 
+    g_listener_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    int opt = 1;
+    ::setsockopt(g_listener_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port        = htons(NET_PORT);
+    if (::bind(g_listener_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        ::perror("bind");
+        ::close(g_listener_fd);
+        g_listener_fd = -1;
+        return;
+    }
+    if (::listen(g_listener_fd, 5) < 0) {
+        ::perror("listen");
+        ::close(g_listener_fd);
+        g_listener_fd = -1;
         return;
     }
 
-    // Room exists, send notif
-    uint8_t success_code = App::STATUS_SUCCESS;
-    send(client_sock, &success_code, 1, 0);
-    
-    // Verifying client acks new connection
-    uint8_t client_response;
-    recv(client_sock, &client_response, sizeof(client_response), 0);
-
-    if (client_response == App::STATUS_FAILURE) {
-        std::cout << std::format("Client joined room {}\n", requested_room);
-    }
-    
-    SessionState* state = SessionState::active_rooms[requested_room];
-    // Sending initial state
-    send(client_sock, &(state->state_struct), sizeof(MsgState), 0);
-
-    auto interval = std::chrono::milliseconds(NET_FLUSH_MS);
-    auto next_wakeup = std::chrono::steady_clock::now() + interval;
-
-    // Loop sending updates
-    while (true) {
-        if (state->has_updates.load()) {
-            std::cout << "has updates" << std::endl;
-            MsgDiff diff = state->diff;
-            ssize_t sent = send(client_sock, &diff, sizeof(MsgDiff), 0);
-            
-            if (sent <= 0) break;
-            
-            state->has_updates.store(false);
-        } else {
-            std::cout << "has no updates" << std::endl;
-        }
-
-        std::this_thread::sleep_until(next_wakeup);
-        next_wakeup += interval;
-    }
-
-    close(client_sock);
+    g_listener_thread = std::thread(listener_loop, state);
 }
 
-void Network::receive_connections() {
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    
-    // Allow immediate reuse of the port after restart
-    int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+std::shared_ptr<SessionState> Network::join(const char* ip, uint16_t room) {
+    int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return nullptr;
 
-    sockaddr_in address;
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY; // Listen on all network cards
-    address.sin_port = htons(5000);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(NET_PORT);
+    if (::inet_pton(AF_INET, ip, &addr.sin_addr) != 1) {
+        ::close(sock);
+        return nullptr;
+    }
+    if (::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        ::close(sock);
+        return nullptr;
+    }
 
-    bind(server_fd, (struct sockaddr*)&address, sizeof(address));
-    listen(server_fd, 5); // Queue up to 5 pending connections
+    uint8_t  hs = MSG_HANDSHAKE;
+    uint16_t rn = htons(room);
+    if (!send_all(sock, &hs, 1) ||
+        !send_all(sock, &rn, sizeof(rn))) {
+        ::close(sock);
+        return nullptr;
+    }
 
-    while (true) {
-        int client_sock = accept(server_fd, nullptr, nullptr);
+    uint8_t resp = 0;
+    if (!recv_all(sock, &resp, 1))  { ::close(sock); return nullptr; }
+    if (resp == MSG_HANDSHAKE_FAIL) { ::close(sock); return nullptr; }
+    if (resp != MSG_STATE)          { ::close(sock); return nullptr; }
 
-        if (client_sock >= 0) {
-            // New user connected! Spawn a thread to handle them
-            std::thread([client_sock]() {
-                client_handler(client_sock);
-            }).detach();
-        }
+    MsgState m{};
+    if (!recv_all(sock, &m, sizeof(m))) { ::close(sock); return nullptr; }
+    ::close(sock);
+
+    auto s = std::make_shared<SessionState>();
+    apply_msg_state(*s, m);
+    return s;
+}
+
+void Network::stop() {
+    g_stop.store(true);
+    if (g_listener_fd >= 0) {
+        ::shutdown(g_listener_fd, SHUT_RDWR);
+        ::close(g_listener_fd);
+        g_listener_fd = -1;
+    }
+    if (g_listener_thread.joinable()) g_listener_thread.join();
+    {
+        std::lock_guard<std::mutex> lock(g_peers_mutex);
+        for (auto& th : g_peer_threads) if (th.joinable()) th.join();
+        g_peer_threads.clear();
     }
 }

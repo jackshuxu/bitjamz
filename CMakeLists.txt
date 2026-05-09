@@ -36,3 +36,21 @@ elseif(UNIX)
 endif()
 
 target_compile_options(bitjams PRIVATE -O2)
+
+# --- Tests -----------------------------------------------------------------
+enable_testing()
+
+add_executable(test_net
+    tests/test_net.cpp
+    src/session.cpp
+    src/network.cpp
+)
+target_include_directories(test_net PRIVATE include src)
+if(APPLE)
+    # No platform libs required for loopback TCP on macOS.
+elseif(UNIX)
+    target_link_libraries(test_net PRIVATE pthread)
+endif()
+target_compile_options(test_net PRIVATE -O2)
+
+add_test(NAME net_tests COMMAND test_net)

@@ -2,19 +2,10 @@
 
 #include <atomic>
 #include <cstdint>
-#include <set>
 #include <memory>
-#include <map>
 
 // Anything used by more than one module (audio, ui, net, main) lives here.
 // Per-module helpers live in that module's own .cpp as file-locals.
-
-namespace App {
-    inline std::atomic<bool> running{true};
-    inline uint16_t GLOBAL_PORT = 1234;
-    inline constexpr uint8_t STATUS_SUCCESS = 0x00;
-    inline constexpr uint8_t STATUS_FAILURE = 0xFF;
-}
 
 inline constexpr int TRACKS         = 12;
 inline constexpr int STEPS          = 16;
@@ -66,48 +57,46 @@ inline constexpr TrackDef TRACK_DEFS[TRACKS] = {
 // Full snapshot of the serializable portion of SessionState. Sent by the
 // host to a joiner immediately after a successful handshake. Replaces the
 // joiner's local state entirely.
+//
+// Wire layout (network byte order for multi-byte ints):
+//   uint16_t session_id          (htons/ntohs at boundary)
+//   int32_t  bpm                 (htonl/ntohl at boundary)
+//   uint8_t  track_active[TRACKS]
+//   uint8_t  grid[TRACKS][STEPS]
 struct __attribute__((packed)) MsgState {
-    MsgState() {
-        session_id = 0;
-        bpm = 120;
-        track_active = 0xFFFF;
-    }
-
-    MsgState(int32_t bpm, uint16_t session_id, uint16_t track_active, uint16_t const src_dirty[TRACKS]):
-        bpm(bpm), session_id(session_id), track_active(track_active) {
-            std::copy(src_dirty, src_dirty + TRACKS, dirty);
-        }
-    uint16_t session_id;
-    int32_t  bpm;
-    uint16_t track_active;       // 0/1 per track
-    uint16_t dirty[TRACKS];      // 0/1 per cell
+    uint16_t session_id;                  // network byte order on the wire
+    int32_t  bpm;                         // network byte order on the wire
+    uint8_t  track_active[TRACKS];        // 0/1 per track
+    uint8_t  grid[TRACKS][STEPS];         // 0/1 per cell, row-major
 };
+static_assert(sizeof(MsgState) == 2 + 4 + TRACKS + TRACKS * STEPS,
+              "MsgState packed size unexpected");
 
-// One changed cell carried inside a MsgDiff payload.
-struct __attribute__((packed)) DiffCell {
-    uint8_t track; // 0..TRACKS-1
-    uint8_t step;  // 0..STEPS-1
-    uint8_t value; // 0/1
-};
-
-// Maximum cells that can ride in a single diff. Equal to one full grid
-// because the dirty bitmask claims at most one bit per cell per flush.
-inline constexpr int DIFF_MAX_CELLS = TRACKS * STEPS;
-
-// Incremental edit batch. Sent on every flush window where any field
-// changed. `cell_count` indicates how many entries of `cells` are valid.
-// `bpm_present` and `track_active_present` flag whether their respective
-// optional fields carry new values for this batch.
-struct __attribute__((packed)) MsgDiff {
-    uint16_t edited_tracks_mask;
-    uint16_t dirty[TRACKS];
-
-    uint8_t  bpm_present;          // 0/1
-    int32_t  bpm;                  // valid iff bpm_present
-
-    uint8_t  track_active_present; // 0/1
-    uint16_t track_active_mask;    // bit t = track_active[t]; valid iff present
-};
+// TODO(milestone-2): live diff propagation
+//
+// // One changed cell carried inside a MsgDiff payload.
+// struct __attribute__((packed)) DiffCell {
+//     uint8_t track; // 0..TRACKS-1
+//     uint8_t step;  // 0..STEPS-1
+//     uint8_t value; // 0/1
+// };
+//
+// // Maximum cells that can ride in a single diff. Equal to one full grid
+// // because the dirty bitmask claims at most one bit per cell per flush.
+// inline constexpr int DIFF_MAX_CELLS = TRACKS * STEPS;
+//
+// // Incremental edit batch. Sent on every flush window where any field
+// // changed.
+// struct __attribute__((packed)) MsgDiff {
+//     uint16_t edited_tracks_mask;
+//     uint16_t dirty[TRACKS];
+//
+//     uint8_t  bpm_present;          // 0/1
+//     int32_t  bpm;                  // valid iff bpm_present
+//
+//     uint8_t  track_active_present; // 0/1
+//     uint16_t track_active_mask;    // bit t = track_active[t]; valid iff present
+// };
 
 // One bitjams session.
 //
@@ -122,19 +111,14 @@ struct __attribute__((packed)) MsgDiff {
 //        play_step, playing, running, trig, loop_len
 //   3. Networking bookkeeping — only meaningful in multi-peer mode:
 //        session_id, dirty
-
 class SessionState {
 public:
-    SessionState(MsgState& state, bool is_shared);
-    ~SessionState();
-
-    uint16_t generate_unique_id();
-    static std::map<uint16_t, SessionState*> active_rooms;
-    static std::mutex registry_mutex;
+    SessionState();                          // default solo state
+    SessionState(const MsgState& state);     // joiner-from-network
+    ~SessionState() = default;
 
     // --- networking bookkeeping ---
     uint16_t session_id = 0;
-    std::atomic<bool> has_updates{false}; // Indicates whether there is updated DAW info to share
 
     // --- shared creative state (synced) ---
     bool  grid[TRACKS][STEPS] = {};
@@ -144,7 +128,7 @@ public:
         true, true, true, true,
     };
     float track_root_hz[TRACKS] = {};
-    int   bpm;
+    int   bpm = 120;
 
     // --- per-peer runtime (not synced) ---
     int               loop_len = STEPS;
@@ -157,14 +141,15 @@ public:
 
     // --- networking bookkeeping ---
     // One bitmask per track, one bit per step. UI sets bits via fetch_or
-    // when it edits a cell; the flush thread claims them via exchange(0)
-    // every NET_FLUSH_MS to construct outbound diffs. Never serialized.
+    // when it edits a cell; the milestone-2 flush thread will claim them
+    // via exchange(0) every NET_FLUSH_MS to construct outbound diffs. They
+    // accumulate harmlessly in solo mode.
     std::atomic<uint16_t> dirty[TRACKS] = {};
-
-    std::mutex diff_mutex; // Might not be necessary I think only one thread is managing diff state
-    MsgState state_struct {};
-    MsgDiff diff {};
 };
+
+// Solo / host default constructor wrapper. Builds a SessionState with the
+// default drum pattern stamped onto kick / snare / chat tracks.
+std::shared_ptr<SessionState> make_solo_session_state();
 
 // The sequencer clock: walks SessionState::grid step by step at the
 // session's bpm, writing to SessionState::trig for the audio callback.
