@@ -9,10 +9,9 @@
 StereoSample     vis_buf[VIS_BUF];
 std::atomic<int> vis_wp{0};
 
-std::atomic<float> synth_trig_freq[MELODIC_VOICES] = {
-    std::atomic<float>{-1.f}, std::atomic<float>{-1.f},
-    std::atomic<float>{-1.f}, std::atomic<float>{-1.f},
-};
+// synth_trig_freq is defined in session.cpp (the timing thread is also a
+// producer; defining it there keeps the symbol available to the test binary
+// which doesn't link audio.cpp).
 std::atomic<int>   synth_osc_atom{0};
 
 // Per-track stereo placement (lightly varied to keep things from collapsing to mono).
@@ -177,14 +176,28 @@ struct SynthVoice {
     float elapsed_s;
     float pitch_hz;
 };
-static SynthVoice synth_voices[MELODIC_VOICES] = {};
 
-static void trigger_synth(int idx, float pitch_hz) {
-    synth_voices[idx] = { true, 0.f, 1.f, 0.f, pitch_hz };
+// Per-melodic-track polyphony pool. Each new trigger claims an inactive
+// voice; if all are active, the longest-running voice is stolen.
+static constexpr int VOICES_PER_TRACK = 8;
+static SynthVoice synth_voices[MELODIC_VOICES][VOICES_PER_TRACK] = {};
+
+static void trigger_synth_polyphonic(int idx, float pitch_hz) {
+    int chosen = -1;
+    float worst_elapsed = -1.f;
+    int   worst_idx     = 0;
+    for (int v = 0; v < VOICES_PER_TRACK; ++v) {
+        if (!synth_voices[idx][v].active) { chosen = v; break; }
+        if (synth_voices[idx][v].elapsed_s > worst_elapsed) {
+            worst_elapsed = synth_voices[idx][v].elapsed_s;
+            worst_idx     = v;
+        }
+    }
+    if (chosen < 0) chosen = worst_idx;  // voice-steal: drop oldest
+    synth_voices[idx][chosen] = { true, 0.f, 1.f, 0.f, pitch_hz };
 }
 
-static float render_synth_voice(int idx) {
-    SynthVoice& v = synth_voices[idx];
+static float render_one_voice(SynthVoice& v) {
     if (!v.active) return 0.f;
 
     const float dt = 1.f / SAMPLE_RATE;
@@ -211,6 +224,19 @@ static float render_synth_voice(int idx) {
     return sample * v.level_env * 0.4f;
 }
 
+// Sum every active voice in a track's pool. A chord of N notes superposes
+// here; trigger time was already separate (one enqueue per onset).
+static float render_synth_track(int idx) {
+    float sum = 0.f;
+    for (int v = 0; v < VOICES_PER_TRACK; ++v) {
+        sum += render_one_voice(synth_voices[idx][v]);
+    }
+    // Soft attenuation to keep N-voice chords from clipping. /sqrt(N) is the
+    // textbook equal-power rule; we apply a milder constant so loud single
+    // notes still feel loud.
+    return sum * 0.6f;
+}
+
 void audio_callback(ma_device* dev, void* out, const void* /*in*/, ma_uint32 frames) {
     float* buf = (float*)out;
     SessionState* state = static_cast<SessionState*>(dev->pUserData);
@@ -230,14 +256,20 @@ void audio_callback(ma_device* dev, void* out, const void* /*in*/, ma_uint32 fra
                 case DK_CYMBAL:     trigger_cymbal();     break;
             }
         } else {
-            // TODO: piano roll - per-step pitch + velocity
-            trigger_synth(td.melodic_idx, state->track_root_hz[t]);
+            // Fallback live-trigger path. Sequencer + UI keys go through
+            // synth_trig_pool instead so chords don't collapse.
+            trigger_synth_polyphonic(td.melodic_idx,
+                                     midi_to_hz(state->track_root_midi[t]));
         }
     }
 
+    // Drain every pool slot. Each surviving freq claims its own voice, so an
+    // N-note chord all fired in the same audio block plays as N voices.
     for (int m = 0; m < MELODIC_VOICES; ++m) {
-        float f = synth_trig_freq[m].exchange(-1.f);
-        if (f > 0.f) trigger_synth(m, f);
+        for (int i = 0; i < TRIG_POOL_SIZE; ++i) {
+            float f = synth_trig_pool[m][i].exchange(-1.f);
+            if (f > 0.f) trigger_synth_polyphonic(m, f);
+        }
     }
 
     int wp = vis_wp.load(std::memory_order_relaxed);
@@ -257,7 +289,7 @@ void audio_callback(ma_device* dev, void* out, const void* /*in*/, ma_uint32 fra
         for (int t = 0; t < TRACKS; ++t) {
             const TrackDef& td = TRACK_DEFS[t];
             if (td.type != TrackType::MELODIC) continue;
-            float v = render_synth_voice(td.melodic_idx);
+            float v = render_synth_track(td.melodic_idx);
             float a = (TRACK_PAN[t] + 1.f) * (float)M_PI * 0.25f;
             mix_l += v * std::cos(a);
             mix_r += v * std::sin(a);

@@ -16,8 +16,14 @@
 // Internal helpers exposed by network.cpp so tests can drive a second joiner
 // over a raw socket without going through Network::join's single-slot globals.
 namespace bitjams_net_internal {
+    bool   send_msg_state(int sock, const SessionState& s);
+    bool   recv_and_apply_msg_state(int sock, SessionState& s);
     size_t build_msg_edit(SessionState& s, uint8_t* buf, size_t buf_cap);
     bool   recv_and_apply_msg_edit(int sock, SessionState& s, bool is_joiner);
+    size_t build_msg_melodic_track(int melodic_idx, const std::vector<Note>& notes,
+                                   uint8_t* buf, size_t buf_cap);
+    bool   recv_and_apply_msg_melodic_track(int sock, SessionState& s, bool is_joiner);
+    size_t build_pending_aux(SessionState& s, uint8_t* buf, size_t buf_cap);
 }
 
 // Hand-rolled secondary joiner. First joiner uses Network::join; this one
@@ -50,24 +56,11 @@ public:
         if (::recv(s, &resp, 1, MSG_WAITALL) != 1) { ::close(s); return nullptr; }
         if (resp != MSG_STATE)                      { ::close(s); return nullptr; }
 
-        MsgState m{};
-        size_t got = 0;
-        while (got < sizeof(m)) {
-            ssize_t n = ::recv(s, reinterpret_cast<uint8_t*>(&m) + got, sizeof(m) - got, 0);
-            if (n <= 0) { ::close(s); return nullptr; }
-            got += static_cast<size_t>(n);
-        }
-
         auto j = std::unique_ptr<TestJoiner>(new TestJoiner());
         j->sock  = s;
         j->state = std::make_shared<SessionState>();
-        j->state->session_id = ntohs(m.session_id);
-        j->state->bpm        = ntohl(m.bpm);
-        for (int t = 0; t < TRACKS; ++t) {
-            j->state->track_active[t] = (m.track_active[t] != 0);
-            for (int st = 0; st < STEPS; ++st) {
-                j->state->grid[t][st] = (m.grid[t][st] != 0);
-            }
+        if (!bitjams_net_internal::recv_and_apply_msg_state(s, *j->state)) {
+            ::close(s); return nullptr;
         }
         j->state->is_joiner = true;
         j->state->network_alive.store(true);
@@ -113,21 +106,31 @@ private:
         state->network_alive.store(false);
     }
 
+    void send_buf(const uint8_t* buf, size_t total) {
+        size_t sent = 0;
+        while (sent < total) {
+            ssize_t n = ::send(sock, buf + sent, total - sent, 0);
+            if (n <= 0) { state->network_alive.store(false); return; }
+            sent += static_cast<size_t>(n);
+        }
+    }
+
     void flush_loop() {
-        uint8_t buf[1024];
+        uint8_t buf[2048];
         while (state->network_alive.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(NET_FLUSH_MS));
             if (!state->network_alive.load()) break;
             size_t payload_len = bitjams_net_internal::build_msg_edit(*state, buf + 1, sizeof(buf) - 1);
-            if (payload_len == 0) continue;
-            buf[0] = MSG_EDIT;
-            size_t total = payload_len + 1;
-            size_t sent = 0;
-            const uint8_t* p = buf;
-            while (sent < total) {
-                ssize_t n = ::send(sock, p + sent, total - sent, 0);
-                if (n <= 0) { state->network_alive.store(false); return; }
-                sent += static_cast<size_t>(n);
+            if (payload_len > 0) {
+                buf[0] = MSG_EDIT;
+                send_buf(buf, payload_len + 1);
+                if (!state->network_alive.load()) return;
+            }
+            for (;;) {
+                size_t n = bitjams_net_internal::build_pending_aux(*state, buf, sizeof(buf));
+                if (n == 0) break;
+                send_buf(buf, n);
+                if (!state->network_alive.load()) return;
             }
         }
     }
@@ -142,11 +145,11 @@ static void test_state_sync() {
     auto host_state = std::make_shared<SessionState>();
     host_state->session_id      = 4242;
     host_state->bpm             = 137;
-    host_state->grid[2][5]      = true;
-    host_state->grid[7][9]      = true;
-    host_state->grid[11][15]    = true;
-    host_state->track_active[3] = false;
-    host_state->track_active[8] = false;
+    host_state->drum_grid[DK_CLAP][5]   = true;
+    host_state->drum_grid[DK_CYMBAL][9] = true;
+    // A melodic note on the drone track must also propagate.
+    host_state->melodic_notes[3 /*drone*/].push_back({15, 1, 60, 127});
+    host_state->track_root_midi[9] = 55;  // bass: change from default
 
     Network::host(host_state);
     wait_for_listener();
@@ -155,13 +158,13 @@ static void test_state_sync() {
     assert(joiner_state != nullptr);
     assert(joiner_state->session_id == 4242);
     assert(joiner_state->bpm == 137);
-    assert(joiner_state->grid[2][5] == true);
-    assert(joiner_state->grid[7][9] == true);
-    assert(joiner_state->grid[11][15] == true);
-    assert(joiner_state->grid[0][0] == false);
-    assert(joiner_state->track_active[3] == false);
-    assert(joiner_state->track_active[8] == false);
-    assert(joiner_state->track_active[0] == true);
+    assert(joiner_state->drum_grid[DK_CLAP][5]   == true);
+    assert(joiner_state->drum_grid[DK_CYMBAL][9] == true);
+    assert(joiner_state->drum_grid[DK_KICK][0]   == false);
+    assert(joiner_state->melodic_notes[3].size() == 1);
+    assert(joiner_state->melodic_notes[3][0].start_step == 15);
+    assert(joiner_state->melodic_notes[3][0].pitch_midi == 60);
+    assert(joiner_state->track_root_midi[9] == 55);
 
     Network::stop();
     std::cout << "test_state_sync PASSED\n";
@@ -198,15 +201,15 @@ static void test_edit_propagates_host_to_joiner() {
 
     auto joiner_state = Network::join("127.0.0.1", 5050);
     assert(joiner_state != nullptr);
-    assert(joiner_state->grid[3][7] == false);
+    assert(joiner_state->drum_grid[DK_CLOSED_HAT][7] == false);
 
-    // Simulate a host UI mutation.
-    host_state->grid[3][7] = true;
+    // Simulate a host UI mutation. Track 3 = chat = closed_hat drum_kind.
+    host_state->drum_grid[DK_CLOSED_HAT][7] = true;
     host_state->dirty[3].fetch_or(static_cast<uint16_t>(1) << 7);
 
     wait_flush_windows();
 
-    assert(joiner_state->grid[3][7] == true);
+    assert(joiner_state->drum_grid[DK_CLOSED_HAT][7] == true);
 
     Network::stop();
     std::cout << "test_edit_propagates_host_to_joiner PASSED\n";
@@ -222,14 +225,14 @@ static void test_edit_propagates_joiner_to_host() {
     auto joiner_state = Network::join("127.0.0.1", 5151);
     assert(joiner_state != nullptr);
 
-    // Simulate joiner UI mutation.
-    joiner_state->grid[5][2] = true;
+    // Simulate joiner UI mutation. Track 5 = cowb = DK_COWBELL drum_kind.
+    joiner_state->drum_grid[DK_COWBELL][2] = true;
     joiner_state->dirty[5].fetch_or(static_cast<uint16_t>(1) << 2);
 
     wait_flush_windows();
 
     // Host received and applied the edit.
-    assert(host_state->grid[5][2] == true);
+    assert(host_state->drum_grid[DK_COWBELL][2] == true);
 
     // Host's relay echo arrived back at the joiner and cleared the in-flight
     // guard.
@@ -253,21 +256,21 @@ static void test_two_joiners_non_conflicting() {
     auto joiner_b = TestJoiner::connect(5252);
     assert(joiner_b != nullptr);
 
-    // Different cells, no conflict.
-    joiner_a->grid[1][4] = true;
+    // Different drum cells, no conflict. Track 1 = snare, track 6 = tom.
+    joiner_a->drum_grid[DK_SNARE][4] = true;
     joiner_a->dirty[1].fetch_or(static_cast<uint16_t>(1) << 4);
 
-    joiner_b->state->grid[9][12] = true;
-    joiner_b->state->dirty[9].fetch_or(static_cast<uint16_t>(1) << 12);
+    joiner_b->state->drum_grid[DK_TOM][12] = true;
+    joiner_b->state->dirty[6].fetch_or(static_cast<uint16_t>(1) << 12);
 
     wait_flush_windows();
 
-    assert(host_state->grid[1][4]   == true);
-    assert(host_state->grid[9][12]  == true);
-    assert(joiner_a->grid[1][4]     == true);
-    assert(joiner_a->grid[9][12]    == true);
-    assert(joiner_b->state->grid[1][4]  == true);
-    assert(joiner_b->state->grid[9][12] == true);
+    assert(host_state->drum_grid[DK_SNARE][4]    == true);
+    assert(host_state->drum_grid[DK_TOM][12]     == true);
+    assert(joiner_a->drum_grid[DK_SNARE][4]      == true);
+    assert(joiner_a->drum_grid[DK_TOM][12]       == true);
+    assert(joiner_b->state->drum_grid[DK_SNARE][4]  == true);
+    assert(joiner_b->state->drum_grid[DK_TOM][12]   == true);
 
     joiner_b.reset();
     Network::stop();
@@ -289,18 +292,19 @@ static void test_two_joiners_conflicting_converge() {
 
     // Same cell. Joiner A wants true, joiner B wants false. Both flush at
     // ~the same time. The host's relay is authoritative.
-    joiner_a->grid[3][5] = true;
+    // Same drum cell (chat track). Joiner A wants true, joiner B wants false.
+    joiner_a->drum_grid[DK_CLOSED_HAT][5] = true;
     joiner_a->dirty[3].fetch_or(static_cast<uint16_t>(1) << 5);
 
-    joiner_b->state->grid[3][5] = false;
+    joiner_b->state->drum_grid[DK_CLOSED_HAT][5] = false;
     joiner_b->state->dirty[3].fetch_or(static_cast<uint16_t>(1) << 5);
 
     // Extra window — gives the conflict-flicker time to resolve.
     wait_flush_windows(4);
 
-    bool host_v = host_state->grid[3][5];
-    assert(joiner_a->grid[3][5]            == host_v);
-    assert(joiner_b->state->grid[3][5]     == host_v);
+    bool host_v = host_state->drum_grid[DK_CLOSED_HAT][5];
+    assert(joiner_a->drum_grid[DK_CLOSED_HAT][5]        == host_v);
+    assert(joiner_b->state->drum_grid[DK_CLOSED_HAT][5] == host_v);
 
     joiner_b.reset();
     Network::stop();
@@ -327,20 +331,256 @@ static void test_joiner_disconnect_does_not_crash_host() {
     wait_flush_windows();
 
     // Surviving joiner B can still send edits and the host applies + relays.
-    joiner_b->grid[2][2] = true;
+    // Track 2 = clap = DK_CLAP.
+    joiner_b->drum_grid[DK_CLAP][2] = true;
     joiner_b->dirty[2].fetch_or(static_cast<uint16_t>(1) << 2);
 
     wait_flush_windows();
 
-    assert(host_state->grid[2][2] == true);
-    assert(joiner_b->grid[2][2]   == true);
+    assert(host_state->drum_grid[DK_CLAP][2] == true);
+    assert(joiner_b->drum_grid[DK_CLAP][2]   == true);
 
     joiner_a.reset();
     Network::stop();
     std::cout << "test_joiner_disconnect_does_not_crash_host PASSED\n";
 }
 
+static void test_projection_lowest_wins() {
+    std::vector<Note> notes;
+    notes.push_back({0, 4, 69, 127});  // A4
+    notes.push_back({0, 4, 72, 127});  // C5
+    auto proj = project_row(notes, 16);
+    // Both notes start at cell 0; lowest-pitch wins -> A4 (idx 0).
+    assert(proj[0].note_idx == 0);
+    assert(proj[0].is_start);
+    // Continuation cell 1: active = {A4, C5}; tie on most-recent (both 0);
+    // tie-break lowest -> A4 still.
+    assert(proj[1].note_idx == 0);
+    assert(!proj[1].is_start);
+    std::cout << "test_projection_lowest_wins PASSED\n";
+}
+
+static void test_projection_stack_preempt_and_return() {
+    std::vector<Note> notes;
+    notes.push_back({0, 16, 69, 127});  // A4 covers entire loop
+    notes.push_back({0,  1, 71, 127});  // B4 at cell 0 only
+    notes.push_back({1,  2, 60, 127});  // C4 at cells 1..2
+    auto proj = project_row(notes, 16);
+    // cell 0: starters {A4, B4} -> A4 (lower).
+    assert(proj[0].note_idx == 0);
+    // cell 1: starter C4 -> C4.
+    assert(proj[1].note_idx == 2);
+    assert(proj[1].is_start);
+    // cell 2: no starter; active {A4, C4}; most-recent = C4 (start 1).
+    assert(proj[2].note_idx == 2);
+    // cell 3: only A4 active.
+    assert(proj[3].note_idx == 0);
+    assert(proj[15].note_idx == 0);
+    std::cout << "test_projection_stack_preempt_and_return PASSED\n";
+}
+
+static void test_collision_truncate() {
+    std::vector<Note> notes;
+    notes.push_back({0, 4, 60, 127});  // C4 [0..3]
+    clear_or_truncate_at(notes, /*pitch_midi=*/60, /*at_step=*/2);
+    // A < C -> truncate to duration = C - A = 2 (covers cells 0..1).
+    assert(notes.size() == 1);
+    assert(notes[0].start_step == 0);
+    assert(notes[0].duration_steps == 2);
+    std::cout << "test_collision_truncate PASSED\n";
+}
+
+static void test_collision_delete_on_exact_start() {
+    std::vector<Note> notes;
+    notes.push_back({0, 4, 60, 127});  // C4 [0..3]
+    clear_or_truncate_at(notes, 60, 0);
+    // A == C -> delete entirely.
+    assert(notes.empty());
+    std::cout << "test_collision_delete_on_exact_start PASSED\n";
+}
+
+static void test_collision_different_pitch_unaffected() {
+    std::vector<Note> notes;
+    notes.push_back({0, 4, 60, 127});  // C4
+    notes.push_back({0, 4, 64, 127});  // E4 same range, different row
+    clear_or_truncate_at(notes, /*pitch=*/64, /*at_step=*/0);
+    // Only the E4 row collides; C4 is untouched.
+    assert(notes.size() == 1);
+    assert(notes[0].pitch_midi == 60);
+    assert(notes[0].duration_steps == 4);
+    std::cout << "test_collision_different_pitch_unaffected PASSED\n";
+}
+
+static void test_note_cap() {
+    std::vector<Note> notes;
+    for (int i = 0; i < MAX_NOTES_PER_MELODIC; ++i) {
+        Note n{0, 1, static_cast<uint8_t>(60), 127};
+        assert(add_note(notes, n));
+    }
+    Note overflow{0, 1, 60, 127};
+    assert(!add_note(notes, overflow));
+    assert(notes.size() == MAX_NOTES_PER_MELODIC);
+    std::cout << "test_note_cap PASSED\n";
+}
+
+static void test_midi_to_hz() {
+    // A4 = MIDI 69 = 440 Hz exactly.
+    float a4 = midi_to_hz(69);
+    assert(std::fabs(a4 - 440.f) < 1e-3f);
+    // C4 = MIDI 60 ≈ 261.6256
+    float c4 = midi_to_hz(60);
+    assert(std::fabs(c4 - 261.6256f) < 0.01f);
+    // Octave up doubles frequency.
+    float a5 = midi_to_hz(81);
+    assert(std::fabs(a5 - 880.f) < 1e-2f);
+    std::cout << "test_midi_to_hz PASSED\n";
+}
+
+// Use a socketpair to exercise serialize/deserialize round trips without
+// involving Network::host. We send through one end and read from the other
+// using the production parsers.
+static void test_msg_state_roundtrip() {
+    int sv[2];
+    int r = ::socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+    assert(r == 0);
+
+    SessionState src;
+    src.session_id = 12345;
+    src.bpm = 144;
+    src.drum_grid[DK_KICK][0] = true;
+    src.drum_grid[DK_KICK][8] = true;
+    src.drum_grid[DK_SNARE][4] = true;
+    src.track_root_midi[8] = 64;  // lead -> E4
+    src.melodic_notes[0].push_back({0, 4, 67, 127});
+    src.melodic_notes[0].push_back({4, 2, 60, 100});
+    src.melodic_notes[3].push_back({0, 16, 36, 127});
+
+    assert(bitjams_net_internal::send_msg_state(sv[0], src));
+
+    // Consume the leading tag byte to match the protocol prefix.
+    uint8_t tag = 0;
+    ssize_t n = ::recv(sv[1], &tag, 1, MSG_WAITALL);
+    assert(n == 1);
+    assert(tag == MSG_STATE);
+
+    SessionState dst;
+    assert(bitjams_net_internal::recv_and_apply_msg_state(sv[1], dst));
+    assert(dst.session_id == 12345);
+    assert(dst.bpm == 144);
+    assert(dst.drum_grid[DK_KICK][0] == true);
+    assert(dst.drum_grid[DK_KICK][8] == true);
+    assert(dst.drum_grid[DK_SNARE][4] == true);
+    assert(dst.drum_grid[DK_SNARE][0] == false);
+    assert(dst.track_root_midi[8] == 64);
+    assert(dst.melodic_notes[0].size() == 2);
+    assert(dst.melodic_notes[0][0].start_step == 0);
+    assert(dst.melodic_notes[0][0].duration_steps == 4);
+    assert(dst.melodic_notes[0][0].pitch_midi == 67);
+    assert(dst.melodic_notes[0][1].velocity == 100);
+    assert(dst.melodic_notes[3].size() == 1);
+    assert(dst.melodic_notes[3][0].duration_steps == 16);
+    assert(dst.melodic_notes[1].empty());
+
+    ::close(sv[0]);
+    ::close(sv[1]);
+    std::cout << "test_msg_state_roundtrip PASSED\n";
+}
+
+static void test_msg_melodic_track_roundtrip() {
+    int sv[2];
+    int r = ::socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+    assert(r == 0);
+
+    std::vector<Note> notes = {
+        {0, 1, 60, 127},
+        {2, 4, 64, 90},
+        {7, 9, 67, 127},
+    };
+    uint8_t buf[1024];
+    size_t n = bitjams_net_internal::build_msg_melodic_track(
+        /*melodic_idx=*/1, notes, buf, sizeof(buf));
+    assert(n > 0);
+    ssize_t s = ::send(sv[0], buf, n, 0);
+    assert(s == (ssize_t)n);
+
+    uint8_t tag = 0;
+    ::recv(sv[1], &tag, 1, MSG_WAITALL);
+    assert(tag == MSG_MELODIC_TRACK);
+
+    SessionState dst;
+    assert(bitjams_net_internal::recv_and_apply_msg_melodic_track(
+        sv[1], dst, /*is_joiner=*/false));
+    // melodic_idx=1 -> track 9 (bass).
+    assert(dst.melodic_notes[1].size() == 3);
+    assert(dst.melodic_notes[1][0].pitch_midi == 60);
+    assert(dst.melodic_notes[1][2].pitch_midi == 67);
+    assert(dst.melodic_notes[1][1].velocity == 90);
+
+    ::close(sv[0]);
+    ::close(sv[1]);
+    std::cout << "test_msg_melodic_track_roundtrip PASSED\n";
+}
+
+static void test_melodic_track_propagates_host_to_joiner() {
+    auto host_state = std::make_shared<SessionState>();
+    host_state->session_id = 6060;
+
+    Network::host(host_state);
+    wait_for_listener();
+
+    auto joiner_state = Network::join("127.0.0.1", 6060);
+    assert(joiner_state != nullptr);
+    assert(joiner_state->melodic_notes[0].empty());
+
+    // Host writes a note on lead (melodic_idx=0) and dirties.
+    host_state->melodic_notes[0].push_back({3, 2, 72, 127});
+    host_state->melodic_dirty[0].store(true);
+
+    wait_flush_windows();
+
+    assert(joiner_state->melodic_notes[0].size() == 1);
+    assert(joiner_state->melodic_notes[0][0].start_step == 3);
+    assert(joiner_state->melodic_notes[0][0].pitch_midi == 72);
+
+    Network::stop();
+    std::cout << "test_melodic_track_propagates_host_to_joiner PASSED\n";
+}
+
+static void test_melodic_track_propagates_joiner_to_host() {
+    auto host_state = std::make_shared<SessionState>();
+    host_state->session_id = 6161;
+
+    Network::host(host_state);
+    wait_for_listener();
+
+    auto joiner_state = Network::join("127.0.0.1", 6161);
+    assert(joiner_state != nullptr);
+
+    joiner_state->melodic_notes[2].push_back({0, 8, 60, 127});
+    joiner_state->melodic_notes[2].push_back({8, 8, 67, 127});
+    joiner_state->melodic_dirty[2].store(true);
+
+    wait_flush_windows();
+
+    assert(host_state->melodic_notes[2].size() == 2);
+    assert(host_state->melodic_notes[2][1].pitch_midi == 67);
+    // After the host echo, in_flight should clear.
+    assert(joiner_state->melodic_in_flight[2].load() == false);
+
+    Network::stop();
+    std::cout << "test_melodic_track_propagates_joiner_to_host PASSED\n";
+}
+
 int main() {
+    test_midi_to_hz();
+    test_note_cap();
+    test_projection_lowest_wins();
+    test_projection_stack_preempt_and_return();
+    test_collision_truncate();
+    test_collision_delete_on_exact_start();
+    test_collision_different_pitch_unaffected();
+    test_msg_state_roundtrip();
+    test_msg_melodic_track_roundtrip();
     test_state_sync();
     test_wrong_room_rejected();
     test_edit_propagates_host_to_joiner();
@@ -348,6 +588,8 @@ int main() {
     test_two_joiners_non_conflicting();
     test_two_joiners_conflicting_converge();
     test_joiner_disconnect_does_not_crash_host();
+    test_melodic_track_propagates_host_to_joiner();
+    test_melodic_track_propagates_joiner_to_host();
     std::cout << "All net tests passed.\n";
     return 0;
 }

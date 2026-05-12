@@ -1,6 +1,7 @@
 #include "ui.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -15,26 +16,44 @@
 
 using namespace ftxui;
 
+// ---- nav state ------------------------------------------------------------
+
+enum class NavState { GRID, KEYBOARD, PARAM_PAGE, PIANO_ROLL };
+static NavState nav_state = NavState::GRID;
+static bool     seq_mode  = false;  // GRID sub-mode: 8-step window for drum cell toggles
+
 static int cursor_track = 0;
 static int cursor_step  = 0;
 static int window_start = 0;
 
-// ---- ui-local music helpers (only the piano keyboard page uses these) ------
+// keyboard mode
+static int  kbd_octave           = 4;
+static int  kbd_active_track     = -1;   // melodic track whose active note is held
+static int  kbd_active_note_idx  = -1;   // index into melodic_notes[]
+// Global edit-vs-jam toggle for the synth views (keyboard mode + piano roll).
+// true: pitch / spacebar input records into the sequencer. false: synth-only.
+static bool note_mode            = true;
 
-// semitone offset from C4 -> Hz  (0=C4~261.6, 9=A4=440)
-static float note_to_freq(int st) {
-    return 440.f * std::pow(2.f, (st - 9.f) / 12.f);
-}
+// piano roll mode. View walks MIDI space by 1 semitone at a time; the
+// visible window is 12 rows starting at piano_view_base_midi (bottom row).
+static int  piano_track            = -1;
+static int  piano_view_base_midi   = 60;  // MIDI of bottom-rendered row
+static int  piano_cursor_step      = 0;
+static int  piano_cursor_midi      = 60;  // absolute MIDI of cursor pitch
+static int  piano_active_note_idx  = -1;
+static Note piano_clipboard        = {};
+static bool piano_clipboard_set    = false;
 
-static const int PENTA_MAP[12] = {0,0,3,3,3,5,5,7,7,10,10,10};
-static int snap_pentatonic(int semitone) {
-    int oct = semitone / 12;
-    int s   = semitone % 12;
-    if (s < 0) { s += 12; --oct; }
-    return oct * 12 + PENTA_MAP[s];
-}
+// param page (oscillator + scale_snap are global; root pitch is per-track)
+enum class OscType { SQUARE, SAW, TRIANGLE, SINE };
+static constexpr int OSC_COUNT = 4;
+static const char* OSC_NAMES[OSC_COUNT] = { "SQUARE", "SAW", "TRIANGLE", "SINE" };
+static OscType synth_osc  = OscType::SQUARE;
+static bool    scale_snap = false;
 
-// piano-keyboard key -> semitone offset from C in current octave (0..14), or -1
+// ---- music helpers --------------------------------------------------------
+
+// piano-keyboard key -> semitone offset from C in current octave (0..14)
 static int key_to_semitone(char c) {
     switch (c) {
         case 'a': return 0;   case 'w': return 1;
@@ -51,27 +70,42 @@ static int key_to_semitone(char c) {
 
 static bool in_pentatonic(int st) {
     int s = ((st % 12) + 12) % 12;
-    return s==0 || s==3 || s==5 || s==7 || s==10;
+    return s == 0 || s == 3 || s == 5 || s == 7 || s == 10;
 }
 
-// MPC key -> track index (0..TRACKS-1) or -1
+static const int PENTA_MAP[12] = {0,0,3,3,3,5,5,7,7,10,10,10};
+static int snap_pentatonic(int abs_semi) {
+    int oct = abs_semi / 12;
+    int s   = abs_semi % 12;
+    if (s < 0) { s += 12; --oct; }
+    return oct * 12 + PENTA_MAP[s];
+}
+
+struct NoteName {
+    char letter;
+    char accidental;   // '_' natural, '#' sharp, 'b' flat (we only emit '_' or '#')
+    int  octave;
+};
+
+static NoteName note_name(uint8_t midi_pitch) {
+    static const char LETTERS[12]   = {'C','C','D','D','E','F','F','G','G','A','A','B'};
+    static const char ACCIDENTAL[12] = {'_','#','_','#','_','_','#','_','#','_','#','_'};
+    int m = static_cast<int>(midi_pitch);
+    int oct = m / 12 - 1;
+    int s   = m % 12;
+    if (oct < 0) oct = 0;
+    if (oct > 9) oct = 9;
+    return { LETTERS[s], ACCIDENTAL[s], oct };
+}
+
+// MPC key -> track index, or -1
 static int track_for_mpc_key(char c) {
     for (int t = 0; t < TRACKS; ++t)
         if (TRACK_DEFS[t].key == c) return t;
     return -1;
 }
 
-// pattern fill: stamp every Nth step on the cursor's track
-static void fill_pattern(SessionState& s, int interval, int start) {
-    uint16_t fill_mask = 0;
-
-    for (int step = start; step < s.loop_len; step += interval) {
-        s.grid[cursor_track][step] = true;
-        fill_mask |= (1 << step);
-    }
-
-    s.dirty[cursor_track].fetch_or(fill_mask, std::memory_order_relaxed);
-}
+// ---- color palette --------------------------------------------------------
 
 static const Color COL_PURPLE = Color::RGB(125,  86, 244);
 static const Color COL_DIM    = Color::RGB( 60,  40, 120);
@@ -79,62 +113,30 @@ static const Color COL_BRIGHT = Color::RGB(200, 180, 255);
 static const Color COL_HEAD   = Color::RGB(255, 220, 100);
 static const Color COL_GREEN  = Color::RGB( 80, 220, 120);
 
-enum class OscType { SQUARE, SAW, TRIANGLE, SINE };
-static constexpr int OSC_COUNT = 4;
-static const char* OSC_NAMES[OSC_COUNT] = { "SQUARE", "SAW", "TRIANGLE", "SINE" };
+// ---- cursor / track navigation -------------------------------------------
 
-static OscType synth_osc    = OscType::SQUARE;
-static int     synth_octave = 4;
-static bool    scale_snap   = false;
-
-enum class NavState { GRID, TITLE_FOCUS, SYNTH_PAGE };
-static NavState nav_state = NavState::GRID;
-static bool     seq_mode  = false; // GRID sub-mode: 8-step window
-
-static int count_active_tracks(SessionState& s) {
-    int c = 0;
-    for (int t = 0; t < TRACKS; ++t) if (s.track_active[t]) ++c;
-    return c;
+static void cycle_cursor_to_active(SessionState& /*s*/, int dir) {
+    cursor_track = (cursor_track + dir + TRACKS) % TRACKS;
 }
 
-static void cycle_cursor_to_active(SessionState& s, int dir) {
-    if (count_active_tracks(s) == 0) return;
-    int t = cursor_track;
-    for (int i = 0; i < TRACKS; ++i) {
-        t = (t + dir + TRACKS) % TRACKS;
-        if (s.track_active[t]) { cursor_track = t; return; }
-    }
+static void ensure_cursor_visible(SessionState& /*s*/) {
+    // Every track is always visible now; cursor is always valid.
 }
 
-static void ensure_cursor_visible(SessionState& s) {
-    if (s.track_active[cursor_track]) return;
-    cycle_cursor_to_active(s, +1);
+// Returns true if any track in the session is soloed.
+static bool any_solo(const SessionState& s) {
+    for (int t = 0; t < TRACKS; ++t) if (s.track_solo[t]) return true;
+    return false;
 }
 
-// activate the next inactive track (wrapping); set cursor on it.
-static void show_next_hidden(SessionState& s) {
-    int start = (cursor_track + 1) % TRACKS;
-    int t     = start;
-    do {
-        if (!s.track_active[t]) {
-            s.track_active[t] = true;
-            s.track_active_dirty.fetch_or(static_cast<uint16_t>(1) << t,
-                                          std::memory_order_relaxed);
-            cursor_track      = t;
-            return;
-        }
-        t = (t + 1) % TRACKS;
-    } while (t != start);
+// Whether track t is effectively silenced for this peer right now.
+static bool track_is_silenced(const SessionState& s, int t) {
+    if (s.track_muted[t]) return true;
+    if (any_solo(s) && !s.track_solo[t]) return true;
+    return false;
 }
 
-// hide cursor track, then move cursor to next visible (skip if only one visible)
-static void hide_cursor_track(SessionState& s) {
-    if (count_active_tracks(s) <= 1) return;
-    s.track_active[cursor_track] = false;
-    s.track_active_dirty.fetch_or(static_cast<uint16_t>(1) << cursor_track,
-                                  std::memory_order_relaxed);
-    cycle_cursor_to_active(s, +1);
-}
+// ---- visualizer (unchanged) ----------------------------------------------
 
 static constexpr int VIS_W = 3 + STEPS * 3;
 static constexpr int VIS_H = 7;
@@ -179,16 +181,68 @@ static Element render_visualizer() {
     return vbox(std::move(rows));
 }
 
-static constexpr int  TITLE_COL_WIDTH = 11;
-static constexpr char TITLE_PAD[]     = "          "; // 10 spaces (TITLE_COL_WIDTH - 1)
+// ---- main-grid rendering --------------------------------------------------
 
-static Element render_track_title(int t, bool focused) {
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "[%-5s](%c) ",
+// Title column: 10 chars exactly. `[name](k) ` with name right-padded to 5.
+static constexpr int TITLE_COL_WIDTH = 10;
+
+static Element render_track_title(int t, bool focused, bool silenced) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "[%-5s](%c)",
                   TRACK_DEFS[t].name, TRACK_DEFS[t].key);
-    Color col = (TRACK_DEFS[t].type == TrackType::MELODIC) ? COL_GREEN : COL_PURPLE;
+    Color col = silenced
+                ? COL_DIM
+                : (TRACK_DEFS[t].type == TrackType::MELODIC ? COL_GREEN : COL_PURPLE);
     Element e = text(buf) | color(col);
     if (focused) e = e | inverted | bold;
+    return e;
+}
+
+// Draw a 5-char drum cell. `narrow` collapses to 3 chars for sub-90col terms.
+// Active hits render the bare ■ glyph in bright+bold so the rhythmic content
+// stands out without changing layout width.
+static Element draw_drum_cell(bool hit, bool highlighted, bool in_loop,
+                              bool on_playhead, bool playing, bool narrow) {
+    (void)on_playhead; (void)playing;
+    const char* glyph_full = hit ? "  ■  " : "  ·  ";
+    const char* glyph_thin = hit ? " ■ "   : " · ";
+    const char* g = narrow ? glyph_thin : glyph_full;
+    if (!in_loop)    return text(narrow ? " · " : "  ·  ") | color(COL_DIM);
+    if (highlighted) return text(g) | color(COL_PURPLE) | inverted;
+    if (hit)         return text(g) | color(COL_BRIGHT)  | bold;
+    return text(g) | color(COL_DIM);
+}
+
+// Draw a 5-char melodic cell given the projection info.
+// kind 0=silence, 1=start (single-step or starts >=2), 2=middle, 3=end
+static Element draw_melodic_cell(int kind, const Note* n, bool single_step,
+                                 bool highlighted, bool in_loop,
+                                 bool on_playhead, bool playing, bool narrow) {
+    if (!in_loop) return text(narrow ? " · " : "  ·  ") | color(COL_DIM);
+
+    char buf[8];
+    if (kind == 0 || kind == 2) {
+        std::snprintf(buf, sizeof(buf), "%s", narrow ? " · " : "  ·  ");
+    } else if (kind == 1 && n) {
+        NoteName nm = note_name(n->pitch_midi);
+        char close = single_step ? ']' : ' ';
+        if (narrow) {
+            std::snprintf(buf, sizeof(buf), "[%c%c", nm.letter, close);
+        } else {
+            std::snprintf(buf, sizeof(buf), "[%c%c%d%c",
+                          nm.letter, nm.accidental, nm.octave, close);
+        }
+    } else if (kind == 3) {
+        std::snprintf(buf, sizeof(buf), "%s", narrow ? " ·]" : "  · ]");
+    } else {
+        std::snprintf(buf, sizeof(buf), "%s", narrow ? "   " : "     ");
+    }
+
+    Element e = text(buf);
+    if (highlighted)               e = e | color(COL_PURPLE) | inverted;
+    else if (kind == 0)            e = e | color(COL_DIM);
+    else                            e = e | color(COL_GREEN);
+    if (on_playhead && playing && kind != 0) e = e | bold;
     return e;
 }
 
@@ -196,15 +250,24 @@ static Element render_grid_view(SessionState& s) {
     int  ps         = s.play_step.load();
     bool is_playing = s.playing.load();
 
+    // Width-aware fallback: target 10 + 16*5 = 90 cols for the full row.
+    // ftxui doesn't tell us screen width inside a Renderer; the fallback is
+    // mostly cosmetic, so we always render full-width here. Narrow terms
+    // wrap. (Per PRD §17 we'd flip this on a screen-width probe; deferred.)
+    const bool narrow = false;
+    const int cell_w  = narrow ? 3 : 5;
+
     Elements lines;
 
     // header
     {
         char head_buf[80];
         const char* mode_label =
-            (nav_state == NavState::TITLE_FOCUS) ? "  [title]" :
-            (seq_mode                          ) ? "  [seq]"   :
-                                                   "  [step]";
+            (nav_state == NavState::PARAM_PAGE) ? "  [param]" :
+            (nav_state == NavState::KEYBOARD)   ? (note_mode ? "  [kbd]" : "  [kbd jam]") :
+            (nav_state == NavState::PIANO_ROLL) ? "  [piano]" :
+            (seq_mode)                          ? "  [seq]"   :
+                                                  "  [step]";
         std::snprintf(head_buf, sizeof(head_buf), "  bpm: %d  steps: %d  %s",
                       s.bpm, s.loop_len, is_playing ? "▶" : "■");
 
@@ -217,89 +280,245 @@ static Element render_grid_view(SessionState& s) {
             std::string room_label = "  ROOM " + std::to_string(s.session_id);
             if (s.is_joiner && !s.network_alive.load()) {
                 room_label += " — solo (host left)";
-                header.push_back(text(room_label) | color(COL_DIM));
-            } else {
-                header.push_back(text(room_label) | color(COL_DIM));
             }
+            header.push_back(text(room_label) | color(COL_DIM));
         }
         lines.push_back(hbox(std::move(header)));
     }
 
-    // step numbers (offset by TITLE_COL_WIDTH-1 so digits align with cells)
+    // step numbers — prefix is TITLE_COL_WIDTH + 1 to match the title+spacer
+    // layout of each track row, so step labels align with the playhead glyph.
     {
         Elements row;
-        row.push_back(text(TITLE_PAD) | color(COL_DIM));
+        row.push_back(text(std::string(TITLE_COL_WIDTH + 1, ' ')));
         for (int step = 0; step < STEPS; ++step) {
-            if (step == 9) row.push_back(text(" ") | color(COL_DIM));
             char buf[8];
-            if (step < s.loop_len) std::snprintf(buf, sizeof(buf), " %2d", step + 1);
-            else                   std::snprintf(buf, sizeof(buf), "   ");
-            row.push_back(text(buf) | color(COL_DIM));
+            if (step < s.loop_len) {
+                std::snprintf(buf, sizeof(buf),
+                              narrow ? "%2d " : " %2d  ", step + 1);
+            } else {
+                std::snprintf(buf, sizeof(buf), "%s", narrow ? "   " : "     ");
+            }
+            row.push_back(text(buf) | color(COL_BRIGHT));
         }
         lines.push_back(hbox(std::move(row)));
     }
 
+    // playhead arrow
     {
         Elements row;
-        row.push_back(text(std::string(TITLE_COL_WIDTH, ' ')));
+        row.push_back(text(std::string(TITLE_COL_WIDTH + 1, ' ')));
         for (int step = 0; step < STEPS; ++step) {
-            if (step == ps && is_playing)
-                row.push_back(text(" ▼ ") | color(COL_HEAD));
-            else
-                row.push_back(text("   "));
+            const char* glyph;
+            if (step == ps && is_playing) glyph = narrow ? " ▼ " : "  ▼  ";
+            else                          glyph = narrow ? "   " : "     ";
+            Element e = text(glyph);
+            if (step == ps && is_playing) e = e | color(COL_HEAD);
+            row.push_back(e);
         }
         lines.push_back(hbox(std::move(row)));
     }
 
-    auto render_track_row = [&](int t) {
-        bool title_focused = (nav_state == NavState::TITLE_FOCUS) && (t == cursor_track);
+    auto render_track_row = [&](int t) -> Element {
         Elements row;
-        row.push_back(render_track_title(t, title_focused));
-        for (int step = 0; step < STEPS; ++step) {
-            bool active      = s.grid[t][step];
-            bool highlighted = (nav_state == NavState::GRID)
-                            && (t == cursor_track)
-                            && (seq_mode
-                                ? (step >= window_start && step < window_start + 8)
-                                : (step == cursor_step));
-            bool in_loop     = (step < s.loop_len);
-            if (!in_loop) {
-                row.push_back(text(" · ") | color(COL_DIM));
-            } else if (highlighted) {
-                row.push_back(text(active ? " ■ " : " · ") | color(COL_PURPLE) | inverted);
-            } else if (active) {
-                Element e = text(" ■ ") | color(COL_BRIGHT);
-                if (step == ps && is_playing) e = e | bold;
-                row.push_back(e);
-            } else {
-                row.push_back(text(" · ") | color(COL_DIM));
+        row.push_back(render_track_title(t, false, track_is_silenced(s, t)));
+        row.push_back(text(" "));   // spacer between title and first cell
+
+        const TrackDef& td = TRACK_DEFS[t];
+        bool is_cursor_track = (t == cursor_track);
+
+        // Show cursor highlight in both GRID and KEYBOARD modes (kbd-mode
+        // edits land at the cursor). PARAM_PAGE/PIANO_ROLL get their own
+        // dedicated render, so we never reach this path in those states.
+        bool show_cursor = (nav_state == NavState::GRID
+                         || nav_state == NavState::KEYBOARD);
+
+        if (td.type == TrackType::DRUM) {
+            int dk = td.drum_kind;
+            for (int step = 0; step < STEPS; ++step) {
+                bool active = s.drum_grid[dk][step];
+                bool in_loop = (step < s.loop_len);
+                // seq_mode is a GRID sub-mode only.
+                bool highlighted = show_cursor
+                                && is_cursor_track
+                                && (seq_mode && nav_state == NavState::GRID
+                                    ? (step >= window_start && step < window_start + 8)
+                                    : (step == cursor_step));
+                row.push_back(draw_drum_cell(active, highlighted, in_loop,
+                                             step == ps, is_playing, narrow));
+            }
+        } else {
+            const auto& notes = s.melodic_notes[td.melodic_idx];
+            auto proj = project_row(notes, s.loop_len);
+            for (int step = 0; step < STEPS; ++step) {
+                bool in_loop = (step < s.loop_len);
+                bool highlighted = show_cursor
+                                && is_cursor_track
+                                && (step == cursor_step);
+                if (!in_loop || proj[step].note_idx < 0) {
+                    row.push_back(draw_melodic_cell(0, nullptr, false,
+                                                    highlighted, in_loop,
+                                                    step == ps, is_playing, narrow));
+                    continue;
+                }
+                const Note& n = notes[proj[step].note_idx];
+                bool single = (n.duration_steps == 1);
+                int kind;
+                if (proj[step].is_start && (single || proj[step].is_end)) kind = 1;
+                else if (proj[step].is_start)                              kind = 1;
+                else if (proj[step].is_end)                                kind = 3;
+                else                                                       kind = 2;
+                row.push_back(draw_melodic_cell(kind, &n, single,
+                                                highlighted, in_loop,
+                                                step == ps, is_playing, narrow));
             }
         }
+
+        // Unused so the compiler doesn't complain on a narrow=false build.
+        (void)cell_w;
         return hbox(std::move(row));
     };
 
-    for (int t = 0; t < TRACKS; ++t)
-        if (s.track_active[t]) lines.push_back(render_track_row(t));
+    for (int t = 0; t < TRACKS; ++t) lines.push_back(render_track_row(t));
 
     lines.push_back(text(""));
-    if (nav_state == NavState::TITLE_FOCUS) {
-        lines.push_back(text("  ↑↓:track  enter:open synth  tab/esc:back  rtyufghjvbnm:trigger"
-                             "  p:play  q:quit")
-                        | color(COL_DIM));
+
+    // footer hints
+    const char* hint;
+    if (nav_state == NavState::KEYBOARD) {
+        hint = note_mode
+            ? "  pitch:awsedftgyhujkol  ←→:resize  spc:release  z/x:oct  n:note(rec)  "
+              "bksp:del  S:solo  M:mute  C:copy  V:paste  D:clr  AD:clr all  1-9:fill  "
+              "tab:param  enter:piano  esc:back"
+            : "  pitch:awsedftgyhujkol (jam — synth only, not recorded)  z/x:oct  "
+              "n:note(jam)  tab:param  enter:piano  esc:back";
     } else if (seq_mode) {
-        lines.push_back(text("  1-8:toggle step  ←→:window  ↑↓:track  rtyufghjvbnm:trigger+focus"
-                             "  a:show  d:hide  s:step mode  tab:title  p:play  q:quit")
-                        | color(COL_DIM));
+        hint = "  1-8:toggle step  ←→:window  ↑↓:track  rtyuvbnmfghj:trigger+focus  "
+               "s:exit step  bksp:del  S:solo  M:mute  C:copy  V:paste  D:clr track  AD:clr all  p:play  q:quit";
     } else {
-        lines.push_back(text("  spc:toggle step  1-9:fill  ←→↑↓:move  rtyufghjvbnm:trigger+focus"
-                             "  a:show  d:hide  s:seq mode  tab:title  p:play  q:quit")
-                        | color(COL_DIM));
+        hint = "  spc:toggle/note  1-9:fill  ←→↑↓:move  bksp:del  rtyuvbnmfghj:trigger+focus  "
+               "tab:param  enter:piano  k:kbd  s:seq  S:solo  M:mute  C:copy  V:paste  D:clr track  AD:clr all  p:play  q:quit";
     }
+    lines.push_back(text(hint) | color(COL_DIM));
 
     return vbox(std::move(lines));
 }
 
-static Element render_drum_synth_page(SessionState& s, int t) {
+// ---- piano roll -----------------------------------------------------------
+
+static Element render_piano_roll(SessionState& s) {
+    Elements lines;
+
+    char head_buf[120];
+    const TrackDef& td = TRACK_DEFS[piano_track];
+    NoteName cur_nm = note_name(static_cast<uint8_t>(piano_cursor_midi));
+    std::snprintf(head_buf, sizeof(head_buf),
+                  "piano roll: %-5s  bpm %d  steps %d  %s  cursor %c%c%d  [esc: back]",
+                  td.name, s.bpm, s.loop_len,
+                  s.playing.load() ? "▶" : "■",
+                  cur_nm.letter, cur_nm.accidental, cur_nm.octave);
+    lines.push_back(text(head_buf) | color(COL_PURPLE) | bold);
+    lines.push_back(text(""));
+
+    // step number row
+    {
+        Elements row;
+        row.push_back(text(std::string(8, ' ')) | color(COL_BRIGHT));
+        for (int step = 0; step < STEPS; ++step) {
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), " %2d  ", step + 1);
+            row.push_back(text(buf) | color(COL_BRIGHT));
+        }
+        lines.push_back(hbox(std::move(row)));
+    }
+
+    // playhead arrow
+    {
+        Elements row;
+        row.push_back(text(std::string(8, ' ')));
+        int ps = s.play_step.load();
+        for (int step = 0; step < STEPS; ++step) {
+            const char* glyph = (step == ps && s.playing.load()) ? "  ▼  " : "     ";
+            Element e = text(glyph);
+            if (step == ps && s.playing.load()) e = e | color(COL_HEAD);
+            row.push_back(e);
+        }
+        lines.push_back(hbox(std::move(row)));
+    }
+
+    const auto& notes = s.melodic_notes[td.melodic_idx];
+
+    // 12 chromatic pitch rows starting at piano_view_base_midi at the bottom.
+    // Render top-down: row 11 (highest) first, row 0 last.
+    for (int row_idx = 11; row_idx >= 0; --row_idx) {
+        Elements row;
+        uint8_t midi = static_cast<uint8_t>(piano_view_base_midi + row_idx);
+        NoteName nm = note_name(midi);
+        char lbl[12];
+        std::snprintf(lbl, sizeof(lbl), "  %c%c%d   ",
+                      nm.letter, nm.accidental, nm.octave);
+        row.push_back(text(lbl) | color(COL_DIM));
+
+        for (int step = 0; step < STEPS; ++step) {
+            bool cursor_here = (midi == piano_cursor_midi && step == piano_cursor_step);
+            bool in_loop = (step < s.loop_len);
+
+            int hit = -1;
+            for (size_t i = 0; i < notes.size(); ++i) {
+                const Note& n = notes[i];
+                if (n.pitch_midi != midi) continue;
+                int end = n.start_step + n.duration_steps;
+                if (step >= n.start_step && step < end) { hit = static_cast<int>(i); break; }
+            }
+
+            // All glyphs anchor at col 1 of the 5-char cell so dots and note
+            // boundaries align vertically across pitch rows. Start: `[■   `
+            // (■ at col 1), end: ` ─]  ` (─ at col 1, ] at col 2), middle:
+            // ` ─   ` (─ at col 1), empty: ` ·   ` (· at col 1), single
+            // step: `[■]  ` ([ at col 0, ■ at col 1, ] at col 2).
+            const char* glyph;
+            if (hit < 0) {
+                glyph = in_loop ? " ·   " : "     ";
+            } else {
+                const Note& n = notes[hit];
+                bool is_start = (step == n.start_step);
+                bool is_end   = (step == n.start_step + n.duration_steps - 1);
+                if (is_start && is_end) glyph = "[■]  ";
+                else if (is_start)       glyph = "[■   ";
+                else if (is_end)         glyph = " ─]  ";
+                else                     glyph = " ─   ";
+            }
+            Element e;
+            if (cursor_here) {
+                e = text(glyph) | color(COL_PURPLE) | inverted;
+            } else if (hit >= 0) {
+                e = text(glyph) | color(COL_GREEN);
+            } else if (in_loop) {
+                e = text(glyph) | color(COL_DIM);
+            } else {
+                e = text(glyph);
+            }
+            row.push_back(e);
+        }
+        lines.push_back(hbox(std::move(row)));
+    }
+
+    lines.push_back(text(""));
+    {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf),
+                      "  ←→ step  ↑↓ pitch  space:%s  c/v:copy/paste  "
+                      "z/x:oct  n:note(%s)  esc:back",
+                      note_mode ? "add/release" : "audition",
+                      note_mode ? "rec" : "jam");
+        lines.push_back(text(buf) | color(COL_DIM));
+    }
+    return vbox(std::move(lines));
+}
+
+// ---- param page (renamed melodic synth page; no piano keys) --------------
+
+static Element render_drum_param_page(SessionState& s, int t) {
     const TrackDef& td = TRACK_DEFS[t];
     const DrumParams& p = DRUM_PARAMS[td.drum_kind];
 
@@ -311,14 +530,13 @@ static Element render_drum_synth_page(SessionState& s, int t) {
     lines.push_back(hbox({
         text("bitjams") | bold | color(COL_PURPLE),
         text(head_buf)         | color(COL_PURPLE),
-        text("[drum synth]")   | color(COL_DIM),
+        text("[drum param]")   | color(COL_DIM),
     }));
 
     char title[64];
     std::snprintf(title, sizeof(title), "  %s  (key: %c)  procedural drum",
                   p.label, td.key);
     lines.push_back(text(title) | bold | color(COL_BRIGHT));
-
     lines.push_back(text(""));
 
     auto param_row = [&](const char* label, const std::string& val) {
@@ -336,39 +554,28 @@ static Element render_drum_synth_page(SessionState& s, int t) {
     lines.push_back(param_row("decay", buf));
     std::snprintf(buf, sizeof(buf), "%.2f", p.noise_mix);
     lines.push_back(param_row("noise mix", buf));
-    lines.push_back(param_row("track key", std::string(1, td.key)));
+    NoteName nm = note_name(s.track_root_midi[t]);
+    char root_buf[8];
+    std::snprintf(root_buf, sizeof(root_buf), "%c%c%d", nm.letter, nm.accidental, nm.octave);
+    lines.push_back(param_row("root midi", root_buf));
 
     lines.push_back(text(""));
-    lines.push_back(text("  (display only — knob editing is future work)") | color(COL_DIM));
-    lines.push_back(text(""));
-    lines.push_back(text("  rtyufghjvbnm:trigger any pad  tab/esc:back  p:play  q:quit")
-                    | color(COL_DIM));
-
+    lines.push_back(text("  z/x:root ▼▲   tab/esc:back  p:play  q:quit") | color(COL_DIM));
     return vbox(std::move(lines));
 }
 
-static Color key_col(int semitone) {
-    if (!scale_snap) return COL_PURPLE;
-    return in_pentatonic(semitone) ? COL_BRIGHT : COL_DIM;
-}
-
-static Element draw_key_el(const char* label, int semitone) {
-    return text(std::string("[") + label + "]") | color(key_col(semitone));
-}
-
-static Element render_melodic_synth_page(SessionState& s, int t) {
+static Element render_melodic_param_page(SessionState& s, int t) {
     const TrackDef& td = TRACK_DEFS[t];
-    bool is_playing = s.playing.load();
 
     Elements lines;
 
     char head_buf[80];
     std::snprintf(head_buf, sizeof(head_buf), "  bpm: %d  steps: %d  %s  ",
-                  s.bpm, s.loop_len, is_playing ? "▶" : "■");
+                  s.bpm, s.loop_len, s.playing.load() ? "▶" : "■");
     lines.push_back(hbox({
-        text("bitjams")           | bold | color(COL_PURPLE),
-        text(head_buf)                   | color(COL_PURPLE),
-        text("[melodic synth]")          | color(COL_DIM),
+        text("bitjams")     | bold | color(COL_PURPLE),
+        text(head_buf)             | color(COL_PURPLE),
+        text("[param]")            | color(COL_DIM),
     }));
 
     char title[64];
@@ -377,85 +584,740 @@ static Element render_melodic_synth_page(SessionState& s, int t) {
     lines.push_back(text(title) | bold | color(COL_GREEN));
 
     {
+        NoteName nm = note_name(s.track_root_midi[t]);
         char osc_buf[16];
         std::snprintf(osc_buf, sizeof(osc_buf), "%-8s", OSC_NAMES[(int)synth_osc]);
-        char oct_buf[8];
-        std::snprintf(oct_buf, sizeof(oct_buf), "%d", synth_octave);
-        const char* scale_str = scale_snap ? "minor penta" : "chromatic";
+        char root_buf[8];
+        std::snprintf(root_buf, sizeof(root_buf), "%c%c%d",
+                      nm.letter, nm.accidental, nm.octave);
         lines.push_back(hbox({
             text(" osc ")     | color(COL_DIM),
             text("◄ ")        | color(COL_DIM),
             text(osc_buf)     | bold | color(COL_BRIGHT),
             text("►")         | color(COL_DIM),
-            text("  oct ")    | color(COL_DIM),
-            text(oct_buf)     | color(COL_BRIGHT),
-            text("  scale ")  | color(COL_DIM),
-            text(scale_str)   | color(COL_BRIGHT),
+            text("  root ")   | color(COL_DIM),
+            text(root_buf)    | color(COL_BRIGHT),
         }));
     }
 
     lines.push_back(text(""));
-
-    {
-        Elements row;
-        row.push_back(text(" "));
-        row.push_back(draw_key_el("w",  1));
-        row.push_back(draw_key_el("e",  3));
-        row.push_back(text("   "));
-        row.push_back(draw_key_el("t",  6));
-        row.push_back(draw_key_el("y",  8));
-        row.push_back(draw_key_el("u", 10));
-        row.push_back(text("   "));
-        row.push_back(draw_key_el("o", 13));
-        lines.push_back(hbox(std::move(row)));
-    }
-
-    {
-        Elements row;
-        row.push_back(draw_key_el("a",  0));
-        row.push_back(draw_key_el("s",  2));
-        row.push_back(draw_key_el("d",  4));
-        row.push_back(draw_key_el("f",  5));
-        row.push_back(draw_key_el("g",  7));
-        row.push_back(draw_key_el("h",  9));
-        row.push_back(draw_key_el("j", 11));
-        row.push_back(draw_key_el("k", 12));
-        row.push_back(draw_key_el("l", 14));
-        lines.push_back(hbox(std::move(row)));
-    }
-
-    lines.push_back(text(""));
-    lines.push_back(text("  z:oct▼  x:oct▲  n:scale  ↑↓:osc  tab/esc:back  p:play  q:quit")
+    lines.push_back(text("  ←→:osc  z/x:root ▼▲  tab/esc:back  p:play  q:quit")
                     | color(COL_DIM));
-
     return vbox(std::move(lines));
 }
 
-static void play_synth_key_for_track(int t, int semitone) {
-    if (TRACK_DEFS[t].type != TrackType::MELODIC) return;
-    int abs_st = (synth_octave - 4) * 12 + semitone;
-    if (scale_snap) abs_st = snap_pentatonic(abs_st);
-    synth_trig_freq[TRACK_DEFS[t].melodic_idx].store(note_to_freq(abs_st));
-}
+// ---- live trigger (MPC pad) ----------------------------------------------
 
-// trigger from MPC pad: fire the track's voice at its root pitch (or drum).
 static void trigger_track_live(SessionState& s, int t) {
-    if (!s.track_active[t]) return;
+    if (track_is_silenced(s, t)) return;
     if (TRACK_DEFS[t].type == TrackType::MELODIC) {
-        synth_trig_freq[TRACK_DEFS[t].melodic_idx].store(s.track_root_hz[t]);
+        enqueue_synth_trig(TRACK_DEFS[t].melodic_idx, midi_to_hz(s.track_root_midi[t]));
     } else {
         s.trig[t].store(true);
     }
 }
 
+// ---- keyboard mode helpers -----------------------------------------------
+
+static void kbd_release_active() {
+    kbd_active_track    = -1;
+    kbd_active_note_idx = -1;
+}
+
+static void kbd_mark_dirty(SessionState& s, int melodic_idx) {
+    s.melodic_dirty[melodic_idx].store(true);
+}
+
+// Resolve the active note's stable identity (start_step + pitch) into a
+// current index — the index may have shifted if other notes were deleted.
+static int kbd_resolve_active_index(SessionState& s) {
+    if (kbd_active_track < 0 || kbd_active_note_idx < 0) return -1;
+    int midx = TRACK_DEFS[kbd_active_track].melodic_idx;
+    if (kbd_active_note_idx < (int)s.melodic_notes[midx].size())
+        return kbd_active_note_idx;
+    return -1;
+}
+
+// Place a 1-step note at cursor_step on the keyboard-mode cursor track.
+// Returns the new active index, or -1 on failure (drum track / cap).
+static int kbd_place_note(SessionState& s, uint8_t pitch_midi) {
+    if (TRACK_DEFS[cursor_track].type != TrackType::MELODIC) return -1;
+    int midx = TRACK_DEFS[cursor_track].melodic_idx;
+    Note n{ static_cast<uint8_t>(cursor_step), 1, pitch_midi, 127 };
+    if (!add_note(s.melodic_notes[midx], n)) return -1;
+    kbd_mark_dirty(s, midx);
+    return static_cast<int>(s.melodic_notes[midx].size() - 1);
+}
+
+// Truncate the held note to end just before cursor_step. Caller advances
+// cursor before invoking this for the "mid-note overwrite" flow. Held notes
+// never shrink below 1 step: if the cursor is still on the start cell, the
+// note keeps its single starting cell so a rapid two-key sequence places the
+// second note in the next cell instead of overwriting the first.
+static void kbd_truncate_active_before(SessionState& s, int new_end_step) {
+    int idx = kbd_resolve_active_index(s);
+    if (idx < 0) return;
+    int midx = TRACK_DEFS[kbd_active_track].melodic_idx;
+    Note& n = s.melodic_notes[midx][idx];
+    int new_dur = new_end_step - n.start_step;
+    if (new_dur < 1) new_dur = 1;
+    n.duration_steps = static_cast<uint8_t>(new_dur);
+    kbd_mark_dirty(s, midx);
+}
+
+// ---- piano-roll helpers --------------------------------------------------
+
+static uint8_t pr_cursor_pitch() {
+    return static_cast<uint8_t>(piano_cursor_midi);
+}
+
+// Keep piano_cursor_midi inside the visible 12-row window by scrolling the
+// viewport one semitone at a time.
+static void pr_clamp_view() {
+    if (piano_cursor_midi < piano_view_base_midi)
+        piano_view_base_midi = piano_cursor_midi;
+    else if (piano_cursor_midi > piano_view_base_midi + 11)
+        piano_view_base_midi = piano_cursor_midi - 11;
+    if (piano_view_base_midi < 0)   piano_view_base_midi = 0;
+    if (piano_view_base_midi > 116) piano_view_base_midi = 116;  // 116+11 = 127
+}
+
+static void pr_release_active() { piano_active_note_idx = -1; }
+
+static int pr_place_note_at_cursor(SessionState& s, uint8_t duration_steps) {
+    if (piano_track < 0) return -1;
+    int midx = TRACK_DEFS[piano_track].melodic_idx;
+    uint8_t pitch = pr_cursor_pitch();
+    // Apply same-row collision rule before adding.
+    clear_or_truncate_at(s.melodic_notes[midx], pitch,
+                         static_cast<uint8_t>(piano_cursor_step));
+    Note n{ static_cast<uint8_t>(piano_cursor_step), duration_steps, pitch, 127 };
+    if (!add_note(s.melodic_notes[midx], n)) return -1;
+    s.melodic_dirty[midx].store(true);
+    return static_cast<int>(s.melodic_notes[midx].size() - 1);
+}
+
+// ---- event dispatch ------------------------------------------------------
+
+static bool dispatch_param_page(SessionState& s, Event e) {
+    if (e == Event::Tab || e == Event::Escape) {
+        nav_state = NavState::GRID;
+        return true;
+    }
+    if (TRACK_DEFS[cursor_track].type == TrackType::MELODIC) {
+        if (e == Event::ArrowLeft) {
+            int o = ((int)synth_osc - 1 + OSC_COUNT) % OSC_COUNT;
+            synth_osc = (OscType)o;
+            synth_osc_atom.store(o);
+            return true;
+        }
+        if (e == Event::ArrowRight) {
+            int o = ((int)synth_osc + 1) % OSC_COUNT;
+            synth_osc = (OscType)o;
+            synth_osc_atom.store(o);
+            return true;
+        }
+    }
+    if (e.is_character() && e.character().size() == 1) {
+        char c = e.character()[0];
+        if (c == 'z') {
+            if (s.track_root_midi[cursor_track] > 0) {
+                --s.track_root_midi[cursor_track];
+                s.track_root_dirty.fetch_or(static_cast<uint16_t>(1) << cursor_track);
+            }
+            return true;
+        }
+        if (c == 'x') {
+            if (s.track_root_midi[cursor_track] < 127) {
+                ++s.track_root_midi[cursor_track];
+                s.track_root_dirty.fetch_or(static_cast<uint16_t>(1) << cursor_track);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+static void delete_at_cursor_cell(SessionState& s);
+static bool handle_shared_track_command(SessionState& s, Event e);
+
+static bool dispatch_keyboard(SessionState& s, Event e) {
+    if (e == Event::Escape) {
+        kbd_release_active();
+        nav_state = NavState::GRID;
+        return true;
+    }
+    if (e == Event::ArrowUp || e == Event::ArrowDown) {
+        kbd_release_active();
+        cycle_cursor_to_active(s, e == Event::ArrowUp ? -1 : +1);
+        if (TRACK_DEFS[cursor_track].type != TrackType::MELODIC) {
+            nav_state = NavState::GRID;
+        }
+        return true;
+    }
+
+    bool has_active = (kbd_resolve_active_index(s) >= 0);
+
+    if (e == Event::ArrowRight) {
+        if (has_active) {
+            int idx = kbd_resolve_active_index(s);
+            int midx = TRACK_DEFS[kbd_active_track].melodic_idx;
+            Note& n = s.melodic_notes[midx][idx];
+            if (n.duration_steps < s.loop_len) {
+                ++n.duration_steps;
+                s.melodic_dirty[midx].store(true);
+            }
+            if (cursor_step < s.loop_len - 1) ++cursor_step;
+        } else {
+            cursor_step = (cursor_step + 1) % s.loop_len;
+        }
+        return true;
+    }
+    if (e == Event::ArrowLeft) {
+        if (has_active) {
+            int idx = kbd_resolve_active_index(s);
+            int midx = TRACK_DEFS[kbd_active_track].melodic_idx;
+            Note& n = s.melodic_notes[midx][idx];
+            if (n.duration_steps > 1) {
+                --n.duration_steps;
+                s.melodic_dirty[midx].store(true);
+                if (cursor_step > 0) --cursor_step;
+            } else {
+                // At dur 1, escape from the held note (like ↑/↓) instead of
+                // deleting it. The note stays put; cursor moves left normally.
+                kbd_release_active();
+                cursor_step = (cursor_step - 1 + s.loop_len) % s.loop_len;
+            }
+        } else {
+            cursor_step = (cursor_step - 1 + s.loop_len) % s.loop_len;
+        }
+        return true;
+    }
+    if (e == Event::Character(' ')) {
+        if (has_active) kbd_release_active();
+        return true;
+    }
+
+    // Track-level commands (mix, clipboard, clear, fill, mode switches) work
+    // identically here and in grid mode. Any of them releases the held note
+    // first so we don't keep editing it through a mode change.
+    if (handle_shared_track_command(s, e)) {
+        kbd_release_active();
+        return true;
+    }
+
+    if (e.is_character() && e.character().size() == 1) {
+        char c = e.character()[0];
+        if (c == 'z') { kbd_octave = std::max(0, kbd_octave - 1); return true; }
+        if (c == 'x') { kbd_octave = std::min(9, kbd_octave + 1); return true; }
+        if (c == 'n') {
+            note_mode = !note_mode;
+            // Leaving record mode while a note is held would orphan the hold
+            // (Arrow keys would still grow it). Drop it so the user starts
+            // jam mode clean.
+            if (!note_mode) kbd_release_active();
+            return true;
+        }
+
+        int semi = key_to_semitone(c);
+        if (semi < 0) return true;  // suppress MPC pads and other letters
+
+        int abs_semi = (kbd_octave - 4) * 12 + semi;
+        if (scale_snap) abs_semi = snap_pentatonic(abs_semi);
+        // MIDI 60 = C4 = abs_semi 0 baseline.
+        int midi = 60 + abs_semi;
+        if (midi < 0 || midi > 127) return true;
+
+        if (TRACK_DEFS[cursor_track].type != TrackType::MELODIC) return true;
+
+        if (!note_mode) {
+            // Jam mode: play the synth, never touch the sequencer.
+            enqueue_synth_trig(TRACK_DEFS[cursor_track].melodic_idx,
+                               midi_to_hz(static_cast<uint8_t>(midi)));
+            return true;
+        }
+
+        if (has_active) {
+            int idx  = kbd_resolve_active_index(s);
+            int midx = TRACK_DEFS[kbd_active_track].melodic_idx;
+            Note& n  = s.melodic_notes[midx][idx];
+            if (cursor_step > n.start_step) {
+                // Held note was grown via ArrowRight. Truncate it so it ends
+                // just before the cursor, and place the new pitch at the
+                // current cursor cell (don't advance).
+                kbd_truncate_active_before(s, cursor_step);
+            } else if (cursor_step < s.loop_len - 1) {
+                // 1-cell held at cursor: keep it at dur 1, advance the cursor
+                // so the new pitch lands in the next cell.
+                ++cursor_step;
+            } else {
+                // 1-cell held at the last cell: cursor can't advance. Delete
+                // the held note so the new pitch cleanly replaces it.
+                s.melodic_notes[midx].erase(s.melodic_notes[midx].begin() + idx);
+                kbd_mark_dirty(s, midx);
+            }
+            kbd_release_active();
+        }
+
+        int new_idx = kbd_place_note(s, static_cast<uint8_t>(midi));
+        if (new_idx >= 0) {
+            kbd_active_track    = cursor_track;
+            kbd_active_note_idx = new_idx;
+            // Fire audio immediately.
+            enqueue_synth_trig(TRACK_DEFS[cursor_track].melodic_idx,
+                               midi_to_hz(static_cast<uint8_t>(midi)));
+        }
+        return true;
+    }
+    return false;
+}
+
+static bool dispatch_piano_roll(SessionState& s, Event e) {
+    if (e == Event::Escape) {
+        pr_release_active();
+        nav_state = NavState::GRID;
+        return true;
+    }
+    if (piano_track < 0) {
+        nav_state = NavState::GRID;
+        return true;
+    }
+
+    if (e == Event::ArrowRight) {
+        if (piano_active_note_idx >= 0) {
+            int midx = TRACK_DEFS[piano_track].melodic_idx;
+            if (piano_active_note_idx < (int)s.melodic_notes[midx].size()) {
+                Note& n = s.melodic_notes[midx][piano_active_note_idx];
+                if (n.duration_steps < s.loop_len) {
+                    ++n.duration_steps;
+                    s.melodic_dirty[midx].store(true);
+                }
+            }
+            if (piano_cursor_step < s.loop_len - 1) ++piano_cursor_step;
+        } else {
+            piano_cursor_step = (piano_cursor_step + 1) % s.loop_len;
+        }
+        return true;
+    }
+    if (e == Event::ArrowLeft) {
+        if (piano_active_note_idx >= 0) {
+            int midx = TRACK_DEFS[piano_track].melodic_idx;
+            if (piano_active_note_idx < (int)s.melodic_notes[midx].size()) {
+                Note& n = s.melodic_notes[midx][piano_active_note_idx];
+                if (n.duration_steps > 1) {
+                    --n.duration_steps;
+                    s.melodic_dirty[midx].store(true);
+                } else {
+                    s.melodic_notes[midx].erase(s.melodic_notes[midx].begin()
+                                                + piano_active_note_idx);
+                    s.melodic_dirty[midx].store(true);
+                    pr_release_active();
+                }
+            }
+            if (piano_cursor_step > 0) --piano_cursor_step;
+        } else {
+            piano_cursor_step = (piano_cursor_step - 1 + s.loop_len) % s.loop_len;
+        }
+        return true;
+    }
+    if (e == Event::ArrowUp) {
+        pr_release_active();
+        if (piano_cursor_midi < 127) ++piano_cursor_midi;
+        pr_clamp_view();
+        return true;
+    }
+    if (e == Event::ArrowDown) {
+        pr_release_active();
+        if (piano_cursor_midi > 0) --piano_cursor_midi;
+        pr_clamp_view();
+        return true;
+    }
+    if (e == Event::Backspace) {
+        // Delete the note under the cursor.
+        int midx = TRACK_DEFS[piano_track].melodic_idx;
+        auto& notes = s.melodic_notes[midx];
+        uint8_t pitch = pr_cursor_pitch();
+        for (auto it = notes.begin(); it != notes.end(); ++it) {
+            if (it->pitch_midi != pitch) continue;
+            int end = it->start_step + it->duration_steps;
+            if (piano_cursor_step >= it->start_step && piano_cursor_step < end) {
+                notes.erase(it);
+                pr_release_active();
+                s.melodic_dirty[midx].store(true);
+                break;
+            }
+        }
+        return true;
+    }
+    if (e == Event::Character(' ')) {
+        if (piano_active_note_idx >= 0) { pr_release_active(); return true; }
+        if (!note_mode) {
+            // Jam mode: audition the cursor pitch without recording.
+            enqueue_synth_trig(TRACK_DEFS[piano_track].melodic_idx,
+                               midi_to_hz(pr_cursor_pitch()));
+            return true;
+        }
+        int new_idx = pr_place_note_at_cursor(s, 1);
+        if (new_idx >= 0) {
+            piano_active_note_idx = new_idx;
+            enqueue_synth_trig(TRACK_DEFS[piano_track].melodic_idx,
+                               midi_to_hz(pr_cursor_pitch()));
+        }
+        return true;
+    }
+
+    if (e.is_character() && e.character().size() == 1) {
+        char c = e.character()[0];
+        if (c == 'z') {
+            piano_cursor_midi    = std::max(0,   piano_cursor_midi - 12);
+            piano_view_base_midi = std::max(0,   piano_view_base_midi - 12);
+            return true;
+        }
+        if (c == 'x') {
+            piano_cursor_midi    = std::min(127, piano_cursor_midi + 12);
+            piano_view_base_midi = std::min(116, piano_view_base_midi + 12);
+            return true;
+        }
+        if (c == 'C') {
+            // Shift+C clears the piano roll's entire pattern.
+            int midx = TRACK_DEFS[piano_track].melodic_idx;
+            s.melodic_notes[midx].clear();
+            pr_release_active();
+            s.melodic_dirty[midx].store(true);
+            return true;
+        }
+        if (c == 'n') {
+            note_mode = !note_mode;
+            if (!note_mode) pr_release_active();
+            return true;
+        }
+        if (c == 'c') {
+            // Copy duration of the note under cursor (if any).
+            int midx = TRACK_DEFS[piano_track].melodic_idx;
+            uint8_t pitch = pr_cursor_pitch();
+            for (const Note& n : s.melodic_notes[midx]) {
+                if (n.pitch_midi != pitch) continue;
+                int end = n.start_step + n.duration_steps;
+                if (piano_cursor_step >= n.start_step && piano_cursor_step < end) {
+                    piano_clipboard = n;
+                    piano_clipboard_set = true;
+                    break;
+                }
+            }
+            return true;
+        }
+        if (c == 'v') {
+            uint8_t dur = piano_clipboard_set ? piano_clipboard.duration_steps : 1;
+            int new_idx = pr_place_note_at_cursor(s, dur);
+            if (new_idx >= 0) {
+                piano_active_note_idx = -1;  // paste does not start a hold
+                enqueue_synth_trig(TRACK_DEFS[piano_track].melodic_idx,
+                                   midi_to_hz(pr_cursor_pitch()));
+            }
+            return true;
+        }
+        // pitch keys: absolute C4-based mapping. `a` = C4 (MIDI 60) always,
+        // independent of scroll position. Spans up to D5 (`l` = semi 14).
+        // Cursor jumps to that pitch; viewport scrolls to keep it visible.
+        int semi = key_to_semitone(c);
+        if (semi >= 0) {
+            pr_release_active();
+            int midi = 60 + semi;
+            if (midi < 0 || midi > 127) return true;
+            piano_cursor_midi = midi;
+            pr_clamp_view();
+            int new_idx = pr_place_note_at_cursor(s, 1);
+            if (new_idx >= 0) {
+                piano_active_note_idx = new_idx;
+                enqueue_synth_trig(TRACK_DEFS[piano_track].melodic_idx,
+                                   midi_to_hz(pr_cursor_pitch()));
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+// 1-9 in grid mode: fill the cursor track at `interval`-step spacing, starting
+// from `start`. Drum tracks set hits; melodic tracks place 1-step notes at the
+// track's root pitch (existing notes at those steps on the root pitch are
+// preserved if already present; we don't dedupe — chord stacking is fine).
+static void fill_pattern(SessionState& s, int interval, int start) {
+    if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
+        int dk = TRACK_DEFS[cursor_track].drum_kind;
+        uint16_t fill_mask = 0;
+        for (int step = start; step < s.loop_len; step += interval) {
+            s.drum_grid[dk][step] = true;
+            fill_mask |= static_cast<uint16_t>(1) << step;
+        }
+        s.dirty[cursor_track].fetch_or(fill_mask, std::memory_order_relaxed);
+        return;
+    }
+    int midx = TRACK_DEFS[cursor_track].melodic_idx;
+    uint8_t root = s.track_root_midi[cursor_track];
+    auto& notes = s.melodic_notes[midx];
+    bool changed = false;
+    for (int step = start; step < s.loop_len; step += interval) {
+        Note n{ static_cast<uint8_t>(step), 1, root, 127 };
+        if (add_note(notes, n)) changed = true;
+    }
+    if (changed) s.melodic_dirty[midx].store(true);
+}
+
+// ---- track clipboard (c=copy, v=paste) ----------------------------------
+//
+// Single-slot clipboard. Cross-type paste translates:
+//   drum -> melodic: every hit becomes a 1-step note at the destination
+//                    track's root pitch.
+//   melodic -> drum: every note's start_step becomes a hit (durations and
+//                    pitches discarded).
+// Native-type paste is a straight copy.
+static int               clip_kind = -1;  // -1 empty, 0 drum, 1 melodic
+static bool              clip_drum[STEPS] = {};
+static std::vector<Note> clip_notes;
+
+static void copy_cursor_track(SessionState& s) {
+    if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
+        int dk = TRACK_DEFS[cursor_track].drum_kind;
+        for (int st = 0; st < STEPS; ++st) clip_drum[st] = s.drum_grid[dk][st];
+        clip_notes.clear();
+        clip_kind = 0;
+    } else {
+        int midx = TRACK_DEFS[cursor_track].melodic_idx;
+        clip_notes = s.melodic_notes[midx];
+        for (int st = 0; st < STEPS; ++st) clip_drum[st] = false;
+        clip_kind = 1;
+    }
+}
+
+static void paste_to_cursor_track(SessionState& s) {
+    if (clip_kind < 0) return;
+    if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
+        int dk = TRACK_DEFS[cursor_track].drum_kind;
+        if (clip_kind == 0) {
+            for (int st = 0; st < STEPS; ++st) s.drum_grid[dk][st] = clip_drum[st];
+        } else {
+            // melodic -> drum: hit on every note start_step.
+            for (int st = 0; st < STEPS; ++st) s.drum_grid[dk][st] = false;
+            for (const Note& n : clip_notes) {
+                if (n.start_step < STEPS) s.drum_grid[dk][n.start_step] = true;
+            }
+        }
+        s.dirty[cursor_track].fetch_or(0xFFFFu, std::memory_order_relaxed);
+    } else {
+        int midx = TRACK_DEFS[cursor_track].melodic_idx;
+        uint8_t root = s.track_root_midi[cursor_track];
+        auto& notes = s.melodic_notes[midx];
+        notes.clear();
+        if (clip_kind == 0) {
+            // drum -> melodic: 1-step note at root pitch for every hit.
+            for (int st = 0; st < STEPS; ++st) {
+                if (!clip_drum[st]) continue;
+                Note n{ static_cast<uint8_t>(st), 1, root, 127 };
+                add_note(notes, n);
+            }
+        } else {
+            for (const Note& n : clip_notes) add_note(notes, n);
+        }
+        s.melodic_dirty[midx].store(true);
+    }
+}
+
+// Backspace handler for the sequencer view. On a drum track, clears the hit
+// at cursor_step. On a melodic track, erases every note whose span covers
+// cursor_step (so stacked / sustaining notes all go in one keystroke).
+static void delete_at_cursor_cell(SessionState& s) {
+    if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
+        int dk = TRACK_DEFS[cursor_track].drum_kind;
+        if (!s.drum_grid[dk][cursor_step]) return;
+        s.drum_grid[dk][cursor_step] = false;
+        s.dirty[cursor_track].fetch_or(static_cast<uint16_t>(1) << cursor_step,
+                                       std::memory_order_relaxed);
+        return;
+    }
+    int midx = TRACK_DEFS[cursor_track].melodic_idx;
+    auto& notes = s.melodic_notes[midx];
+    bool changed = false;
+    for (auto it = notes.begin(); it != notes.end();) {
+        int end = it->start_step + it->duration_steps;
+        if (cursor_step >= it->start_step && cursor_step < end) {
+            it = notes.erase(it);
+            changed = true;
+        } else {
+            ++it;
+        }
+    }
+    if (changed) s.melodic_dirty[midx].store(true);
+}
+
+// Track-level commands that work the same in GRID and KEYBOARD modes:
+// nav-mode switches (Tab/Return), the delete key, mix toggles (S/M), the
+// clipboard (C/V), clear-track + AD-clear-all, and the 1-9 fill pattern.
+// Returns true if the event was a shared command.
+static bool handle_shared_track_command(SessionState& s, Event e) {
+    if (e == Event::Tab) {
+        ensure_cursor_visible(s);
+        nav_state = NavState::PARAM_PAGE;
+        return true;
+    }
+    if (e == Event::Return) {
+        ensure_cursor_visible(s);
+        if (TRACK_DEFS[cursor_track].type == TrackType::MELODIC) {
+            piano_track          = cursor_track;
+            piano_cursor_step    = std::min(cursor_step, s.loop_len - 1);
+            piano_cursor_midi    = s.track_root_midi[cursor_track];
+            piano_view_base_midi = std::max(0, piano_cursor_midi - 6);
+            if (piano_view_base_midi > 116) piano_view_base_midi = 116;
+            pr_release_active();
+            nav_state = NavState::PIANO_ROLL;
+        }
+        return true;
+    }
+    if (e == Event::Backspace) { delete_at_cursor_cell(s); return true; }
+    if (e == Event::Character('S')) {
+        s.track_solo[cursor_track] = !s.track_solo[cursor_track];
+        return true;
+    }
+    if (e == Event::Character('M')) {
+        s.track_muted[cursor_track] = !s.track_muted[cursor_track];
+        return true;
+    }
+    if (e == Event::Character('C')) { copy_cursor_track(s);     return true; }
+    if (e == Event::Character('V')) { paste_to_cursor_track(s); return true; }
+
+    using clk = std::chrono::steady_clock;
+    static auto last_A = clk::time_point{};
+    constexpr auto CLEAR_ALL_WINDOW = std::chrono::milliseconds(500);
+
+    if (e == Event::Character('A')) {
+        // Arm clear-all. A standalone 'A' does nothing else; the next 'D'
+        // within the window commits the wipe.
+        last_A = clk::now();
+        return true;
+    }
+    if (e == Event::Character('D')) {
+        auto now = clk::now();
+        if (now - last_A <= CLEAR_ALL_WINDOW) {
+            for (int k = 0; k < DRUM_KINDS; ++k)
+                std::memset(s.drum_grid[k], 0, sizeof(s.drum_grid[k]));
+            for (int m = 0; m < MELODIC_VOICES; ++m) s.melodic_notes[m].clear();
+            for (int t = 0; t < TRACKS; ++t) s.dirty[t].fetch_or(0xFFFFu);
+            for (int m = 0; m < MELODIC_VOICES; ++m) s.melodic_dirty[m].store(true);
+            last_A = clk::time_point{};
+            return true;
+        }
+        if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
+            int dk = TRACK_DEFS[cursor_track].drum_kind;
+            std::memset(s.drum_grid[dk], 0, sizeof(s.drum_grid[dk]));
+            s.dirty[cursor_track].fetch_or(0xFFFFu, std::memory_order_relaxed);
+        } else {
+            int midx = TRACK_DEFS[cursor_track].melodic_idx;
+            s.melodic_notes[midx].clear();
+            s.melodic_dirty[midx].store(true);
+        }
+        return true;
+    }
+    if (e.is_character() && e.character().size() == 1) {
+        char c = e.character()[0];
+        if (c >= '1' && c <= '9') {
+            fill_pattern(s, c - '0', cursor_step);
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool dispatch_grid(SessionState& s, Event e) {
+    if (handle_shared_track_command(s, e)) return true;
+
+    if (e.is_character() && e.character().size() == 1 && e.character()[0] == 'k') {
+        if (TRACK_DEFS[cursor_track].type == TrackType::MELODIC) {
+            kbd_release_active();
+            kbd_octave = std::max(0, (s.track_root_midi[cursor_track] / 12) - 1);
+            nav_state = NavState::KEYBOARD;
+        }
+        return true;
+    }
+
+    // MPC pad triggers: focus + fire audio. Lowercase letters that match
+    // TRACK_DEFS keys (v, b, n, m, f, g, h, j, r, t, y, u). These are
+    // grid-only — keyboard mode treats lowercase letters as pitches.
+    if (e.is_character() && e.character().size() == 1) {
+        char c = e.character()[0];
+        int t = track_for_mpc_key(c);
+        if (t >= 0) {
+            trigger_track_live(s, t);
+            cursor_track = t;
+            return true;
+        }
+    }
+
+    if (e == Event::Character('s')) { seq_mode = !seq_mode; return true; }
+
+    if (e == Event::ArrowUp)   { cycle_cursor_to_active(s, -1); return true; }
+    if (e == Event::ArrowDown) { cycle_cursor_to_active(s, +1); return true; }
+
+    if (seq_mode) {
+        if (e == Event::ArrowLeft)  { window_start = (window_start - 8 + 16) % 16; return true; }
+        if (e == Event::ArrowRight) { window_start = (window_start + 8) % 16;      return true; }
+        if (e.is_character() && e.character().size() == 1) {
+            char c = e.character()[0];
+            if (c >= '1' && c <= '8') {
+                int step = window_start + (c - '1');
+                if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
+                    int dk = TRACK_DEFS[cursor_track].drum_kind;
+                    s.drum_grid[dk][step] = !s.drum_grid[dk][step];
+                    s.dirty[cursor_track].fetch_or(1u << step, std::memory_order_relaxed);
+                }
+                return true;
+            }
+        }
+    } else {
+        if (e == Event::ArrowLeft) {
+            cursor_step = (cursor_step - 1 + STEPS) % STEPS; return true;
+        }
+        if (e == Event::ArrowRight) {
+            cursor_step = (cursor_step + 1) % STEPS; return true;
+        }
+        if (e == Event::Character(' ')) {
+            if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
+                int dk = TRACK_DEFS[cursor_track].drum_kind;
+                s.drum_grid[dk][cursor_step] = !s.drum_grid[dk][cursor_step];
+                s.dirty[cursor_track].fetch_or(1u << cursor_step, std::memory_order_relaxed);
+            } else {
+                // Place a 1-step note at root pitch. If a note already starts
+                // at this cell on the root pitch, remove it (toggle feel).
+                int midx = TRACK_DEFS[cursor_track].melodic_idx;
+                uint8_t root = s.track_root_midi[cursor_track];
+                auto& notes = s.melodic_notes[midx];
+                bool removed = false;
+                for (auto it = notes.begin(); it != notes.end(); ++it) {
+                    if (it->start_step == cursor_step && it->pitch_midi == root) {
+                        notes.erase(it); removed = true; break;
+                    }
+                }
+                if (!removed) {
+                    Note n{ static_cast<uint8_t>(cursor_step), 1, root, 127 };
+                    add_note(notes, n);
+                }
+                s.melodic_dirty[midx].store(true);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 Component build_session_ui(ScreenInteractive& screen, SessionState& state) {
     auto root = Renderer([&state] {
         Element page;
-        if (nav_state == NavState::SYNTH_PAGE) {
+        if (nav_state == NavState::PARAM_PAGE) {
             ensure_cursor_visible(state);
             page = (TRACK_DEFS[cursor_track].type == TrackType::MELODIC)
-                 ? render_melodic_synth_page(state, cursor_track)
-                 : render_drum_synth_page(state, cursor_track);
+                 ? render_melodic_param_page(state, cursor_track)
+                 : render_drum_param_page(state, cursor_track);
+        } else if (nav_state == NavState::PIANO_ROLL) {
+            page = render_piano_roll(state);
         } else {
             page = render_grid_view(state);
         }
@@ -466,12 +1328,12 @@ Component build_session_ui(ScreenInteractive& screen, SessionState& state) {
     });
 
     auto with_events = CatchEvent(root, [&screen, &state](Event e) -> bool {
+        // Global keys first.
         if (e == Event::Character('q') || e == Event::Character('Q')) {
             state.running.store(false);
             screen.Exit();
             return true;
         }
-
         if (e == Event::Character('p') || e == Event::Character('P')) {
             state.playing.store(!state.playing.load());
             if (!state.playing.load()) state.play_step.store(0);
@@ -494,143 +1356,19 @@ Component build_session_ui(ScreenInteractive& screen, SessionState& state) {
             state.loop_len = std::max(1, state.loop_len - 1); return true;
         }
 
-        // ---- SYNTH_PAGE ----
-        if (nav_state == NavState::SYNTH_PAGE) {
-            if (e == Event::Tab || e == Event::Escape) {
-                nav_state = NavState::GRID;
-                return true;
-            }
-            if (TRACK_DEFS[cursor_track].type == TrackType::MELODIC) {
-                if (e == Event::ArrowUp) {
-                    int o = ((int)synth_osc - 1 + OSC_COUNT) % OSC_COUNT;
-                    synth_osc = (OscType)o;
-                    synth_osc_atom.store(o);
-                    return true;
-                }
-                if (e == Event::ArrowDown) {
-                    int o = ((int)synth_osc + 1) % OSC_COUNT;
-                    synth_osc = (OscType)o;
-                    synth_osc_atom.store(o);
-                    return true;
-                }
-                if (e.is_character() && e.character().size() == 1) {
-                    char c = e.character()[0];
-                    int st = key_to_semitone(c);
-                    if (st >= 0) { play_synth_key_for_track(cursor_track, st); return true; }
-                    if (c == 'z') { synth_octave = std::max(1, synth_octave - 1); return true; }
-                    if (c == 'x') { synth_octave = std::min(7, synth_octave + 1); return true; }
-                    if (c == 'n') { scale_snap = !scale_snap; return true; }
-                }
-            } else {
-                // drum synth page: still allow MPC-pad triggers so the user can
-                // audition any track without leaving the page
-                if (e.is_character() && e.character().size() == 1) {
-                    int t = track_for_mpc_key(e.character()[0]);
-                    if (t >= 0) { trigger_track_live(state, t); return true; }
-                }
-            }
-            return false;
+        switch (nav_state) {
+            case NavState::PARAM_PAGE: return dispatch_param_page(state, e);
+            case NavState::KEYBOARD:   return dispatch_keyboard(state, e);
+            case NavState::PIANO_ROLL: return dispatch_piano_roll(state, e);
+            case NavState::GRID:
+            default:                   return dispatch_grid(state, e);
         }
-
-        // ---- TITLE_FOCUS ----
-        if (nav_state == NavState::TITLE_FOCUS) {
-            if (e == Event::Tab || e == Event::Escape) {
-                nav_state = NavState::GRID;
-                return true;
-            }
-            if (e == Event::Return) {
-                nav_state = NavState::SYNTH_PAGE;
-                return true;
-            }
-            if (e == Event::ArrowUp)   { cycle_cursor_to_active(state, -1); return true; }
-            if (e == Event::ArrowDown) { cycle_cursor_to_active(state, +1); return true; }
-            // MPC keys still trigger (no focus move; user is navigating)
-            if (e.is_character() && e.character().size() == 1) {
-                int t = track_for_mpc_key(e.character()[0]);
-                if (t >= 0) { trigger_track_live(state, t); return true; }
-            }
-            return false;
-        }
-
-        // ---- GRID (default) ----
-        if (e == Event::Tab) {
-            ensure_cursor_visible(state);
-            nav_state = NavState::TITLE_FOCUS;
-            return true;
-        }
-
-        // MPC pad: trigger sound + move cursor focus to that track
-        if (e.is_character() && e.character().size() == 1) {
-            char c = e.character()[0];
-            int t = track_for_mpc_key(c);
-            if (t >= 0 && state.track_active[t]) {
-                trigger_track_live(state, t);
-                cursor_track = t;
-                return true;
-            }
-        }
-
-        if (e == Event::Character('a')) { show_next_hidden(state); return true; }
-        if (e == Event::Character('d')) { hide_cursor_track(state); return true; }
-
-        // track navigation (cycles only visible tracks)
-        if (e == Event::ArrowUp)   { cycle_cursor_to_active(state, -1); return true; }
-        if (e == Event::ArrowDown) { cycle_cursor_to_active(state, +1); return true; }
-
-        if (e == Event::Character('s')) { seq_mode = !seq_mode; return true; }
-        if (e == Event::Character('c')) {
-            std::memset(state.grid[cursor_track], 0, sizeof(state.grid[cursor_track]));
-            // Mark the entire track dirty so milestone-2 flush picks up the clear.
-            state.dirty[cursor_track].fetch_or(0xFFFFu, std::memory_order_relaxed);
-            return true;
-        }
-        if (e == Event::Character('C')) {
-            std::memset(state.grid, 0, sizeof(state.grid));
-            for (int t = 0; t < TRACKS; ++t) {
-                state.dirty[t].fetch_or(0xFFFFu, std::memory_order_relaxed);
-            }
-            return true;
-        }
-
-        if (seq_mode) {
-            if (e == Event::ArrowLeft)  { window_start = (window_start - 8 + 16) % 16; return true; }
-            if (e == Event::ArrowRight) { window_start = (window_start + 8) % 16;      return true; }
-            if (e.is_character() && e.character().size() == 1) {
-                char c = e.character()[0];
-                if (c >= '1' && c <= '8') {
-                    int step = window_start + (c - '1');
-                    state.grid[cursor_track][step] = !state.grid[cursor_track][step];
-                    state.dirty[cursor_track].fetch_or(1u << step, std::memory_order_relaxed);
-                    return true;
-                }
-            }
-        } else {
-            if (e == Event::ArrowLeft)  { cursor_step = (cursor_step - 1 + STEPS) % STEPS; return true; }
-            if (e == Event::ArrowRight) { cursor_step = (cursor_step + 1) % STEPS;          return true; }
-            if (e == Event::Character(' ')) {
-                state.grid[cursor_track][cursor_step] = !state.grid[cursor_track][cursor_step];
-                state.dirty[cursor_track].fetch_or(1u << cursor_step, std::memory_order_relaxed);
-                return true;
-            }
-            if (e.is_character() && e.character().size() == 1) {
-                char c = e.character()[0];
-                if (c >= '1' && c <= '9') { 
-                    fill_pattern(state, c - '0', cursor_step);
-
-                    return true;
-                }
-            }
-        }
-
-        return false;
     });
 
     return with_events;
 }
 
-// ---------------------------------------------------------------------------
-// Startup page
-// ---------------------------------------------------------------------------
+// ---- startup page (unchanged) --------------------------------------------
 
 static const char* const BITJAMS_LOGO[] = {
     "    ██████╗ ██╗████████╗     ██╗ █████╗ ███╗   ███╗███████╗",
@@ -662,7 +1400,6 @@ static Element render_logo() {
 }
 
 namespace {
-
 constexpr int LANDING    = 0;
 constexpr int HOST_INFO  = 1;
 constexpr int JOIN_ENTRY = 2;
@@ -675,13 +1412,10 @@ struct StartupCtx {
     std::string   last_error;
     StartupChoice* result      = nullptr;
     ftxui::ScreenInteractive*  screen = nullptr;
-    std::string   local_ip     = "(unknown)";  // display-only
+    std::string   local_ip     = "(unknown)";
 };
-
 } // namespace
 
-// Picks the first non-loopback IPv4 interface address. Used only for the
-// HOST_INFO confirmation screen. Implementation in main.cpp.
 extern std::string get_local_ipv4();
 
 static Element render_landing(const StartupCtx& ctx) {
@@ -736,8 +1470,6 @@ ftxui::Component build_startup_screens(ftxui::ScreenInteractive& screen,
     auto room_field = Input(&ctx->room_buf, "room number");
     auto join_form  = Container::Vertical({ip_field, room_field});
 
-    // Single renderer that switches by ctx->current. Wraps the join form so
-    // its Input fields receive keystrokes when JOIN_ENTRY is active.
     auto root = Renderer(join_form, [ctx, ip_field, room_field] {
         switch (ctx->current) {
             case HOST_INFO: return render_host_info(*ctx);
@@ -808,8 +1540,6 @@ ftxui::Component build_startup_screens(ftxui::ScreenInteractive& screen,
                 return false;
             }
             case JOIN_ENTRY: {
-                // Only consume Enter and Escape — let everything else fall
-                // through to the Input fields so they can receive keystrokes.
                 if (e == Event::Return) {
                     if (ctx->ip_buf.empty() || ctx->room_buf.empty()) return true;
                     int parsed = 0;

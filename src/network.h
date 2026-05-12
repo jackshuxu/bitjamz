@@ -6,11 +6,37 @@
 inline constexpr uint16_t NET_PORT     = 47474;
 inline constexpr int      NET_FLUSH_MS = 50;
 
+// MSG_EDIT — drum-cell sparse edit batch (one per NET_FLUSH_MS window):
+//   uint8_t  cell_count
+//   { uint8_t track, uint8_t step, uint8_t value }[cell_count]   (track 0..7)
+//   uint8_t  bpm_present
+//   int32_t  bpm                       (network byte order; always present)
+//
+// MSG_MELODIC_TRACK — whole-list resend for one melodic track:
+//   uint8_t  track_id                  (8..11; validated on recv)
+//   uint8_t  note_count
+//   { uint8_t start_step, duration_steps, pitch_midi, velocity }[note_count]
+//
+// MSG_TRACK_ROOT_MIDI — scalar:
+//   uint8_t  track_id                  (0..11)
+//   uint8_t  midi
+//
+// MSG_STATE — variable-length handshake snapshot:
+//   uint16_t session_id                (NBO)
+//   int32_t  bpm                       (NBO)
+//   uint8_t  track_root_midi[12]
+//   uint16_t drum_grid_mask[8]         (NBO, per-drum-kind 16-bit step mask)
+//   for melodic_idx in 0..3:
+//       uint8_t note_count
+//       { uint8_t start_step, duration_steps, pitch_midi, velocity }[note_count]
+
 enum MsgType : uint8_t {
-    MSG_HANDSHAKE      = 0x00,
-    MSG_HANDSHAKE_FAIL = 0x01,
-    MSG_STATE          = 0x02,
-    MSG_EDIT           = 0x03,
+    MSG_HANDSHAKE        = 0x00,
+    MSG_HANDSHAKE_FAIL   = 0x01,
+    MSG_STATE            = 0x02,
+    MSG_EDIT             = 0x03,
+    MSG_MELODIC_TRACK    = 0x04,
+    MSG_TRACK_ROOT_MIDI  = 0x05,
 };
 
 class Network {

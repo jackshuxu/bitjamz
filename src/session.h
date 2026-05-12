@@ -1,8 +1,11 @@
 #pragma once
 
+#include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 // Anything used by more than one module (audio, ui, net, main) lives here.
 // Per-module helpers live in that module's own .cpp as file-locals.
@@ -13,6 +16,107 @@ inline constexpr int MELODIC_VOICES = 4;
 inline constexpr int DRUM_KINDS     = 8;
 
 enum class TrackType { DRUM, MELODIC };
+
+// 64-note cap per melodic track. Wire-format note_count is uint8_t but a
+// 64-cap keeps packets small and matches the UI's "1-bar" mental model.
+inline constexpr int MAX_NOTES_PER_MELODIC = 64;
+
+// One note in a melodic track. start_step + duration_steps may exceed
+// loop_len; the audio side only fires the onset.
+struct Note {
+    uint8_t start_step;
+    uint8_t duration_steps;
+    uint8_t pitch_midi;
+    uint8_t velocity;
+};
+
+inline float midi_to_hz(uint8_t m) {
+    return 440.0f * std::exp2((static_cast<int>(m) - 69) / 12.0f);
+}
+
+// Append n to notes unless the 64-note cap is reached. Returns true on
+// success, false on no-op overflow.
+inline bool add_note(std::vector<Note>& notes, const Note& n) {
+    if (notes.size() >= MAX_NOTES_PER_MELODIC) return false;
+    notes.push_back(n);
+    return true;
+}
+
+// Same-row collision rule applied before placing a new note at (at_step) on
+// pitch (pitch_midi). For each existing note on the same pitch row whose
+// span [A, A+D) contains at_step:
+//   A == at_step -> deleted
+//   A <  at_step -> duration shrunk to (at_step - A)
+inline void clear_or_truncate_at(std::vector<Note>& notes,
+                                 uint8_t pitch_midi, uint8_t at_step) {
+    for (auto it = notes.begin(); it != notes.end();) {
+        if (it->pitch_midi != pitch_midi) { ++it; continue; }
+        int a = it->start_step;
+        int b = a + it->duration_steps - 1;
+        if (a <= static_cast<int>(at_step) && static_cast<int>(at_step) <= b) {
+            if (a == static_cast<int>(at_step)) {
+                it = notes.erase(it);
+                continue;
+            }
+            it->duration_steps = static_cast<uint8_t>(at_step - a);
+        }
+        ++it;
+    }
+}
+
+// One projected cell from a melodic track for the single-row sequencer view.
+struct ProjectedCell {
+    int  note_idx;   // -1 if cell is empty
+    bool is_start;
+    bool is_end;
+};
+
+// Walk a melodic track's notes and produce per-cell display info under the
+// "starters win (lowest-pitch tiebreak); continuation cells pick the
+// most-recently-started still-sustaining (lowest-pitch tiebreak)" stack
+// rule. Cells past loop_len are returned as { -1, false, false }.
+inline std::array<ProjectedCell, STEPS> project_row(
+    const std::vector<Note>& notes, int loop_len) {
+    std::array<ProjectedCell, STEPS> out{};
+    for (auto& c : out) c = { -1, false, false };
+
+    for (int c = 0; c < loop_len; ++c) {
+        int best = -1;
+        bool best_is_starter = false;
+        // First pass: starters on this cell.
+        for (size_t i = 0; i < notes.size(); ++i) {
+            const Note& n = notes[i];
+            if (n.start_step != c) continue;
+            int end = n.start_step + n.duration_steps;
+            if (c >= end) continue;
+            if (best < 0) { best = static_cast<int>(i); best_is_starter = true; continue; }
+            if (n.pitch_midi < notes[best].pitch_midi) best = static_cast<int>(i);
+        }
+        // No starter: pick the most-recently-started still-sustaining note
+        // (lowest-pitch on tie).
+        if (best < 0) {
+            for (size_t i = 0; i < notes.size(); ++i) {
+                const Note& n = notes[i];
+                int end = n.start_step + n.duration_steps;
+                if (c < n.start_step || c >= end) continue;
+                if (best < 0) { best = static_cast<int>(i); continue; }
+                const Note& cur = notes[best];
+                if (n.start_step > cur.start_step) best = static_cast<int>(i);
+                else if (n.start_step == cur.start_step && n.pitch_midi < cur.pitch_midi)
+                    best = static_cast<int>(i);
+            }
+        }
+        out[c].note_idx = best;
+        if (best >= 0) {
+            const Note& n = notes[best];
+            int end_step = n.start_step + n.duration_steps - 1;
+            if (end_step >= loop_len) end_step = loop_len - 1;
+            out[c].is_start = (c == n.start_step) && best_is_starter;
+            out[c].is_end   = (c == end_step);
+        }
+    }
+    return out;
+}
 
 // drum_kind values when type == DRUM (index into audio drum voice + DRUM_PARAMS)
 enum DrumKind {
@@ -54,33 +158,6 @@ inline constexpr TrackDef TRACK_DEFS[TRACKS] = {
     { "drone", 'u', TrackType::MELODIC, -1, 3 },
 };
 
-// Full snapshot of the serializable portion of SessionState. Sent by the
-// host to a joiner immediately after a successful handshake. Replaces the
-// joiner's local state entirely.
-//
-// Wire layout (network byte order for multi-byte ints):
-//   uint16_t session_id          (htons/ntohs at boundary)
-//   int32_t  bpm                 (htonl/ntohl at boundary)
-//   uint8_t  track_active[TRACKS]
-//   uint8_t  grid[TRACKS][STEPS]
-struct __attribute__((packed)) MsgState {
-    uint16_t session_id;                  // network byte order on the wire
-    int32_t  bpm;                         // network byte order on the wire
-    uint8_t  track_active[TRACKS];        // 0/1 per track
-    uint8_t  grid[TRACKS][STEPS];         // 0/1 per cell, row-major
-};
-static_assert(sizeof(MsgState) == 2 + 4 + TRACKS + TRACKS * STEPS,
-              "MsgState packed size unexpected");
-
-// MSG_EDIT wire format (milestone 2): see network.h. Sparse edit batch sent
-// every NET_FLUSH_MS window when there's anything to ship. Layout:
-//   uint8_t  cell_count
-//   { uint8_t track, uint8_t step, uint8_t value }[cell_count]
-//   uint8_t  bpm_present
-//   int32_t  bpm                       (network byte order; always present)
-//   uint8_t  track_active_present
-//   uint16_t track_active_mask         (network byte order; always present)
-
 // One bitjams session.
 //
 // A "session" is the collaborative unit: what a host hosts, what a joiner
@@ -89,29 +166,40 @@ static_assert(sizeof(MsgState) == 2 + 4 + TRACKS + TRACKS * STEPS,
 //
 // Three logical groups of fields:
 //   1. Shared creative state — synced across the network:
-//        grid, track_active, bpm, track_root_hz
+//        drum_grid, melodic_notes, bpm, track_root_midi
 //   2. Per-peer runtime — never synced, each peer runs its own:
-//        play_step, playing, running, trig, loop_len
+//        play_step, playing, running, trig, loop_len, track_muted, track_solo
 //   3. Networking bookkeeping — only meaningful in multi-peer mode:
-//        session_id, dirty
+//        session_id, dirty, melodic_dirty
 class SessionState {
 public:
     SessionState();                          // default solo state
-    SessionState(const MsgState& state);     // joiner-from-network
     ~SessionState() = default;
 
     // --- networking bookkeeping ---
     uint16_t session_id = 0;
 
     // --- shared creative state (synced) ---
-    bool  grid[TRACKS][STEPS] = {};
-    bool  track_active[TRACKS] = {
-        true, true, true, true,
-        true, true, true, true,
-        true, true, true, true,
+    // Drum tracks indexed by TRACK_DEFS[t].drum_kind (0..7). Melodic tracks
+    // indexed by TRACK_DEFS[t].melodic_idx (0..3).
+    bool              drum_grid[DRUM_KINDS][STEPS] = {};
+    std::vector<Note> melodic_notes[MELODIC_VOICES];
+    // Per-track default root pitch in MIDI. Drum tracks use it as the
+    // synthesized voice's base pitch; melodic tracks use it for grid-mode
+    // space-entry and live-pad trigger.
+    uint8_t track_root_midi[TRACKS] = {
+        36, 38, 40, 42, 44, 46, 48, 50,   // drums
+        60, 48, 60, 36,                   // lead, bass, chord, drone
     };
-    float track_root_hz[TRACKS] = {};
     int   bpm = 120;
+
+    // --- per-peer mix (not synced) ---
+    // track_muted: if true, this peer skips sequencer triggers for the track.
+    // track_solo : if any track in the session is soloed, all non-solo tracks
+    // are silenced for this peer. Mute wins over solo (a muted+soloed track
+    // is silent).
+    bool  track_muted[TRACKS] = {};
+    bool  track_solo[TRACKS]  = {};
 
     // --- per-peer runtime (not synced) ---
     int               loop_len = STEPS;
@@ -123,13 +211,21 @@ public:
     std::atomic<bool> trig[TRACKS] = {};
 
     // --- networking bookkeeping ---
-    // One bitmask per track, one bit per step. UI sets bits via fetch_or
-    // when it edits a cell; the flush thread claims them via exchange(0)
-    // every NET_FLUSH_MS to construct outbound MSG_EDIT packets. On host,
-    // recv threads also OR in bits when applying inbound peer edits, so
-    // relays go out via the same flush path. Accumulates harmlessly in
-    // solo mode.
+    // Drum-only: one bitmask per drum track, one bit per step. UI sets bits
+    // via fetch_or when it edits a drum cell; flush thread claims them via
+    // exchange(0) every NET_FLUSH_MS to construct outbound MSG_EDIT packets.
+    // Melodic tracks use whole-list resends (see melodic_dirty).
     std::atomic<uint16_t> dirty[TRACKS] = {};
+
+    // Melodic-track whole-list dirty flag. Set by the UI after any edit to
+    // melodic_notes[i] is durable (note placed, released, deleted). The
+    // flush thread resends the entire note list as MSG_MELODIC_TRACK.
+    std::atomic<bool> melodic_dirty[MELODIC_VOICES] = {};
+    std::atomic<bool> melodic_in_flight[MELODIC_VOICES] = {};
+
+    // track_root_midi sync: bit per track, same Rule Y semantics.
+    std::atomic<uint16_t> track_root_dirty{0};
+    std::atomic<uint16_t> track_root_in_flight{0};
 
     // True iff this peer is a connected joiner. Set by Network::join() after
     // a successful handshake. Cleared by the joiner recv thread on EOF /
@@ -143,21 +239,33 @@ public:
     // if not set, normal apply.
     std::atomic<uint16_t> in_flight[TRACKS] = {};
 
-    // Scalar sync (bpm + track_active). Same Rule Y semantics as cells.
+    // Scalar sync (bpm). Same Rule Y semantics as cells.
     std::atomic<bool>     bpm_dirty{false};
     std::atomic<bool>     bpm_in_flight{false};
-    std::atomic<uint16_t> track_active_dirty{0};
-    std::atomic<uint16_t> track_active_in_flight{0};
 
     // Joiner-only label: lets the UI render "solo (host left)" once
     // network_alive falls. Set true in Network::join().
     bool is_joiner = false;
 };
 
+// UI/timing → audio onset trigger pool. Each melodic track has TRIG_POOL_SIZE
+// atomic slots; producers CAS a freq into a free slot (-1.f). Audio callback
+// drains the pool each block and claims a polyphony voice per trigger.
+//
+// Multi-producer safe (timing thread + UI key paths can both fire on the
+// same audio frame, e.g. a chord onset). Drops the trigger silently if the
+// pool is full — only happens if more than TRIG_POOL_SIZE simultaneous
+// onsets land between audio callbacks (~10ms), which is well past chord
+// territory.
+inline constexpr int TRIG_POOL_SIZE = 8;
+extern std::atomic<float> synth_trig_pool[MELODIC_VOICES][TRIG_POOL_SIZE];
+
+void enqueue_synth_trig(int melodic_idx, float freq_hz);
+
 // Solo / host default constructor wrapper. Builds a SessionState with the
 // default drum pattern stamped onto kick / snare / chat tracks.
 std::shared_ptr<SessionState> make_solo_session_state();
 
-// The sequencer clock: walks SessionState::grid step by step at the
-// session's bpm, writing to SessionState::trig for the audio callback.
+// The sequencer clock: walks the drum_grid / melodic_notes step by step at
+// the session's bpm, writing drum trigs and melodic synth_trig_freqs.
 void timing_thread(SessionState& s);
