@@ -31,6 +31,8 @@ if(APPLE)
         "-framework AudioToolbox"
         "-framework CoreFoundation"
     )
+elseif(WIN32)
+    target_link_libraries(bitjams PRIVATE ole32 winmm)
 elseif(UNIX)
     target_link_libraries(bitjams PRIVATE pthread dl m)
 endif()
