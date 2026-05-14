@@ -17,6 +17,12 @@ inline constexpr int DRUM_KINDS     = 8;
 
 enum class TrackType { DRUM, MELODIC };
 
+// Recording state. OFF = passive playback. COUNTDOWN = 4-beat count-in
+// before recording begins; play_step is held at 0. RECORDING = live capture
+// is active; input keypaths additionally write into the underlying track
+// data at the current play_step.
+enum class RecordState { OFF, COUNTDOWN, RECORDING };
+
 // 64-note cap per melodic track. Wire-format note_count is uint8_t but a
 // 64-cap keeps packets small and matches the UI's "1-bar" mental model.
 inline constexpr int MAX_NOTES_PER_MELODIC = 64;
@@ -207,6 +213,19 @@ public:
     std::atomic<bool> running{true};
     std::atomic<bool> playing{true};
 
+    // Recording state machine. Per-peer; never synced.
+    std::atomic<RecordState> rec_state{RecordState::OFF};
+    // Displayed count-in beat number (1..4) during COUNTDOWN; 0 otherwise.
+    std::atomic<int>         countdown_beat{0};
+    // Position within the current count-in beat (0..3). Advanced by the
+    // timing thread; rolls over to advance countdown_beat.
+    std::atomic<int>         countdown_subtick{0};
+
+    // Metronome. Per-peer; never synced.
+    std::atomic<bool> metronome_enabled{false};
+    std::atomic<bool> metronome_trig{false};
+    std::atomic<int>  metronome_pitch_hz{800};
+
     // sequencer -> audio: one-shot triggers
     std::atomic<bool> trig[TRACKS] = {};
 
@@ -269,3 +288,38 @@ std::shared_ptr<SessionState> make_solo_session_state();
 // The sequencer clock: walks the drum_grid / melodic_notes step by step at
 // the session's bpm, writing drum trigs and melodic synth_trig_freqs.
 void timing_thread(SessionState& s);
+
+// Overdub capture path. Called from every input source that produces audible
+// output (MPC pad, keyboard-mode pitch key, piano-roll pitch key). No-op if
+// rec_state != RECORDING. Writes at the current play_step:
+//   - drum track    : sets drum_grid[drum_kind][play_step] + dirty bit
+//   - melodic track : appends Note{play_step, 1, pitch_midi, 127} to the
+//                     track's note list (dedup'd by (start_step,pitch)),
+//                     bounded by the 64-note cap
+// `pitch_midi` is unused for drum tracks.
+void record_input(SessionState& s, int track, uint8_t pitch_midi);
+
+// Drive the record state machine on a `q` keypress.
+//   OFF (playing)  → RECORDING : no transport changes
+//   OFF (stopped)  → COUNTDOWN : playing←true, play_step←0, countdown_beat←1
+//   COUNTDOWN      → OFF       : cancels (playing←false, play_step stays 0)
+//   RECORDING      → OFF       : stops capture, transport keeps playing
+void toggle_record(SessionState& s);
+
+// Drive the transport-stop key `p` while COUNTDOWN or RECORDING is active.
+// Hard halt: rec_state←OFF, playing←false, play_step←0. No-op if rec_state
+// is already OFF (the caller handles plain transport-stop separately).
+void hard_halt_transport(SessionState& s);
+
+// One step-tick of countdown progress. No-op if rec_state != COUNTDOWN.
+// Behavior: on each beat boundary (every 4 ticks) sets metronome_trig and
+// metronome_pitch_hz (1000 Hz on beat 1, 800 Hz on beats 2..4). After the
+// 16th call (i.e. the 4th completed beat) flips rec_state to RECORDING with
+// play_step still at 0 so the loop's step 0 fires on the next tick.
+void countdown_tick(SessionState& s);
+
+// One step-tick of normal metronome firing. Sets metronome_trig and
+// metronome_pitch_hz on beat boundaries (every 4 steps) iff
+// metronome_enabled is true. `step` is the play_step about to fire. Step 0
+// gets the accented (1000 Hz) blip; other beat boundaries get 800 Hz.
+void metronome_step_tick(SessionState& s, int step);

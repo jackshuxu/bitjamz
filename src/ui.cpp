@@ -262,20 +262,38 @@ static Element render_grid_view(SessionState& s) {
     // header
     {
         char head_buf[80];
-        const char* mode_label =
-            (nav_state == NavState::PARAM_PAGE) ? "  [param]" :
-            (nav_state == NavState::KEYBOARD)   ? (note_mode ? "  [kbd]" : "  [kbd jam]") :
-            (nav_state == NavState::PIANO_ROLL) ? "  [piano]" :
-            (seq_mode)                          ? "  [seq]"   :
-                                                  "  [step]";
         std::snprintf(head_buf, sizeof(head_buf), "  bpm: %d  steps: %d  %s",
                       s.bpm, s.loop_len, is_playing ? "▶" : "■");
 
         Elements header = {
             text("bitjams") | bold | color(COL_PURPLE),
             text(head_buf)         | color(COL_PURPLE),
-            text(mode_label)       | color(COL_DIM),
         };
+
+        // Metronome glyph next to BPM (bright when armed, dim when off).
+        bool metro_on = s.metronome_enabled.load();
+        Element metro_glyph = metro_on
+            ? (text(" ♩") | color(COL_BRIGHT) | bold)
+            : (text(" ♩") | color(COL_DIM));
+        header.push_back(metro_glyph);
+
+        // Mode label area: REC > COUNTDOWN > existing nav label.
+        auto rec = s.rec_state.load();
+        if (rec == RecordState::RECORDING) {
+            header.push_back(text("  ● REC") | color(Color::Red) | bold);
+        } else if (rec == RecordState::COUNTDOWN) {
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), "  %d", s.countdown_beat.load());
+            header.push_back(text(buf) | color(Color::Red) | bold);
+        } else {
+            const char* mode_label =
+                (nav_state == NavState::PARAM_PAGE) ? "  [param]" :
+                (nav_state == NavState::KEYBOARD)   ? (note_mode ? "  [kbd]" : "  [kbd jam]") :
+                (nav_state == NavState::PIANO_ROLL) ? "  [piano]" :
+                (seq_mode)                          ? "  [seq]"   :
+                                                      "  [step]";
+            header.push_back(text(mode_label) | color(COL_DIM));
+        }
         if (s.session_id != 0) {
             std::string room_label = "  ROOM " + std::to_string(s.session_id);
             if (s.is_joiner && !s.network_alive.load()) {
@@ -389,15 +407,17 @@ static Element render_grid_view(SessionState& s) {
         hint = note_mode
             ? "  pitch:awsedftgyhujkol  ←→:resize  spc:release  z/x:oct  n:note(rec)  "
               "bksp:del  S:solo  M:mute  C:copy  V:paste  D:clr  AD:clr all  1-9:fill  "
-              "tab:param  enter:piano  esc:back"
+              "q:rec  \\:metro  tab:param  enter:piano  esc:back  Q:quit"
             : "  pitch:awsedftgyhujkol (jam — synth only, not recorded)  z/x:oct  "
-              "n:note(jam)  tab:param  enter:piano  esc:back";
+              "n:note(jam)  q:rec  \\:metro  tab:param  enter:piano  esc:back  Q:quit";
     } else if (seq_mode) {
         hint = "  1-8:toggle step  ←→:window  ↑↓:track  rtyuvbnmfghj:trigger+focus  "
-               "s:exit step  bksp:del  S:solo  M:mute  C:copy  V:paste  D:clr track  AD:clr all  p:play  q:quit";
+               "s:exit step  bksp:del  S:solo  M:mute  C:copy  V:paste  D:clr track  AD:clr all  "
+               "q:rec  \\:metro  p:play  Q:quit";
     } else {
         hint = "  spc:toggle/note  1-9:fill  ←→↑↓:move  bksp:del  rtyuvbnmfghj:trigger+focus  "
-               "tab:param  enter:piano  k:kbd  s:seq  S:solo  M:mute  C:copy  V:paste  D:clr track  AD:clr all  p:play  q:quit";
+               "tab:param  enter:piano  k:kbd  s:seq  S:solo  M:mute  C:copy  V:paste  D:clr track  AD:clr all  "
+               "q:rec  \\:metro  p:play  Q:quit";
     }
     lines.push_back(text(hint) | color(COL_DIM));
 
@@ -508,7 +528,7 @@ static Element render_piano_roll(SessionState& s) {
         char buf[128];
         std::snprintf(buf, sizeof(buf),
                       "  ←→ step  ↑↓ pitch  space:%s  c/v:copy/paste  "
-                      "z/x:oct  n:note(%s)  esc:back",
+                      "z/x:oct  n:note(%s)  q:rec  \\:metro  esc:back  Q:quit",
                       note_mode ? "add/release" : "audition",
                       note_mode ? "rec" : "jam");
         lines.push_back(text(buf) | color(COL_DIM));
@@ -560,7 +580,8 @@ static Element render_drum_param_page(SessionState& s, int t) {
     lines.push_back(param_row("root midi", root_buf));
 
     lines.push_back(text(""));
-    lines.push_back(text("  z/x:root ▼▲   tab/esc:back  p:play  q:quit") | color(COL_DIM));
+    lines.push_back(text("  z/x:root ▼▲   tab/esc:back  q:rec  \\:metro  p:play  Q:quit")
+                    | color(COL_DIM));
     return vbox(std::move(lines));
 }
 
@@ -601,7 +622,7 @@ static Element render_melodic_param_page(SessionState& s, int t) {
     }
 
     lines.push_back(text(""));
-    lines.push_back(text("  ←→:osc  z/x:root ▼▲  tab/esc:back  p:play  q:quit")
+    lines.push_back(text("  ←→:osc  z/x:root ▼▲  tab/esc:back  q:rec  \\:metro  p:play  Q:quit")
                     | color(COL_DIM));
     return vbox(std::move(lines));
 }
@@ -830,6 +851,15 @@ static bool dispatch_keyboard(SessionState& s, Event e) {
 
         if (TRACK_DEFS[cursor_track].type != TrackType::MELODIC) return true;
 
+        if (s.rec_state.load() == RecordState::RECORDING) {
+            // REC overrides note_mode. Capture at play_step; never start a
+            // hold (cursor-edit + arrow-key resize stay out of the way).
+            enqueue_synth_trig(TRACK_DEFS[cursor_track].melodic_idx,
+                               midi_to_hz(static_cast<uint8_t>(midi)));
+            record_input(s, cursor_track, static_cast<uint8_t>(midi));
+            return true;
+        }
+
         if (!note_mode) {
             // Jam mode: play the synth, never touch the sequencer.
             enqueue_synth_trig(TRACK_DEFS[cursor_track].melodic_idx,
@@ -1024,6 +1054,14 @@ static bool dispatch_piano_roll(SessionState& s, Event e) {
             pr_release_active();
             int midi = 60 + semi;
             if (midi < 0 || midi > 127) return true;
+            if (s.rec_state.load() == RecordState::RECORDING) {
+                // REC overrides note_mode. Capture at play_step; the cursor
+                // stays put so the user keeps a stable reference point.
+                enqueue_synth_trig(TRACK_DEFS[piano_track].melodic_idx,
+                                   midi_to_hz(static_cast<uint8_t>(midi)));
+                record_input(s, piano_track, static_cast<uint8_t>(midi));
+                return true;
+            }
             piano_cursor_midi = midi;
             pr_clamp_view();
             int new_idx = pr_place_note_at_cursor(s, 1);
@@ -1248,6 +1286,15 @@ static bool dispatch_grid(SessionState& s, Event e) {
         if (t >= 0) {
             trigger_track_live(s, t);
             cursor_track = t;
+            if (s.rec_state.load() == RecordState::RECORDING) {
+                // Drum pads capture as bool-grid steps; melodic pads capture
+                // 1-step root-pitch notes (root for skeleton, melodies get
+                // refined later in piano roll / keyboard mode).
+                const TrackDef& td = TRACK_DEFS[t];
+                uint8_t pitch = (td.type == TrackType::MELODIC)
+                              ? s.track_root_midi[t] : 0;
+                record_input(s, t, pitch);
+            }
             return true;
         }
     }
@@ -1329,12 +1376,31 @@ Component build_session_ui(ScreenInteractive& screen, SessionState& state) {
 
     auto with_events = CatchEvent(root, [&screen, &state](Event e) -> bool {
         // Global keys first.
-        if (e == Event::Character('q') || e == Event::Character('Q')) {
+        // Quit moved to shift+Q. Lowercase q drives record (PRD).
+        if (e == Event::Character('Q')) {
             state.running.store(false);
             screen.Exit();
             return true;
         }
+        if (e == Event::Character('q')) {
+            // While recording, releasing any keyboard-mode active note so we
+            // don't keep growing it via the still-tracked hold.
+            kbd_release_active();
+            pr_release_active();
+            toggle_record(state);
+            return true;
+        }
+        if (e == Event::Character('\\')) {
+            state.metronome_enabled.store(!state.metronome_enabled.load());
+            return true;
+        }
         if (e == Event::Character('p') || e == Event::Character('P')) {
+            // Hard halt if COUNTDOWN or RECORDING is active (PRD: p is never
+            // ambiguous during those states).
+            if (state.rec_state.load() != RecordState::OFF) {
+                hard_halt_transport(state);
+                return true;
+            }
             state.playing.store(!state.playing.load());
             if (!state.playing.load()) state.play_step.store(0);
             return true;

@@ -169,6 +169,30 @@ static float render_drum_voice(int kind) {
     return sample * voice.level_env;
 }
 
+// Dedicated metronome voice. Outside the 12-track roster so it can't be
+// muted/soloed and never competes with user-programmed drums.
+struct MetronomeVoice {
+    bool  active;
+    float phase;
+    float elapsed_s;
+    float pitch_hz;
+};
+static MetronomeVoice metronome_voice = {};
+static constexpr float METRONOME_DECAY_S = 0.030f;  // PRD: ~30 ms
+
+static void render_metronome_into(float& mix_l, float& mix_r) {
+    if (!metronome_voice.active) return;
+    const float dt = 1.f / SAMPLE_RATE;
+    float env = std::exp(-metronome_voice.elapsed_s / METRONOME_DECAY_S);
+    if (env < 0.001f) { metronome_voice.active = false; return; }
+    metronome_voice.phase += metronome_voice.pitch_hz * dt;
+    if (metronome_voice.phase > 1.f) metronome_voice.phase -= 1.f;
+    float s = std::sin(metronome_voice.phase * 2.f * (float)M_PI) * env * 0.35f;
+    metronome_voice.elapsed_s += dt;
+    mix_l += s;
+    mix_r += s;
+}
+
 struct SynthVoice {
     bool  active;
     float cycle_phase;
@@ -263,6 +287,14 @@ void audio_callback(ma_device* dev, void* out, const void* /*in*/, ma_uint32 fra
         }
     }
 
+    // Metronome onset: one-shot blip at the latched pitch.
+    if (state->metronome_trig.exchange(false)) {
+        metronome_voice.active    = true;
+        metronome_voice.phase     = 0.f;
+        metronome_voice.elapsed_s = 0.f;
+        metronome_voice.pitch_hz  = (float)state->metronome_pitch_hz.load();
+    }
+
     // Drain every pool slot. Each surviving freq claims its own voice, so an
     // N-note chord all fired in the same audio block plays as N voices.
     for (int m = 0; m < MELODIC_VOICES; ++m) {
@@ -294,6 +326,10 @@ void audio_callback(ma_device* dev, void* out, const void* /*in*/, ma_uint32 fra
             mix_l += v * std::cos(a);
             mix_r += v * std::sin(a);
         }
+
+        // Metronome: centred sine blip, summed AFTER the per-track bit-crush
+        // so the click stays clean.
+        render_metronome_into(mix_l, mix_r);
 
         float l = (float)(int8_t)(mix_l * 127.f) / 127.f * 0.25f;
         float r = (float)(int8_t)(mix_r * 127.f) / 127.f * 0.25f;

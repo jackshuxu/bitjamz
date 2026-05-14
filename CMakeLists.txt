@@ -54,3 +54,16 @@ endif()
 target_compile_options(test_net PRIVATE -O2)
 
 add_test(NAME net_tests COMMAND test_net)
+
+add_executable(test_record
+    tests/test_record.cpp
+    src/session.cpp
+)
+target_include_directories(test_record PRIVATE include src)
+if(APPLE)
+elseif(UNIX)
+    target_link_libraries(test_record PRIVATE pthread)
+endif()
+target_compile_options(test_record PRIVATE -O2)
+
+add_test(NAME record_tests COMMAND test_record)

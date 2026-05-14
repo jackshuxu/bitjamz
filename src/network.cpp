@@ -292,18 +292,24 @@ bool recv_and_apply_msg_melodic_track(int sock, SessionState& s, bool is_joiner)
     if (TRACK_DEFS[track_id].type != TrackType::MELODIC) return true;
     int idx = TRACK_DEFS[track_id].melodic_idx;
 
+    // Network-applied move overwrites the vector wholesale; restore the
+    // reserve() guarantee so the timing thread's concurrent iteration of
+    // melodic_notes can't race a future reallocating push_back.
     if (is_joiner) {
         // Rule Y: drop inbound if we have an unsent local edit (dirty);
         // accept if it's our own echo (in_flight); otherwise apply.
         if (s.melodic_dirty[idx].load()) return true;
         if (s.melodic_in_flight[idx].load()) {
             s.melodic_notes[idx] = std::move(incoming);
+            s.melodic_notes[idx].reserve(MAX_NOTES_PER_MELODIC);
             s.melodic_in_flight[idx].store(false);
             return true;
         }
         s.melodic_notes[idx] = std::move(incoming);
+        s.melodic_notes[idx].reserve(MAX_NOTES_PER_MELODIC);
     } else {
         s.melodic_notes[idx] = std::move(incoming);
+        s.melodic_notes[idx].reserve(MAX_NOTES_PER_MELODIC);
         s.melodic_dirty[idx].store(true);  // relay to other peers
     }
     return true;
