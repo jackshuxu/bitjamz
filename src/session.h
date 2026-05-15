@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 // Anything used by more than one module (audio, ui, net, main) lives here.
@@ -188,8 +189,9 @@ public:
     // --- shared creative state (synced) ---
     // Drum tracks indexed by TRACK_DEFS[t].drum_kind (0..7). Melodic tracks
     // indexed by TRACK_DEFS[t].melodic_idx (0..3).
-    bool              drum_grid[DRUM_KINDS][STEPS] = {};
+    std::atomic<bool> drum_grid[DRUM_KINDS][STEPS] = {};
     std::vector<Note> melodic_notes[MELODIC_VOICES];
+    mutable std::mutex melodic_mutex;
     // Per-track default root pitch in MIDI. Drum tracks use it as the
     // synthesized voice's base pitch; melodic tracks use it for grid-mode
     // space-entry and live-pad trigger.

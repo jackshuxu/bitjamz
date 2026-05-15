@@ -4,6 +4,10 @@ project(bitjams CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+if(MSVC)
+    add_compile_definitions(_USE_MATH_DEFINES NOMINMAX)
+endif()
+
 include(FetchContent)
 FetchContent_Declare(ftxui
     GIT_REPOSITORY https://github.com/ArthurSonzogni/FTXUI.git
@@ -32,7 +36,7 @@ if(APPLE)
         "-framework CoreFoundation"
     )
 elseif(WIN32)
-    target_link_libraries(bitjams PRIVATE ole32 winmm)
+    target_link_libraries(bitjams PRIVATE ole32 winmm ws2_32)
 elseif(UNIX)
     target_link_libraries(bitjams PRIVATE pthread dl m)
 endif()
@@ -54,10 +58,16 @@ add_executable(test_net
 target_include_directories(test_net PRIVATE include src)
 if(APPLE)
     # No platform libs required for loopback TCP on macOS.
+elseif(WIN32)
+    target_link_libraries(test_net PRIVATE ws2_32)
 elseif(UNIX)
     target_link_libraries(test_net PRIVATE pthread)
 endif()
-target_compile_options(test_net PRIVATE -Wall -Wextra -O2)
+if(MSVC)
+    target_compile_options(test_net PRIVATE /W3 /O2)
+else()
+    target_compile_options(test_net PRIVATE -Wall -Wextra -O2)
+endif()
 add_test(NAME net_tests COMMAND test_net)
 
 add_executable(test_record

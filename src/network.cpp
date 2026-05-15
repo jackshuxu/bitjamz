@@ -1,10 +1,7 @@
 #include "network.h"
+#include "net_compat.h"
 #include "session.h"
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -19,7 +16,7 @@ namespace {
 std::atomic<bool>          g_stop{false};
 
 // --- host-side state ---
-int                        g_listener_fd = -1;
+std::atomic<int>           g_listener_fd{-1};
 std::thread                g_listener_thread;
 std::thread                g_host_flush_thread;
 
@@ -40,7 +37,7 @@ std::thread                g_joiner_flush_thread;
 bool send_all(int sock, const void* buf, size_t len) {
     const auto* p = static_cast<const uint8_t*>(buf);
     while (len > 0) {
-        ssize_t n = ::send(sock, p, len, 0);
+        int n = ::send(sock, reinterpret_cast<const char*>(p), static_cast<int>(len), 0);
         if (n <= 0) return false;
         p   += n;
         len -= static_cast<size_t>(n);
@@ -51,7 +48,7 @@ bool send_all(int sock, const void* buf, size_t len) {
 bool recv_all(int sock, void* buf, size_t len) {
     auto* p = static_cast<uint8_t*>(buf);
     while (len > 0) {
-        ssize_t n = ::recv(sock, p, len, 0);
+        int n = ::recv(sock, reinterpret_cast<char*>(p), static_cast<int>(len), 0);
         if (n <= 0) return false;
         p   += n;
         len -= static_cast<size_t>(n);
@@ -173,7 +170,7 @@ size_t build_msg_edit(SessionState& s, uint8_t* buf, size_t buf_cap) {
         uint16_t bits = claimed;
         int dk = TRACK_DEFS[t].drum_kind;
         while (bits) {
-            int step = __builtin_ctz(bits);
+            int step = bitjams_ctz(bits);
             *p++ = static_cast<uint8_t>(t);
             *p++ = static_cast<uint8_t>(step);
             *p++ = s.drum_grid[dk][step] ? 1 : 0;
@@ -295,6 +292,7 @@ bool recv_and_apply_msg_melodic_track(int sock, SessionState& s, bool is_joiner)
     // Network-applied move overwrites the vector wholesale; restore the
     // reserve() guarantee so the timing thread's concurrent iteration of
     // melodic_notes can't race a future reallocating push_back.
+    std::lock_guard<std::mutex> lk(s.melodic_mutex);
     if (is_joiner) {
         // Rule Y: drop inbound if we have an unsent local edit (dirty);
         // accept if it's our own echo (in_flight); otherwise apply.
@@ -350,6 +348,7 @@ size_t build_pending_aux(SessionState& s, uint8_t* buf, size_t buf_cap) {
         bool expected = true;
         if (s.melodic_dirty[m].compare_exchange_strong(expected, false)) {
             if (joiner_path) s.melodic_in_flight[m].store(true);
+            std::lock_guard<std::mutex> lk(s.melodic_mutex);
             return build_msg_melodic_track(m, s.melodic_notes[m], buf, buf_cap);
         }
     }
@@ -358,7 +357,7 @@ size_t build_pending_aux(SessionState& s, uint8_t* buf, size_t buf_cap) {
     if (roots) {
         if (joiner_path) s.track_root_in_flight.fetch_or(roots);
         // Send one per call; re-dirty the rest.
-        int t = __builtin_ctz(roots);
+        int t = bitjams_ctz(roots);
         uint16_t rest = roots & ~(static_cast<uint16_t>(1) << t);
         if (rest) s.track_root_dirty.fetch_or(rest);
         if (buf_cap < 3) return 0;
@@ -416,22 +415,22 @@ void flush_one_round(int sock, SessionState& state, std::atomic<bool>& alive) {
 void per_peer_handler(int sock, std::shared_ptr<SessionState> state, std::shared_ptr<Peer> peer) {
     uint8_t  type = 0;
     uint16_t room_n = 0;
-    if (!recv_all(sock, &type, 1))                 { peer->alive.store(false); ::close(sock); return; }
-    if (type != MSG_HANDSHAKE)                     { peer->alive.store(false); ::close(sock); return; }
-    if (!recv_all(sock, &room_n, sizeof(room_n)))  { peer->alive.store(false); ::close(sock); return; }
+    if (!recv_all(sock, &type, 1))                 { peer->alive.store(false); close_socket(sock); return; }
+    if (type != MSG_HANDSHAKE)                     { peer->alive.store(false); close_socket(sock); return; }
+    if (!recv_all(sock, &room_n, sizeof(room_n)))  { peer->alive.store(false); close_socket(sock); return; }
     uint16_t room = ntohs(room_n);
 
     if (room != state->session_id) {
         uint8_t fail = MSG_HANDSHAKE_FAIL;
         send_all(sock, &fail, 1);
         peer->alive.store(false);
-        ::close(sock);
+        close_socket(sock);
         return;
     }
 
     if (!send_msg_state(sock, *state)) {
         peer->alive.store(false);
-        ::close(sock);
+        close_socket(sock);
         return;
     }
 
@@ -449,17 +448,19 @@ void per_peer_handler(int sock, std::shared_ptr<SessionState> state, std::shared
 
     peer->alive.store(false);
     ::shutdown(sock, SHUT_RDWR);
-    ::close(sock);
+    close_socket(sock);
 }
 
 void listener_loop(std::shared_ptr<SessionState> state) {
     while (!g_stop.load()) {
         sockaddr_in peer_addr{};
         socklen_t   peer_len = sizeof(peer_addr);
-        int sock = ::accept(g_listener_fd, reinterpret_cast<sockaddr*>(&peer_addr), &peer_len);
+        int sock = accept_socket(g_listener_fd.load(), reinterpret_cast<sockaddr*>(&peer_addr), &peer_len);
         if (sock < 0) {
             if (g_stop.load()) break;
+#ifndef _WIN32
             if (errno == EINTR) continue;
+#endif
             break;
         }
         auto peer = std::make_shared<Peer>();
@@ -532,24 +533,24 @@ void joiner_flush_loop(int sock, std::shared_ptr<SessionState> state) {
 void Network::host(std::shared_ptr<SessionState> state) {
     g_stop.store(false);
 
-    g_listener_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    g_listener_fd.store(create_socket());
     int opt = 1;
-    ::setsockopt(g_listener_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    ::setsockopt(g_listener_fd.load(), SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
 
     sockaddr_in addr{};
     addr.sin_family      = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port        = htons(NET_PORT);
-    if (::bind(g_listener_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+    if (::bind(g_listener_fd.load(), reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
         ::perror("bind");
-        ::close(g_listener_fd);
-        g_listener_fd = -1;
+        close_socket(g_listener_fd.load());
+        g_listener_fd.store(-1);
         return;
     }
-    if (::listen(g_listener_fd, 5) < 0) {
+    if (::listen(g_listener_fd.load(), 5) < 0) {
         ::perror("listen");
-        ::close(g_listener_fd);
-        g_listener_fd = -1;
+        close_socket(g_listener_fd.load());
+        g_listener_fd.store(-1);
         return;
     }
 
@@ -558,18 +559,18 @@ void Network::host(std::shared_ptr<SessionState> state) {
 }
 
 std::shared_ptr<SessionState> Network::join(const char* ip, uint16_t room) {
-    int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+    int sock = create_socket();
     if (sock < 0) return nullptr;
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port   = htons(NET_PORT);
     if (::inet_pton(AF_INET, ip, &addr.sin_addr) != 1) {
-        ::close(sock);
+        close_socket(sock);
         return nullptr;
     }
     if (::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(sock);
+        close_socket(sock);
         return nullptr;
     }
 
@@ -577,17 +578,17 @@ std::shared_ptr<SessionState> Network::join(const char* ip, uint16_t room) {
     uint16_t rn = htons(room);
     if (!send_all(sock, &hs, 1) ||
         !send_all(sock, &rn, sizeof(rn))) {
-        ::close(sock);
+        close_socket(sock);
         return nullptr;
     }
 
     uint8_t resp = 0;
-    if (!recv_all(sock, &resp, 1))  { ::close(sock); return nullptr; }
-    if (resp == MSG_HANDSHAKE_FAIL) { ::close(sock); return nullptr; }
-    if (resp != MSG_STATE)          { ::close(sock); return nullptr; }
+    if (!recv_all(sock, &resp, 1))  { close_socket(sock); return nullptr; }
+    if (resp == MSG_HANDSHAKE_FAIL) { close_socket(sock); return nullptr; }
+    if (resp != MSG_STATE)          { close_socket(sock); return nullptr; }
 
     auto s = std::make_shared<SessionState>();
-    if (!recv_and_apply_msg_state(sock, *s)) { ::close(sock); return nullptr; }
+    if (!recv_and_apply_msg_state(sock, *s)) { close_socket(sock); return nullptr; }
     s->is_joiner = true;
     s->network_alive.store(true);
 
@@ -600,10 +601,10 @@ std::shared_ptr<SessionState> Network::join(const char* ip, uint16_t room) {
 void Network::stop() {
     g_stop.store(true);
 
-    if (g_listener_fd >= 0) {
-        ::shutdown(g_listener_fd, SHUT_RDWR);
-        ::close(g_listener_fd);
-        g_listener_fd = -1;
+    if (g_listener_fd.load() >= 0) {
+        ::shutdown(g_listener_fd.load(), SHUT_RDWR);
+        close_socket(g_listener_fd.load());
+        g_listener_fd.store(-1);
     }
     if (g_listener_thread.joinable())   g_listener_thread.join();
     if (g_host_flush_thread.joinable()) g_host_flush_thread.join();
@@ -633,7 +634,7 @@ void Network::stop() {
     if (g_joiner_recv_thread.joinable())  g_joiner_recv_thread.join();
     if (g_joiner_flush_thread.joinable()) g_joiner_flush_thread.join();
     if (g_joiner_sock >= 0) {
-        ::close(g_joiner_sock);
+        close_socket(g_joiner_sock);
         g_joiner_sock = -1;
     }
 

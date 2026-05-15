@@ -5,10 +5,7 @@
 #include <memory>
 #include <thread>
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include "net_compat.h"
 
 #include "session.h"
 #include "network.h"
@@ -26,6 +23,35 @@ namespace bitjams_net_internal {
     size_t build_pending_aux(SessionState& s, uint8_t* buf, size_t buf_cap);
 }
 
+// Creates a connected socket pair. On POSIX uses AF_UNIX socketpair; on
+// Windows uses a TCP loopback pair (AF_UNIX socketpair is unavailable).
+static bool make_socket_pair(int sv[2]) {
+#ifndef _WIN32
+    return ::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0;
+#else
+    int listener = create_socket();
+    if (listener < 0) return false;
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port        = 0;
+    if (::bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        close_socket(listener); return false;
+    }
+    if (::listen(listener, 1) < 0) { close_socket(listener); return false; }
+    socklen_t len = sizeof(addr);
+    ::getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &len);
+    sv[0] = create_socket();
+    if (sv[0] < 0) { close_socket(listener); return false; }
+    if (::connect(sv[0], reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        close_socket(sv[0]); close_socket(listener); return false;
+    }
+    sv[1] = accept_socket(listener, nullptr, nullptr);
+    close_socket(listener);
+    return sv[1] >= 0;
+#endif
+}
+
 // Hand-rolled secondary joiner. First joiner uses Network::join; this one
 // connects over a raw socket and runs its own recv + flush threads. Lets a
 // single-process test exercise multi-joiner scenarios.
@@ -37,30 +63,32 @@ public:
     std::thread                   flush_th;
 
     static std::unique_ptr<TestJoiner> connect(uint16_t room) {
-        int s = ::socket(AF_INET, SOCK_STREAM, 0);
+        int s = create_socket();
         if (s < 0) return nullptr;
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_port   = htons(NET_PORT);
         ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
         if (::connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-            ::close(s); return nullptr;
+            close_socket(s); return nullptr;
         }
         uint8_t  hs = MSG_HANDSHAKE;
         uint16_t rn = htons(room);
-        if (::send(s, &hs, 1, 0) != 1)             { ::close(s); return nullptr; }
-        if (::send(s, &rn, sizeof(rn), 0) != (ssize_t)sizeof(rn)) {
-            ::close(s); return nullptr;
+        if (::send(s, reinterpret_cast<const char*>(&hs), 1, 0) != 1) {
+            close_socket(s); return nullptr;
+        }
+        if (::send(s, reinterpret_cast<const char*>(&rn), sizeof(rn), 0) != static_cast<int>(sizeof(rn))) {
+            close_socket(s); return nullptr;
         }
         uint8_t resp = 0;
-        if (::recv(s, &resp, 1, MSG_WAITALL) != 1) { ::close(s); return nullptr; }
-        if (resp != MSG_STATE)                      { ::close(s); return nullptr; }
+        if (::recv(s, reinterpret_cast<char*>(&resp), 1, MSG_WAITALL) != 1) { close_socket(s); return nullptr; }
+        if (resp != MSG_STATE)                      { close_socket(s); return nullptr; }
 
         auto j = std::unique_ptr<TestJoiner>(new TestJoiner());
         j->sock  = s;
         j->state = std::make_shared<SessionState>();
         if (!bitjams_net_internal::recv_and_apply_msg_state(s, *j->state)) {
-            ::close(s); return nullptr;
+            close_socket(s); return nullptr;
         }
         j->state->is_joiner = true;
         j->state->network_alive.store(true);
@@ -87,7 +115,7 @@ public:
         if (recv_th.joinable())  recv_th.join();
         if (flush_th.joinable()) flush_th.join();
         if (sock >= 0) {
-            ::close(sock);
+            close_socket(sock);
             sock = -1;
         }
     }
@@ -98,7 +126,7 @@ private:
     void recv_loop() {
         while (state->network_alive.load()) {
             uint8_t tag = 0;
-            ssize_t n = ::recv(sock, &tag, 1, MSG_WAITALL);
+            int n = ::recv(sock, reinterpret_cast<char*>(&tag), 1, MSG_WAITALL);
             if (n != 1) break;
             if (tag != MSG_EDIT) break;
             if (!bitjams_net_internal::recv_and_apply_msg_edit(sock, *state, /*is_joiner=*/true)) break;
@@ -109,7 +137,7 @@ private:
     void send_buf(const uint8_t* buf, size_t total) {
         size_t sent = 0;
         while (sent < total) {
-            ssize_t n = ::send(sock, buf + sent, total - sent, 0);
+            int n = ::send(sock, reinterpret_cast<const char*>(buf + sent), static_cast<int>(total - sent), 0);
             if (n <= 0) { state->network_alive.store(false); return; }
             sent += static_cast<size_t>(n);
         }
@@ -441,8 +469,7 @@ static void test_midi_to_hz() {
 // using the production parsers.
 static void test_msg_state_roundtrip() {
     int sv[2];
-    int r = ::socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
-    assert(r == 0);
+    if (!make_socket_pair(sv)) std::abort();
 
     SessionState src;
     src.session_id = 12345;
@@ -459,7 +486,7 @@ static void test_msg_state_roundtrip() {
 
     // Consume the leading tag byte to match the protocol prefix.
     uint8_t tag = 0;
-    ssize_t n = ::recv(sv[1], &tag, 1, MSG_WAITALL);
+    int n = ::recv(sv[1], reinterpret_cast<char*>(&tag), 1, MSG_WAITALL);
     assert(n == 1);
     assert(tag == MSG_STATE);
 
@@ -481,15 +508,14 @@ static void test_msg_state_roundtrip() {
     assert(dst.melodic_notes[3][0].duration_steps == 16);
     assert(dst.melodic_notes[1].empty());
 
-    ::close(sv[0]);
-    ::close(sv[1]);
+    close_socket(sv[0]);
+    close_socket(sv[1]);
     std::cout << "test_msg_state_roundtrip PASSED\n";
 }
 
 static void test_msg_melodic_track_roundtrip() {
     int sv[2];
-    int r = ::socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
-    assert(r == 0);
+    if (!make_socket_pair(sv)) std::abort();
 
     std::vector<Note> notes = {
         {0, 1, 60, 127},
@@ -500,11 +526,11 @@ static void test_msg_melodic_track_roundtrip() {
     size_t n = bitjams_net_internal::build_msg_melodic_track(
         /*melodic_idx=*/1, notes, buf, sizeof(buf));
     assert(n > 0);
-    ssize_t s = ::send(sv[0], buf, n, 0);
-    assert(s == (ssize_t)n);
+    int s = ::send(sv[0], reinterpret_cast<const char*>(buf), static_cast<int>(n), 0);
+    assert(s == static_cast<int>(n));
 
     uint8_t tag = 0;
-    ::recv(sv[1], &tag, 1, MSG_WAITALL);
+    ::recv(sv[1], reinterpret_cast<char*>(&tag), 1, MSG_WAITALL);
     assert(tag == MSG_MELODIC_TRACK);
 
     SessionState dst;
@@ -516,8 +542,8 @@ static void test_msg_melodic_track_roundtrip() {
     assert(dst.melodic_notes[1][2].pitch_midi == 67);
     assert(dst.melodic_notes[1][1].velocity == 90);
 
-    ::close(sv[0]);
-    ::close(sv[1]);
+    close_socket(sv[0]);
+    close_socket(sv[1]);
     std::cout << "test_msg_melodic_track_roundtrip PASSED\n";
 }
 
@@ -533,14 +559,16 @@ static void test_melodic_track_propagates_host_to_joiner() {
     assert(joiner_state->melodic_notes[0].empty());
 
     // Host writes a note on lead (melodic_idx=0) and dirties.
-    host_state->melodic_notes[0].push_back({3, 2, 72, 127});
+    { std::lock_guard<std::mutex> lk(host_state->melodic_mutex);
+      host_state->melodic_notes[0].push_back({3, 2, 72, 127}); }
     host_state->melodic_dirty[0].store(true);
 
     wait_flush_windows();
 
-    assert(joiner_state->melodic_notes[0].size() == 1);
-    assert(joiner_state->melodic_notes[0][0].start_step == 3);
-    assert(joiner_state->melodic_notes[0][0].pitch_midi == 72);
+    { std::lock_guard<std::mutex> lk(joiner_state->melodic_mutex);
+      assert(joiner_state->melodic_notes[0].size() == 1);
+      assert(joiner_state->melodic_notes[0][0].start_step == 3);
+      assert(joiner_state->melodic_notes[0][0].pitch_midi == 72); }
 
     Network::stop();
     std::cout << "test_melodic_track_propagates_host_to_joiner PASSED\n";
@@ -556,14 +584,16 @@ static void test_melodic_track_propagates_joiner_to_host() {
     auto joiner_state = Network::join("127.0.0.1", 6161);
     assert(joiner_state != nullptr);
 
-    joiner_state->melodic_notes[2].push_back({0, 8, 60, 127});
-    joiner_state->melodic_notes[2].push_back({8, 8, 67, 127});
+    { std::lock_guard<std::mutex> lk(joiner_state->melodic_mutex);
+      joiner_state->melodic_notes[2].push_back({0, 8, 60, 127});
+      joiner_state->melodic_notes[2].push_back({8, 8, 67, 127}); }
     joiner_state->melodic_dirty[2].store(true);
 
     wait_flush_windows();
 
-    assert(host_state->melodic_notes[2].size() == 2);
-    assert(host_state->melodic_notes[2][1].pitch_midi == 67);
+    { std::lock_guard<std::mutex> lk(host_state->melodic_mutex);
+      assert(host_state->melodic_notes[2].size() == 2);
+      assert(host_state->melodic_notes[2][1].pitch_midi == 67); }
     // After the host echo, in_flight should clear.
     assert(joiner_state->melodic_in_flight[2].load() == false);
 
@@ -572,6 +602,7 @@ static void test_melodic_track_propagates_joiner_to_host() {
 }
 
 int main() {
+    net_init();
     test_midi_to_hz();
     test_note_cap();
     test_projection_lowest_wins();

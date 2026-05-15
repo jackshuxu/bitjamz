@@ -1,4 +1,11 @@
 #define MA_IMPLEMENTATION
+// net_compat.h must be first on Windows: defines WIN32_LEAN_AND_MEAN and
+// includes winsock2.h before miniaudio.h pulls in windows.h → winsock.h.
+#include "net_compat.h"
+#ifndef _WIN32
+#  include <ifaddrs.h>
+#  include <net/if.h>
+#endif
 #include "miniaudio.h"
 
 #include <atomic>
@@ -8,12 +15,6 @@
 #include <memory>
 #include <thread>
 #include <string>
-
-#include <arpa/inet.h>
-#include <ifaddrs.h>
-#include <net/if.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
 
 #include <ftxui/component/event.hpp>
 #include <ftxui/component/screen_interactive.hpp>
@@ -31,6 +32,9 @@ namespace App {
 // "127.0.0.1" if no LAN interface is up. Used only to print the host's
 // reachable address on the HOST_INFO screen.
 std::string get_local_ipv4() {
+#ifdef _WIN32
+    return "127.0.0.1";
+#else
     struct ifaddrs* head = nullptr;
     if (::getifaddrs(&head) != 0 || head == nullptr) {
         return "127.0.0.1";
@@ -53,6 +57,7 @@ std::string get_local_ipv4() {
     }
     ::freeifaddrs(head);
     return result;
+#endif
 }
 
 // Runs one full bitjams session end-to-end: owns the SessionState's audio
@@ -94,6 +99,7 @@ static void main_session(std::shared_ptr<SessionState> state) {
 }
 
 int main() {
+    net_init();
     std::string last_error;
 
     while (App::running.load()) {
@@ -132,5 +138,6 @@ int main() {
             }
         }
     }
+    net_cleanup();
     return 0;
 }
