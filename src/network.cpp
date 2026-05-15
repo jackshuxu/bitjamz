@@ -170,7 +170,7 @@ size_t build_msg_edit(SessionState& s, uint8_t* buf, size_t buf_cap) {
         uint16_t bits = claimed;
         int dk = TRACK_DEFS[t].drum_kind;
         while (bits) {
-            int step = __builtin_ctz(bits);
+            int step = bitjams_ctz(bits);
             *p++ = static_cast<uint8_t>(t);
             *p++ = static_cast<uint8_t>(step);
             *p++ = s.drum_grid[dk][step] ? 1 : 0;
@@ -292,6 +292,7 @@ bool recv_and_apply_msg_melodic_track(int sock, SessionState& s, bool is_joiner)
     // Network-applied move overwrites the vector wholesale; restore the
     // reserve() guarantee so the timing thread's concurrent iteration of
     // melodic_notes can't race a future reallocating push_back.
+    std::lock_guard<std::mutex> lk(s.melodic_mutex);
     if (is_joiner) {
         // Rule Y: drop inbound if we have an unsent local edit (dirty);
         // accept if it's our own echo (in_flight); otherwise apply.
@@ -347,6 +348,7 @@ size_t build_pending_aux(SessionState& s, uint8_t* buf, size_t buf_cap) {
         bool expected = true;
         if (s.melodic_dirty[m].compare_exchange_strong(expected, false)) {
             if (joiner_path) s.melodic_in_flight[m].store(true);
+            std::lock_guard<std::mutex> lk(s.melodic_mutex);
             return build_msg_melodic_track(m, s.melodic_notes[m], buf, buf_cap);
         }
     }
@@ -355,7 +357,7 @@ size_t build_pending_aux(SessionState& s, uint8_t* buf, size_t buf_cap) {
     if (roots) {
         if (joiner_path) s.track_root_in_flight.fetch_or(roots);
         // Send one per call; re-dirty the rest.
-        int t = __builtin_ctz(roots);
+        int t = bitjams_ctz(roots);
         uint16_t rest = roots & ~(static_cast<uint16_t>(1) << t);
         if (rest) s.track_root_dirty.fetch_or(rest);
         if (buf_cap < 3) return 0;

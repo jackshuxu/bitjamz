@@ -559,14 +559,16 @@ static void test_melodic_track_propagates_host_to_joiner() {
     assert(joiner_state->melodic_notes[0].empty());
 
     // Host writes a note on lead (melodic_idx=0) and dirties.
-    host_state->melodic_notes[0].push_back({3, 2, 72, 127});
+    { std::lock_guard<std::mutex> lk(host_state->melodic_mutex);
+      host_state->melodic_notes[0].push_back({3, 2, 72, 127}); }
     host_state->melodic_dirty[0].store(true);
 
     wait_flush_windows();
 
-    assert(joiner_state->melodic_notes[0].size() == 1);
-    assert(joiner_state->melodic_notes[0][0].start_step == 3);
-    assert(joiner_state->melodic_notes[0][0].pitch_midi == 72);
+    { std::lock_guard<std::mutex> lk(joiner_state->melodic_mutex);
+      assert(joiner_state->melodic_notes[0].size() == 1);
+      assert(joiner_state->melodic_notes[0][0].start_step == 3);
+      assert(joiner_state->melodic_notes[0][0].pitch_midi == 72); }
 
     Network::stop();
     std::cout << "test_melodic_track_propagates_host_to_joiner PASSED\n";
@@ -582,14 +584,16 @@ static void test_melodic_track_propagates_joiner_to_host() {
     auto joiner_state = Network::join("127.0.0.1", 6161);
     assert(joiner_state != nullptr);
 
-    joiner_state->melodic_notes[2].push_back({0, 8, 60, 127});
-    joiner_state->melodic_notes[2].push_back({8, 8, 67, 127});
+    { std::lock_guard<std::mutex> lk(joiner_state->melodic_mutex);
+      joiner_state->melodic_notes[2].push_back({0, 8, 60, 127});
+      joiner_state->melodic_notes[2].push_back({8, 8, 67, 127}); }
     joiner_state->melodic_dirty[2].store(true);
 
     wait_flush_windows();
 
-    assert(host_state->melodic_notes[2].size() == 2);
-    assert(host_state->melodic_notes[2][1].pitch_midi == 67);
+    { std::lock_guard<std::mutex> lk(host_state->melodic_mutex);
+      assert(host_state->melodic_notes[2].size() == 2);
+      assert(host_state->melodic_notes[2][1].pitch_midi == 67); }
     // After the host echo, in_flight should clear.
     assert(joiner_state->melodic_in_flight[2].load() == false);
 
