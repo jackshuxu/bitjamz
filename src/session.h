@@ -188,7 +188,7 @@ public:
     // --- shared creative state (synced) ---
     // Drum tracks indexed by TRACK_DEFS[t].drum_kind (0..7). Melodic tracks
     // indexed by TRACK_DEFS[t].melodic_idx (0..3).
-    bool              drum_grid[DRUM_KINDS][STEPS] = {};
+    std::atomic<bool> drum_grid[DRUM_KINDS][STEPS] = {};
     std::vector<Note> melodic_notes[MELODIC_VOICES];
     // Per-track default root pitch in MIDI. Drum tracks use it as the
     // synthesized voice's base pitch; melodic tracks use it for grid-mode

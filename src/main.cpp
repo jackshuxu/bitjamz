@@ -1,4 +1,11 @@
 #define MA_IMPLEMENTATION
+// net_compat.h must be first on Windows: defines WIN32_LEAN_AND_MEAN and
+// includes winsock2.h before miniaudio.h pulls in windows.h → winsock.h.
+#include "net_compat.h"
+#ifndef _WIN32
+#  include <ifaddrs.h>
+#  include <net/if.h>
+#endif
 #include "miniaudio.h"
 
 #include <atomic>
@@ -8,12 +15,6 @@
 #include <memory>
 #include <thread>
 #include <string>
-
-#include "net_compat.h"
-#ifndef _WIN32
-#  include <ifaddrs.h>
-#  include <net/if.h>
-#endif
 
 #include <ftxui/component/event.hpp>
 #include <ftxui/component/screen_interactive.hpp>

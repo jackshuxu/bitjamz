@@ -51,9 +51,9 @@ std::shared_ptr<SessionState> make_solo_session_state() {
     static const bool kick_row[STEPS]  = {1,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0};
     static const bool snare_row[STEPS] = {0,0,1,0,0,0,1,0,0,0,1,0,0,0,1,0};
     static const bool chat_row[STEPS]  = {1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0};
-    std::memcpy(s->drum_grid[DK_KICK],       kick_row,  sizeof(kick_row));
-    std::memcpy(s->drum_grid[DK_SNARE],      snare_row, sizeof(snare_row));
-    std::memcpy(s->drum_grid[DK_CLOSED_HAT], chat_row,  sizeof(chat_row));
+    for (int i = 0; i < STEPS; ++i) s->drum_grid[DK_KICK][i].store(kick_row[i]);
+    for (int i = 0; i < STEPS; ++i) s->drum_grid[DK_SNARE][i].store(snare_row[i]);
+    for (int i = 0; i < STEPS; ++i) s->drum_grid[DK_CLOSED_HAT][i].store(chat_row[i]);
     return s;
 }
 

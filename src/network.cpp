@@ -16,7 +16,7 @@ namespace {
 std::atomic<bool>          g_stop{false};
 
 // --- host-side state ---
-int                        g_listener_fd = -1;
+std::atomic<int>           g_listener_fd{-1};
 std::thread                g_listener_thread;
 std::thread                g_host_flush_thread;
 
@@ -453,7 +453,7 @@ void listener_loop(std::shared_ptr<SessionState> state) {
     while (!g_stop.load()) {
         sockaddr_in peer_addr{};
         socklen_t   peer_len = sizeof(peer_addr);
-        int sock = accept_socket(g_listener_fd, reinterpret_cast<sockaddr*>(&peer_addr), &peer_len);
+        int sock = accept_socket(g_listener_fd.load(), reinterpret_cast<sockaddr*>(&peer_addr), &peer_len);
         if (sock < 0) {
             if (g_stop.load()) break;
 #ifndef _WIN32
@@ -531,24 +531,24 @@ void joiner_flush_loop(int sock, std::shared_ptr<SessionState> state) {
 void Network::host(std::shared_ptr<SessionState> state) {
     g_stop.store(false);
 
-    g_listener_fd = create_socket();
+    g_listener_fd.store(create_socket());
     int opt = 1;
-    ::setsockopt(g_listener_fd, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
+    ::setsockopt(g_listener_fd.load(), SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
 
     sockaddr_in addr{};
     addr.sin_family      = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port        = htons(NET_PORT);
-    if (::bind(g_listener_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+    if (::bind(g_listener_fd.load(), reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
         ::perror("bind");
-        close_socket(g_listener_fd);
-        g_listener_fd = -1;
+        close_socket(g_listener_fd.load());
+        g_listener_fd.store(-1);
         return;
     }
-    if (::listen(g_listener_fd, 5) < 0) {
+    if (::listen(g_listener_fd.load(), 5) < 0) {
         ::perror("listen");
-        close_socket(g_listener_fd);
-        g_listener_fd = -1;
+        close_socket(g_listener_fd.load());
+        g_listener_fd.store(-1);
         return;
     }
 
@@ -599,10 +599,10 @@ std::shared_ptr<SessionState> Network::join(const char* ip, uint16_t room) {
 void Network::stop() {
     g_stop.store(true);
 
-    if (g_listener_fd >= 0) {
-        ::shutdown(g_listener_fd, SHUT_RDWR);
-        close_socket(g_listener_fd);
-        g_listener_fd = -1;
+    if (g_listener_fd.load() >= 0) {
+        ::shutdown(g_listener_fd.load(), SHUT_RDWR);
+        close_socket(g_listener_fd.load());
+        g_listener_fd.store(-1);
     }
     if (g_listener_thread.joinable())   g_listener_thread.join();
     if (g_host_flush_thread.joinable()) g_host_flush_thread.join();
