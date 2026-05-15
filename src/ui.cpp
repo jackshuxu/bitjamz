@@ -1237,7 +1237,7 @@ static bool handle_shared_track_command(SessionState& s, Event e) {
         auto now = clk::now();
         if (now - last_A <= CLEAR_ALL_WINDOW) {
             for (int k = 0; k < DRUM_KINDS; ++k)
-                std::memset(s.drum_grid[k], 0, sizeof(s.drum_grid[k]));
+                for (int st = 0; st < STEPS; ++st) s.drum_grid[k][st].store(false);
             for (int m = 0; m < MELODIC_VOICES; ++m) s.melodic_notes[m].clear();
             for (int t = 0; t < TRACKS; ++t) s.dirty[t].fetch_or(0xFFFFu);
             for (int m = 0; m < MELODIC_VOICES; ++m) s.melodic_dirty[m].store(true);
@@ -1246,7 +1246,7 @@ static bool handle_shared_track_command(SessionState& s, Event e) {
         }
         if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
             int dk = TRACK_DEFS[cursor_track].drum_kind;
-            std::memset(s.drum_grid[dk], 0, sizeof(s.drum_grid[dk]));
+            for (int st = 0; st < STEPS; ++st) s.drum_grid[dk][st].store(false);
             s.dirty[cursor_track].fetch_or(0xFFFFu, std::memory_order_relaxed);
         } else {
             int midx = TRACK_DEFS[cursor_track].melodic_idx;
