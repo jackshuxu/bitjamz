@@ -37,7 +37,11 @@ elseif(UNIX)
     target_link_libraries(bitjams PRIVATE pthread dl m)
 endif()
 
-target_compile_options(bitjams PRIVATE -O2)
+if(MSVC)
+    target_compile_options(bitjams PRIVATE /W3 /O2)
+else()
+    target_compile_options(bitjams PRIVATE -Wall -Wextra -O2)
+endif()
 
 # --- Tests -----------------------------------------------------------------
 enable_testing()
@@ -53,8 +57,7 @@ if(APPLE)
 elseif(UNIX)
     target_link_libraries(test_net PRIVATE pthread)
 endif()
-target_compile_options(test_net PRIVATE -O2)
-
+target_compile_options(test_net PRIVATE -Wall -Wextra -O2)
 add_test(NAME net_tests COMMAND test_net)
 
 add_executable(test_record
@@ -66,6 +69,10 @@ if(APPLE)
 elseif(UNIX)
     target_link_libraries(test_record PRIVATE pthread)
 endif()
-target_compile_options(test_record PRIVATE -O2)
+if(MSVC)
+    target_compile_options(test_record PRIVATE /W3 /O2)
+else()
+    target_compile_options(test_record PRIVATE -Wall -Wextra -O2)
+endif()
 
 add_test(NAME record_tests COMMAND test_record)
