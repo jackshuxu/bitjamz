@@ -137,6 +137,27 @@ enum DrumKind {
     DK_CYMBAL,
 };
 
+// A reusable musical section. Owns the drum cells and melodic note lists for
+// 8 drum tracks and 4 melodic voices. Held by SessionState as a
+// std::unique_ptr because the atomic drum cells and mutex are non-movable.
+//
+// Phase 1: a single Pattern with id=1 sits on every SessionState; multi-bar,
+// time-sig, and multi-pattern support arrive in later phases.
+struct Pattern {
+    uint16_t id = 1;
+    std::atomic<bool> drum_grid[DRUM_KINDS][STEPS] = {};
+    std::vector<Note> melodic_notes[MELODIC_VOICES];
+    mutable std::mutex melodic_mutex;
+
+    Pattern() {
+        // Reserve up-front so the timing thread's concurrent iteration over
+        // melodic_notes can't race a reallocating push_back.
+        for (int m = 0; m < MELODIC_VOICES; ++m) {
+            melodic_notes[m].reserve(MAX_NOTES_PER_MELODIC);
+        }
+    }
+};
+
 struct TrackDef {
     const char* name;        // <= 5 chars
     char        key;         // MPC trigger key
@@ -187,11 +208,12 @@ public:
     uint16_t session_id = 0;
 
     // --- shared creative state (synced) ---
-    // Drum tracks indexed by TRACK_DEFS[t].drum_kind (0..7). Melodic tracks
-    // indexed by TRACK_DEFS[t].melodic_idx (0..3).
-    std::atomic<bool> drum_grid[DRUM_KINDS][STEPS] = {};
-    std::vector<Note> melodic_notes[MELODIC_VOICES];
-    mutable std::mutex melodic_mutex;
+    // Patterns: the musical sections. Phase 1 has exactly one pattern (id=1)
+    // and the rest of the codebase reaches drum cells / melodic notes via
+    // patterns[0]->drum_grid / melodic_notes. Later phases introduce
+    // multi-bar storage, time signatures, and multiple patterns referenced
+    // by a song timeline.
+    std::vector<std::unique_ptr<Pattern>> patterns;
     // Per-track default root pitch in MIDI. Drum tracks use it as the
     // synthesized voice's base pitch; melodic tracks use it for grid-mode
     // space-entry and live-pad trigger.

@@ -36,14 +36,13 @@ void enqueue_synth_trig(int melodic_idx, float freq_hz) {
 }
 
 SessionState::SessionState() {
-    // Reserve the per-track note capacity up front so the timing thread can
-    // iterate melodic_notes concurrently with a UI/record push_back without
-    // hitting a reallocation. Combined with the 64-cap on add_note, push_back
-    // never grows past this capacity, so the original begin()/end() pointers
-    // captured by the timing thread's loop stay valid.
-    for (int m = 0; m < MELODIC_VOICES; ++m) {
-        melodic_notes[m].reserve(MAX_NOTES_PER_MELODIC);
-    }
+    // Phase 1 invariant: every session begins with one Pattern, id=1. The
+    // Pattern constructor reserves the per-track note capacity so the timing
+    // thread can iterate melodic_notes concurrently with a UI/record
+    // push_back without hitting a reallocation.
+    auto p = std::make_unique<Pattern>();
+    p->id = 1;
+    patterns.push_back(std::move(p));
 }
 
 std::shared_ptr<SessionState> make_solo_session_state() {
@@ -51,24 +50,27 @@ std::shared_ptr<SessionState> make_solo_session_state() {
     static const bool kick_row[STEPS]  = {1,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0};
     static const bool snare_row[STEPS] = {0,0,1,0,0,0,1,0,0,0,1,0,0,0,1,0};
     static const bool chat_row[STEPS]  = {1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0};
-    for (int i = 0; i < STEPS; ++i) s->drum_grid[DK_KICK][i].store(kick_row[i]);
-    for (int i = 0; i < STEPS; ++i) s->drum_grid[DK_SNARE][i].store(snare_row[i]);
-    for (int i = 0; i < STEPS; ++i) s->drum_grid[DK_CLOSED_HAT][i].store(chat_row[i]);
+    Pattern& p = *s->patterns[0];
+    for (int i = 0; i < STEPS; ++i) p.drum_grid[DK_KICK][i].store(kick_row[i]);
+    for (int i = 0; i < STEPS; ++i) p.drum_grid[DK_SNARE][i].store(snare_row[i]);
+    for (int i = 0; i < STEPS; ++i) p.drum_grid[DK_CLOSED_HAT][i].store(chat_row[i]);
     return s;
 }
 
 void record_input(SessionState& s, int track, uint8_t pitch_midi) {
     if (s.rec_state.load() != RecordState::RECORDING) return;
     if (track < 0 || track >= TRACKS) return;
+    if (s.patterns.empty()) return;
+    Pattern& pat = *s.patterns[0];
     int target_step = s.play_step.load() % s.loop_len;
     const TrackDef& td = TRACK_DEFS[track];
     if (td.type == TrackType::DRUM) {
-        s.drum_grid[td.drum_kind][target_step] = true;
+        pat.drum_grid[td.drum_kind][target_step] = true;
         s.dirty[track].fetch_or(static_cast<uint16_t>(1) << target_step);
         return;
     }
     int midx = td.melodic_idx;
-    auto& notes = s.melodic_notes[midx];
+    auto& notes = pat.melodic_notes[midx];
     for (const Note& existing : notes) {
         if (existing.start_step == target_step
             && existing.pitch_midi == pitch_midi) {
@@ -203,12 +205,14 @@ void timing_thread(SessionState& s) {
         bool any_solo = false;
         for (int t = 0; t < TRACKS; ++t) if (s.track_solo[t]) { any_solo = true; break; }
 
+        Pattern* pat = s.patterns.empty() ? nullptr : s.patterns[0].get();
         for (int t = 0; t < TRACKS; ++t) {
             if (s.track_muted[t]) continue;
             if (any_solo && !s.track_solo[t]) continue;
+            if (!pat) continue;
             const TrackDef& td = TRACK_DEFS[t];
             if (td.type == TrackType::DRUM) {
-                if (s.drum_grid[td.drum_kind][step]) s.trig[t].store(true);
+                if (pat->drum_grid[td.drum_kind][step]) s.trig[t].store(true);
             } else {
                 // Fire onsets only — sustain is handled by the synth voice
                 // envelope. Multiple onsets on the same step (polyphony) all
@@ -217,10 +221,10 @@ void timing_thread(SessionState& s) {
                 //
                 // Snapshot size: concurrent record_input appends from the UI
                 // thread won't be picked up this loop pass. Combined with
-                // the up-front reserve(MAX_NOTES_PER_MELODIC) in the
-                // SessionState constructor (so push_back never reallocates),
-                // this eliminates the iterator-race double-trigger.
-                const auto& notes = s.melodic_notes[td.melodic_idx];
+                // the up-front reserve(MAX_NOTES_PER_MELODIC) in the Pattern
+                // constructor (so push_back never reallocates), this
+                // eliminates the iterator-race double-trigger.
+                const auto& notes = pat->melodic_notes[td.melodic_idx];
                 size_t n_count = notes.size();
                 for (size_t i = 0; i < n_count; ++i) {
                     const Note& n = notes[i];

@@ -86,3 +86,19 @@ else()
 endif()
 
 add_test(NAME record_tests COMMAND test_record)
+
+add_executable(test_pattern
+    tests/test_pattern.cpp
+    src/session.cpp
+)
+target_include_directories(test_pattern PRIVATE include src)
+if(APPLE)
+elseif(UNIX)
+    target_link_libraries(test_pattern PRIVATE pthread)
+endif()
+if(MSVC)
+    target_compile_options(test_pattern PRIVATE /W3 /O2)
+else()
+    target_compile_options(test_pattern PRIVATE -Wall -Wextra -O2)
+endif()
+add_test(NAME pattern_tests COMMAND test_pattern)

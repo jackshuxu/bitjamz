@@ -12,7 +12,7 @@ static void test_drum_record_writes_cell_and_dirty() {
 
     record_input(s, /*track=*/0, /*pitch=*/0);
 
-    assert(s.drum_grid[DK_KICK][5] == true);
+    assert(s.patterns[0]->drum_grid[DK_KICK][5] == true);
     assert((s.dirty[0].load() & (1u << 5)) != 0);
     std::cout << "test_drum_record_writes_cell_and_dirty PASSED\n";
 }
@@ -25,9 +25,9 @@ static void test_record_input_noop_when_off() {
     record_input(s, /*track=*/0, /*pitch=*/0);
     record_input(s, /*track=*/8, /*pitch=*/60);  // melodic track (lead)
 
-    assert(s.drum_grid[DK_KICK][5] == false);
+    assert(s.patterns[0]->drum_grid[DK_KICK][5] == false);
     assert(s.dirty[0].load() == 0);
-    assert(s.melodic_notes[0].empty());
+    assert(s.patterns[0]->melodic_notes[0].empty());
     assert(s.melodic_dirty[0].load() == false);
     std::cout << "test_record_input_noop_when_off PASSED\n";
 }
@@ -43,7 +43,7 @@ static void test_melodic_record_appends_note_and_dirty() {
 
     record_input(s, LEAD_TRACK, /*pitch=*/64);
 
-    auto& notes = s.melodic_notes[LEAD_MELODIC];
+    auto& notes = s.patterns[0]->melodic_notes[LEAD_MELODIC];
     assert(notes.size() == 1);
     assert(notes[0].start_step == 5);
     assert(notes[0].duration_steps == 1);
@@ -61,7 +61,7 @@ static void test_melodic_record_dedup_same_step_and_pitch() {
     record_input(s, LEAD_TRACK, 64);
     record_input(s, LEAD_TRACK, 64);  // identical
 
-    assert(s.melodic_notes[LEAD_MELODIC].size() == 1);
+    assert(s.patterns[0]->melodic_notes[LEAD_MELODIC].size() == 1);
     std::cout << "test_melodic_record_dedup_same_step_and_pitch PASSED\n";
 }
 
@@ -74,7 +74,7 @@ static void test_melodic_record_polyphonic_same_step() {
     record_input(s, LEAD_TRACK, 64);
     record_input(s, LEAD_TRACK, 67);
 
-    assert(s.melodic_notes[LEAD_MELODIC].size() == 3);
+    assert(s.patterns[0]->melodic_notes[LEAD_MELODIC].size() == 3);
     std::cout << "test_melodic_record_polyphonic_same_step PASSED\n";
 }
 
@@ -85,16 +85,16 @@ static void test_melodic_record_64_cap() {
 
     // Pre-fill to the cap with distinct pitches (cap = 64).
     for (int i = 0; i < MAX_NOTES_PER_MELODIC; ++i) {
-        s.melodic_notes[LEAD_MELODIC].push_back(
+        s.patterns[0]->melodic_notes[LEAD_MELODIC].push_back(
             Note{0, 1, static_cast<uint8_t>(i), 127});
     }
-    assert((int)s.melodic_notes[LEAD_MELODIC].size() == MAX_NOTES_PER_MELODIC);
+    assert((int)s.patterns[0]->melodic_notes[LEAD_MELODIC].size() == MAX_NOTES_PER_MELODIC);
 
     // 65th: pitch not already in the list, so dedup wouldn't reject it —
     // only the cap should.
     record_input(s, LEAD_TRACK, 100);
 
-    assert((int)s.melodic_notes[LEAD_MELODIC].size() == MAX_NOTES_PER_MELODIC);
+    assert((int)s.patterns[0]->melodic_notes[LEAD_MELODIC].size() == MAX_NOTES_PER_MELODIC);
     std::cout << "test_melodic_record_64_cap PASSED\n";
 }
 

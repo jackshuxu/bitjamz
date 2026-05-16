@@ -354,7 +354,7 @@ static Element render_grid_view(SessionState& s) {
         if (td.type == TrackType::DRUM) {
             int dk = td.drum_kind;
             for (int step = 0; step < STEPS; ++step) {
-                bool active = s.drum_grid[dk][step];
+                bool active = s.patterns[0]->drum_grid[dk][step];
                 bool in_loop = (step < s.loop_len);
                 // seq_mode is a GRID sub-mode only.
                 bool highlighted = show_cursor
@@ -366,7 +366,7 @@ static Element render_grid_view(SessionState& s) {
                                              step == ps, is_playing, narrow));
             }
         } else {
-            const auto& notes = s.melodic_notes[td.melodic_idx];
+            const auto& notes = s.patterns[0]->melodic_notes[td.melodic_idx];
             auto proj = project_row(notes, s.loop_len);
             for (int step = 0; step < STEPS; ++step) {
                 bool in_loop = (step < s.loop_len);
@@ -466,7 +466,7 @@ static Element render_piano_roll(SessionState& s) {
         lines.push_back(hbox(std::move(row)));
     }
 
-    const auto& notes = s.melodic_notes[td.melodic_idx];
+    const auto& notes = s.patterns[0]->melodic_notes[td.melodic_idx];
 
     // 12 chromatic pitch rows starting at piano_view_base_midi at the bottom.
     // Render top-down: row 11 (highest) first, row 0 last.
@@ -654,7 +654,7 @@ static void kbd_mark_dirty(SessionState& s, int melodic_idx) {
 static int kbd_resolve_active_index(SessionState& s) {
     if (kbd_active_track < 0 || kbd_active_note_idx < 0) return -1;
     int midx = TRACK_DEFS[kbd_active_track].melodic_idx;
-    if (kbd_active_note_idx < (int)s.melodic_notes[midx].size())
+    if (kbd_active_note_idx < (int)s.patterns[0]->melodic_notes[midx].size())
         return kbd_active_note_idx;
     return -1;
 }
@@ -665,9 +665,9 @@ static int kbd_place_note(SessionState& s, uint8_t pitch_midi) {
     if (TRACK_DEFS[cursor_track].type != TrackType::MELODIC) return -1;
     int midx = TRACK_DEFS[cursor_track].melodic_idx;
     Note n{ static_cast<uint8_t>(cursor_step), 1, pitch_midi, 127 };
-    if (!add_note(s.melodic_notes[midx], n)) return -1;
+    if (!add_note(s.patterns[0]->melodic_notes[midx], n)) return -1;
     kbd_mark_dirty(s, midx);
-    return static_cast<int>(s.melodic_notes[midx].size() - 1);
+    return static_cast<int>(s.patterns[0]->melodic_notes[midx].size() - 1);
 }
 
 // Truncate the held note to end just before cursor_step. Caller advances
@@ -679,7 +679,7 @@ static void kbd_truncate_active_before(SessionState& s, int new_end_step) {
     int idx = kbd_resolve_active_index(s);
     if (idx < 0) return;
     int midx = TRACK_DEFS[kbd_active_track].melodic_idx;
-    Note& n = s.melodic_notes[midx][idx];
+    Note& n = s.patterns[0]->melodic_notes[midx][idx];
     int new_dur = new_end_step - n.start_step;
     if (new_dur < 1) new_dur = 1;
     n.duration_steps = static_cast<uint8_t>(new_dur);
@@ -710,12 +710,12 @@ static int pr_place_note_at_cursor(SessionState& s, uint8_t duration_steps) {
     int midx = TRACK_DEFS[piano_track].melodic_idx;
     uint8_t pitch = pr_cursor_pitch();
     // Apply same-row collision rule before adding.
-    clear_or_truncate_at(s.melodic_notes[midx], pitch,
+    clear_or_truncate_at(s.patterns[0]->melodic_notes[midx], pitch,
                          static_cast<uint8_t>(piano_cursor_step));
     Note n{ static_cast<uint8_t>(piano_cursor_step), duration_steps, pitch, 127 };
-    if (!add_note(s.melodic_notes[midx], n)) return -1;
+    if (!add_note(s.patterns[0]->melodic_notes[midx], n)) return -1;
     s.melodic_dirty[midx].store(true);
-    return static_cast<int>(s.melodic_notes[midx].size() - 1);
+    return static_cast<int>(s.patterns[0]->melodic_notes[midx].size() - 1);
 }
 
 // ---- event dispatch ------------------------------------------------------
@@ -783,7 +783,7 @@ static bool dispatch_keyboard(SessionState& s, Event e) {
         if (has_active) {
             int idx = kbd_resolve_active_index(s);
             int midx = TRACK_DEFS[kbd_active_track].melodic_idx;
-            Note& n = s.melodic_notes[midx][idx];
+            Note& n = s.patterns[0]->melodic_notes[midx][idx];
             if (n.duration_steps < s.loop_len) {
                 ++n.duration_steps;
                 s.melodic_dirty[midx].store(true);
@@ -798,7 +798,7 @@ static bool dispatch_keyboard(SessionState& s, Event e) {
         if (has_active) {
             int idx = kbd_resolve_active_index(s);
             int midx = TRACK_DEFS[kbd_active_track].melodic_idx;
-            Note& n = s.melodic_notes[midx][idx];
+            Note& n = s.patterns[0]->melodic_notes[midx][idx];
             if (n.duration_steps > 1) {
                 --n.duration_steps;
                 s.melodic_dirty[midx].store(true);
@@ -870,7 +870,7 @@ static bool dispatch_keyboard(SessionState& s, Event e) {
         if (has_active) {
             int idx  = kbd_resolve_active_index(s);
             int midx = TRACK_DEFS[kbd_active_track].melodic_idx;
-            Note& n  = s.melodic_notes[midx][idx];
+            Note& n  = s.patterns[0]->melodic_notes[midx][idx];
             if (cursor_step > n.start_step) {
                 // Held note was grown via ArrowRight. Truncate it so it ends
                 // just before the cursor, and place the new pitch at the
@@ -883,7 +883,7 @@ static bool dispatch_keyboard(SessionState& s, Event e) {
             } else {
                 // 1-cell held at the last cell: cursor can't advance. Delete
                 // the held note so the new pitch cleanly replaces it.
-                s.melodic_notes[midx].erase(s.melodic_notes[midx].begin() + idx);
+                s.patterns[0]->melodic_notes[midx].erase(s.patterns[0]->melodic_notes[midx].begin() + idx);
                 kbd_mark_dirty(s, midx);
             }
             kbd_release_active();
@@ -916,8 +916,8 @@ static bool dispatch_piano_roll(SessionState& s, Event e) {
     if (e == Event::ArrowRight) {
         if (piano_active_note_idx >= 0) {
             int midx = TRACK_DEFS[piano_track].melodic_idx;
-            if (piano_active_note_idx < (int)s.melodic_notes[midx].size()) {
-                Note& n = s.melodic_notes[midx][piano_active_note_idx];
+            if (piano_active_note_idx < (int)s.patterns[0]->melodic_notes[midx].size()) {
+                Note& n = s.patterns[0]->melodic_notes[midx][piano_active_note_idx];
                 if (n.duration_steps < s.loop_len) {
                     ++n.duration_steps;
                     s.melodic_dirty[midx].store(true);
@@ -932,13 +932,13 @@ static bool dispatch_piano_roll(SessionState& s, Event e) {
     if (e == Event::ArrowLeft) {
         if (piano_active_note_idx >= 0) {
             int midx = TRACK_DEFS[piano_track].melodic_idx;
-            if (piano_active_note_idx < (int)s.melodic_notes[midx].size()) {
-                Note& n = s.melodic_notes[midx][piano_active_note_idx];
+            if (piano_active_note_idx < (int)s.patterns[0]->melodic_notes[midx].size()) {
+                Note& n = s.patterns[0]->melodic_notes[midx][piano_active_note_idx];
                 if (n.duration_steps > 1) {
                     --n.duration_steps;
                     s.melodic_dirty[midx].store(true);
                 } else {
-                    s.melodic_notes[midx].erase(s.melodic_notes[midx].begin()
+                    s.patterns[0]->melodic_notes[midx].erase(s.patterns[0]->melodic_notes[midx].begin()
                                                 + piano_active_note_idx);
                     s.melodic_dirty[midx].store(true);
                     pr_release_active();
@@ -965,7 +965,7 @@ static bool dispatch_piano_roll(SessionState& s, Event e) {
     if (e == Event::Backspace) {
         // Delete the note under the cursor.
         int midx = TRACK_DEFS[piano_track].melodic_idx;
-        auto& notes = s.melodic_notes[midx];
+        auto& notes = s.patterns[0]->melodic_notes[midx];
         uint8_t pitch = pr_cursor_pitch();
         for (auto it = notes.begin(); it != notes.end(); ++it) {
             if (it->pitch_midi != pitch) continue;
@@ -1011,7 +1011,7 @@ static bool dispatch_piano_roll(SessionState& s, Event e) {
         if (c == 'C') {
             // Shift+C clears the piano roll's entire pattern.
             int midx = TRACK_DEFS[piano_track].melodic_idx;
-            s.melodic_notes[midx].clear();
+            s.patterns[0]->melodic_notes[midx].clear();
             pr_release_active();
             s.melodic_dirty[midx].store(true);
             return true;
@@ -1025,7 +1025,7 @@ static bool dispatch_piano_roll(SessionState& s, Event e) {
             // Copy duration of the note under cursor (if any).
             int midx = TRACK_DEFS[piano_track].melodic_idx;
             uint8_t pitch = pr_cursor_pitch();
-            for (const Note& n : s.melodic_notes[midx]) {
+            for (const Note& n : s.patterns[0]->melodic_notes[midx]) {
                 if (n.pitch_midi != pitch) continue;
                 int end = n.start_step + n.duration_steps;
                 if (piano_cursor_step >= n.start_step && piano_cursor_step < end) {
@@ -1085,7 +1085,7 @@ static void fill_pattern(SessionState& s, int interval, int start) {
         int dk = TRACK_DEFS[cursor_track].drum_kind;
         uint16_t fill_mask = 0;
         for (int step = start; step < s.loop_len; step += interval) {
-            s.drum_grid[dk][step] = true;
+            s.patterns[0]->drum_grid[dk][step] = true;
             fill_mask |= static_cast<uint16_t>(1) << step;
         }
         s.dirty[cursor_track].fetch_or(fill_mask, std::memory_order_relaxed);
@@ -1093,7 +1093,7 @@ static void fill_pattern(SessionState& s, int interval, int start) {
     }
     int midx = TRACK_DEFS[cursor_track].melodic_idx;
     uint8_t root = s.track_root_midi[cursor_track];
-    auto& notes = s.melodic_notes[midx];
+    auto& notes = s.patterns[0]->melodic_notes[midx];
     bool changed = false;
     for (int step = start; step < s.loop_len; step += interval) {
         Note n{ static_cast<uint8_t>(step), 1, root, 127 };
@@ -1117,12 +1117,12 @@ static std::vector<Note> clip_notes;
 static void copy_cursor_track(SessionState& s) {
     if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
         int dk = TRACK_DEFS[cursor_track].drum_kind;
-        for (int st = 0; st < STEPS; ++st) clip_drum[st] = s.drum_grid[dk][st];
+        for (int st = 0; st < STEPS; ++st) clip_drum[st] = s.patterns[0]->drum_grid[dk][st];
         clip_notes.clear();
         clip_kind = 0;
     } else {
         int midx = TRACK_DEFS[cursor_track].melodic_idx;
-        clip_notes = s.melodic_notes[midx];
+        clip_notes = s.patterns[0]->melodic_notes[midx];
         for (int st = 0; st < STEPS; ++st) clip_drum[st] = false;
         clip_kind = 1;
     }
@@ -1133,19 +1133,19 @@ static void paste_to_cursor_track(SessionState& s) {
     if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
         int dk = TRACK_DEFS[cursor_track].drum_kind;
         if (clip_kind == 0) {
-            for (int st = 0; st < STEPS; ++st) s.drum_grid[dk][st] = clip_drum[st];
+            for (int st = 0; st < STEPS; ++st) s.patterns[0]->drum_grid[dk][st] = clip_drum[st];
         } else {
             // melodic -> drum: hit on every note start_step.
-            for (int st = 0; st < STEPS; ++st) s.drum_grid[dk][st] = false;
+            for (int st = 0; st < STEPS; ++st) s.patterns[0]->drum_grid[dk][st] = false;
             for (const Note& n : clip_notes) {
-                if (n.start_step < STEPS) s.drum_grid[dk][n.start_step] = true;
+                if (n.start_step < STEPS) s.patterns[0]->drum_grid[dk][n.start_step] = true;
             }
         }
         s.dirty[cursor_track].fetch_or(0xFFFFu, std::memory_order_relaxed);
     } else {
         int midx = TRACK_DEFS[cursor_track].melodic_idx;
         uint8_t root = s.track_root_midi[cursor_track];
-        auto& notes = s.melodic_notes[midx];
+        auto& notes = s.patterns[0]->melodic_notes[midx];
         notes.clear();
         if (clip_kind == 0) {
             // drum -> melodic: 1-step note at root pitch for every hit.
@@ -1167,14 +1167,14 @@ static void paste_to_cursor_track(SessionState& s) {
 static void delete_at_cursor_cell(SessionState& s) {
     if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
         int dk = TRACK_DEFS[cursor_track].drum_kind;
-        if (!s.drum_grid[dk][cursor_step]) return;
-        s.drum_grid[dk][cursor_step] = false;
+        if (!s.patterns[0]->drum_grid[dk][cursor_step]) return;
+        s.patterns[0]->drum_grid[dk][cursor_step] = false;
         s.dirty[cursor_track].fetch_or(static_cast<uint16_t>(1) << cursor_step,
                                        std::memory_order_relaxed);
         return;
     }
     int midx = TRACK_DEFS[cursor_track].melodic_idx;
-    auto& notes = s.melodic_notes[midx];
+    auto& notes = s.patterns[0]->melodic_notes[midx];
     bool changed = false;
     for (auto it = notes.begin(); it != notes.end();) {
         int end = it->start_step + it->duration_steps;
@@ -1237,8 +1237,8 @@ static bool handle_shared_track_command(SessionState& s, Event e) {
         auto now = clk::now();
         if (now - last_A <= CLEAR_ALL_WINDOW) {
             for (int k = 0; k < DRUM_KINDS; ++k)
-                for (int st = 0; st < STEPS; ++st) s.drum_grid[k][st].store(false);
-            for (int m = 0; m < MELODIC_VOICES; ++m) s.melodic_notes[m].clear();
+                for (int st = 0; st < STEPS; ++st) s.patterns[0]->drum_grid[k][st].store(false);
+            for (int m = 0; m < MELODIC_VOICES; ++m) s.patterns[0]->melodic_notes[m].clear();
             for (int t = 0; t < TRACKS; ++t) s.dirty[t].fetch_or(0xFFFFu);
             for (int m = 0; m < MELODIC_VOICES; ++m) s.melodic_dirty[m].store(true);
             last_A = clk::time_point{};
@@ -1246,11 +1246,11 @@ static bool handle_shared_track_command(SessionState& s, Event e) {
         }
         if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
             int dk = TRACK_DEFS[cursor_track].drum_kind;
-            for (int st = 0; st < STEPS; ++st) s.drum_grid[dk][st].store(false);
+            for (int st = 0; st < STEPS; ++st) s.patterns[0]->drum_grid[dk][st].store(false);
             s.dirty[cursor_track].fetch_or(0xFFFFu, std::memory_order_relaxed);
         } else {
             int midx = TRACK_DEFS[cursor_track].melodic_idx;
-            s.melodic_notes[midx].clear();
+            s.patterns[0]->melodic_notes[midx].clear();
             s.melodic_dirty[midx].store(true);
         }
         return true;
@@ -1313,7 +1313,7 @@ static bool dispatch_grid(SessionState& s, Event e) {
                 int step = window_start + (c - '1');
                 if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
                     int dk = TRACK_DEFS[cursor_track].drum_kind;
-                    s.drum_grid[dk][step] = !s.drum_grid[dk][step];
+                    s.patterns[0]->drum_grid[dk][step] = !s.patterns[0]->drum_grid[dk][step];
                     s.dirty[cursor_track].fetch_or(1u << step, std::memory_order_relaxed);
                 }
                 return true;
@@ -1329,14 +1329,14 @@ static bool dispatch_grid(SessionState& s, Event e) {
         if (e == Event::Character(' ')) {
             if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
                 int dk = TRACK_DEFS[cursor_track].drum_kind;
-                s.drum_grid[dk][cursor_step] = !s.drum_grid[dk][cursor_step];
+                s.patterns[0]->drum_grid[dk][cursor_step] = !s.patterns[0]->drum_grid[dk][cursor_step];
                 s.dirty[cursor_track].fetch_or(1u << cursor_step, std::memory_order_relaxed);
             } else {
                 // Place a 1-step note at root pitch. If a note already starts
                 // at this cell on the root pitch, remove it (toggle feel).
                 int midx = TRACK_DEFS[cursor_track].melodic_idx;
                 uint8_t root = s.track_root_midi[cursor_track];
-                auto& notes = s.melodic_notes[midx];
+                auto& notes = s.patterns[0]->melodic_notes[midx];
                 bool removed = false;
                 for (auto it = notes.begin(); it != notes.end(); ++it) {
                     if (it->start_step == cursor_step && it->pitch_midi == root) {
