@@ -1,5 +1,6 @@
 #include "session.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -51,10 +52,27 @@ std::shared_ptr<SessionState> make_solo_session_state() {
     static const bool snare_row[STEPS] = {0,0,1,0,0,0,1,0,0,0,1,0,0,0,1,0};
     static const bool chat_row[STEPS]  = {1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0};
     Pattern& p = *s->patterns[0];
-    for (int i = 0; i < STEPS; ++i) p.drum_grid[DK_KICK][i].store(kick_row[i]);
-    for (int i = 0; i < STEPS; ++i) p.drum_grid[DK_SNARE][i].store(snare_row[i]);
-    for (int i = 0; i < STEPS; ++i) p.drum_grid[DK_CLOSED_HAT][i].store(chat_row[i]);
+    // Phase 2: default groove lives in bar 0 of the 1-bar pattern.
+    for (int i = 0; i < STEPS; ++i) p.drum_grid[DK_KICK][0][i].store(kick_row[i]);
+    for (int i = 0; i < STEPS; ++i) p.drum_grid[DK_SNARE][0][i].store(snare_row[i]);
+    for (int i = 0; i < STEPS; ++i) p.drum_grid[DK_CLOSED_HAT][0][i].store(chat_row[i]);
     return s;
+}
+
+void extend_pattern_length(SessionState& s, int n) {
+    if (n <= 0) return;
+    if (s.patterns.empty()) return;
+    Pattern& p = *s.patterns[0];
+    int new_len = std::min<int>(MAX_BARS_PER_PATTERN, p.length_bars + n);
+    p.length_bars = static_cast<uint8_t>(new_len);
+}
+
+void shrink_pattern_length(SessionState& s, int n) {
+    if (n <= 0) return;
+    if (s.patterns.empty()) return;
+    Pattern& p = *s.patterns[0];
+    int new_len = std::max<int>(1, p.length_bars - n);
+    p.length_bars = static_cast<uint8_t>(new_len);
 }
 
 void record_input(SessionState& s, int track, uint8_t pitch_midi) {
@@ -63,21 +81,25 @@ void record_input(SessionState& s, int track, uint8_t pitch_midi) {
     if (s.patterns.empty()) return;
     Pattern& pat = *s.patterns[0];
     int target_step = s.play_step.load() % s.loop_len;
+    int target_bar  = std::clamp<int>(s.play_bar.load(), 0,
+                                      pat.length_bars - 1);
     const TrackDef& td = TRACK_DEFS[track];
     if (td.type == TrackType::DRUM) {
-        pat.drum_grid[td.drum_kind][target_step] = true;
+        pat.drum_grid[td.drum_kind][target_bar][target_step] = true;
         s.dirty[track].fetch_or(static_cast<uint16_t>(1) << target_step);
         return;
     }
     int midx = td.melodic_idx;
     auto& notes = pat.melodic_notes[midx];
     for (const Note& existing : notes) {
-        if (existing.start_step == target_step
+        if (existing.bar == target_bar
+            && existing.start_step == target_step
             && existing.pitch_midi == pitch_midi) {
-            return;  // same-step same-pitch dedup
+            return;  // same-bar same-step same-pitch dedup
         }
     }
-    Note n{ static_cast<uint8_t>(target_step), 1, pitch_midi, 127 };
+    Note n{ static_cast<uint8_t>(target_bar),
+            static_cast<uint8_t>(target_step), 1, pitch_midi, 127 };
     if (!add_note(notes, n)) return;  // 64-cap silent drop
     s.melodic_dirty[midx].store(true);
 }
@@ -193,10 +215,24 @@ void timing_thread(SessionState& s) {
             continue;
         }
 
+        Pattern* pat = s.patterns.empty() ? nullptr : s.patterns[0].get();
+        int len_bars = pat ? std::max<int>(1, pat->length_bars) : 1;
         int step = s.play_step.load();
+        int bar  = s.play_bar.load();
         if (!first_iter_after_pause) {
-            step = (step + 1) % s.loop_len;
+            step = step + 1;
+            if (step >= s.loop_len) {
+                step = 0;
+                bar = (bar + 1) % len_bars;
+                s.play_bar.store(bar);
+            }
             s.play_step.store(step);
+        } else {
+            // On first iteration after pause, ensure play_bar is in-range.
+            if (bar >= len_bars) {
+                bar = 0;
+                s.play_bar.store(bar);
+            }
         }
         first_iter_after_pause = false;
 
@@ -205,14 +241,13 @@ void timing_thread(SessionState& s) {
         bool any_solo = false;
         for (int t = 0; t < TRACKS; ++t) if (s.track_solo[t]) { any_solo = true; break; }
 
-        Pattern* pat = s.patterns.empty() ? nullptr : s.patterns[0].get();
         for (int t = 0; t < TRACKS; ++t) {
             if (s.track_muted[t]) continue;
             if (any_solo && !s.track_solo[t]) continue;
             if (!pat) continue;
             const TrackDef& td = TRACK_DEFS[t];
             if (td.type == TrackType::DRUM) {
-                if (pat->drum_grid[td.drum_kind][step]) s.trig[t].store(true);
+                if (pat->drum_grid[td.drum_kind][bar][step]) s.trig[t].store(true);
             } else {
                 // Fire onsets only — sustain is handled by the synth voice
                 // envelope. Multiple onsets on the same step (polyphony) all
@@ -228,7 +263,7 @@ void timing_thread(SessionState& s) {
                 size_t n_count = notes.size();
                 for (size_t i = 0; i < n_count; ++i) {
                     const Note& n = notes[i];
-                    if (n.start_step == step) {
+                    if (n.bar == bar && n.start_step == step) {
                         enqueue_synth_trig(td.melodic_idx, midi_to_hz(n.pitch_midi));
                     }
                 }

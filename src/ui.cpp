@@ -261,9 +261,13 @@ static Element render_grid_view(SessionState& s) {
 
     // header
     {
-        char head_buf[80];
-        std::snprintf(head_buf, sizeof(head_buf), "  bpm: %d  steps: %d  %s",
-                      s.bpm, s.loop_len, is_playing ? "▶" : "■");
+        int len_bars = s.patterns.empty() ? 1 : s.patterns[0]->length_bars;
+        int cur_bar  = s.edit_bar.load();
+        char head_buf[100];
+        std::snprintf(head_buf, sizeof(head_buf),
+                      "  bpm: %d  steps: %d  bar %d/%d  %s",
+                      s.bpm, s.loop_len, cur_bar + 1, len_bars,
+                      is_playing ? "▶" : "■");
 
         Elements header = {
             text("bitjams") | bold | color(COL_PURPLE),
@@ -354,7 +358,7 @@ static Element render_grid_view(SessionState& s) {
         if (td.type == TrackType::DRUM) {
             int dk = td.drum_kind;
             for (int step = 0; step < STEPS; ++step) {
-                bool active = s.patterns[0]->drum_grid[dk][step];
+                bool active = s.patterns[0]->drum_grid[dk][s.edit_bar.load()][step];
                 bool in_loop = (step < s.loop_len);
                 // seq_mode is a GRID sub-mode only.
                 bool highlighted = show_cursor
@@ -367,7 +371,7 @@ static Element render_grid_view(SessionState& s) {
             }
         } else {
             const auto& notes = s.patterns[0]->melodic_notes[td.melodic_idx];
-            auto proj = project_row(notes, s.loop_len);
+            auto proj = project_row(notes, s.loop_len, s.edit_bar.load());
             for (int step = 0; step < STEPS; ++step) {
                 bool in_loop = (step < s.loop_len);
                 bool highlighted = show_cursor
@@ -664,7 +668,8 @@ static int kbd_resolve_active_index(SessionState& s) {
 static int kbd_place_note(SessionState& s, uint8_t pitch_midi) {
     if (TRACK_DEFS[cursor_track].type != TrackType::MELODIC) return -1;
     int midx = TRACK_DEFS[cursor_track].melodic_idx;
-    Note n{ static_cast<uint8_t>(cursor_step), 1, pitch_midi, 127 };
+    Note n{ static_cast<uint8_t>(s.edit_bar.load()),
+            static_cast<uint8_t>(cursor_step), 1, pitch_midi, 127 };
     if (!add_note(s.patterns[0]->melodic_notes[midx], n)) return -1;
     kbd_mark_dirty(s, midx);
     return static_cast<int>(s.patterns[0]->melodic_notes[midx].size() - 1);
@@ -711,8 +716,10 @@ static int pr_place_note_at_cursor(SessionState& s, uint8_t duration_steps) {
     uint8_t pitch = pr_cursor_pitch();
     // Apply same-row collision rule before adding.
     clear_or_truncate_at(s.patterns[0]->melodic_notes[midx], pitch,
-                         static_cast<uint8_t>(piano_cursor_step));
-    Note n{ static_cast<uint8_t>(piano_cursor_step), duration_steps, pitch, 127 };
+                         static_cast<uint8_t>(piano_cursor_step),
+                         static_cast<uint8_t>(s.edit_bar.load()));
+    Note n{ static_cast<uint8_t>(s.edit_bar.load()),
+            static_cast<uint8_t>(piano_cursor_step), duration_steps, pitch, 127 };
     if (!add_note(s.patterns[0]->melodic_notes[midx], n)) return -1;
     s.melodic_dirty[midx].store(true);
     return static_cast<int>(s.patterns[0]->melodic_notes[midx].size() - 1);
@@ -1085,7 +1092,7 @@ static void fill_pattern(SessionState& s, int interval, int start) {
         int dk = TRACK_DEFS[cursor_track].drum_kind;
         uint16_t fill_mask = 0;
         for (int step = start; step < s.loop_len; step += interval) {
-            s.patterns[0]->drum_grid[dk][step] = true;
+            s.patterns[0]->drum_grid[dk][s.edit_bar.load()][step] = true;
             fill_mask |= static_cast<uint16_t>(1) << step;
         }
         s.dirty[cursor_track].fetch_or(fill_mask, std::memory_order_relaxed);
@@ -1096,7 +1103,8 @@ static void fill_pattern(SessionState& s, int interval, int start) {
     auto& notes = s.patterns[0]->melodic_notes[midx];
     bool changed = false;
     for (int step = start; step < s.loop_len; step += interval) {
-        Note n{ static_cast<uint8_t>(step), 1, root, 127 };
+        Note n{ static_cast<uint8_t>(s.edit_bar.load()),
+                static_cast<uint8_t>(step), 1, root, 127 };
         if (add_note(notes, n)) changed = true;
     }
     if (changed) s.melodic_dirty[midx].store(true);
@@ -1117,7 +1125,7 @@ static std::vector<Note> clip_notes;
 static void copy_cursor_track(SessionState& s) {
     if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
         int dk = TRACK_DEFS[cursor_track].drum_kind;
-        for (int st = 0; st < STEPS; ++st) clip_drum[st] = s.patterns[0]->drum_grid[dk][st];
+        for (int st = 0; st < STEPS; ++st) clip_drum[st] = s.patterns[0]->drum_grid[dk][s.edit_bar.load()][st];
         clip_notes.clear();
         clip_kind = 0;
     } else {
@@ -1133,12 +1141,12 @@ static void paste_to_cursor_track(SessionState& s) {
     if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
         int dk = TRACK_DEFS[cursor_track].drum_kind;
         if (clip_kind == 0) {
-            for (int st = 0; st < STEPS; ++st) s.patterns[0]->drum_grid[dk][st] = clip_drum[st];
+            for (int st = 0; st < STEPS; ++st) s.patterns[0]->drum_grid[dk][s.edit_bar.load()][st] = clip_drum[st];
         } else {
             // melodic -> drum: hit on every note start_step.
-            for (int st = 0; st < STEPS; ++st) s.patterns[0]->drum_grid[dk][st] = false;
+            for (int st = 0; st < STEPS; ++st) s.patterns[0]->drum_grid[dk][s.edit_bar.load()][st] = false;
             for (const Note& n : clip_notes) {
-                if (n.start_step < STEPS) s.patterns[0]->drum_grid[dk][n.start_step] = true;
+                if (n.start_step < STEPS) s.patterns[0]->drum_grid[dk][s.edit_bar.load()][n.start_step] = true;
             }
         }
         s.dirty[cursor_track].fetch_or(0xFFFFu, std::memory_order_relaxed);
@@ -1151,7 +1159,8 @@ static void paste_to_cursor_track(SessionState& s) {
             // drum -> melodic: 1-step note at root pitch for every hit.
             for (int st = 0; st < STEPS; ++st) {
                 if (!clip_drum[st]) continue;
-                Note n{ static_cast<uint8_t>(st), 1, root, 127 };
+                Note n{ static_cast<uint8_t>(s.edit_bar.load()),
+                        static_cast<uint8_t>(st), 1, root, 127 };
                 add_note(notes, n);
             }
         } else {
@@ -1167,8 +1176,8 @@ static void paste_to_cursor_track(SessionState& s) {
 static void delete_at_cursor_cell(SessionState& s) {
     if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
         int dk = TRACK_DEFS[cursor_track].drum_kind;
-        if (!s.patterns[0]->drum_grid[dk][cursor_step]) return;
-        s.patterns[0]->drum_grid[dk][cursor_step] = false;
+        if (!s.patterns[0]->drum_grid[dk][s.edit_bar.load()][cursor_step]) return;
+        s.patterns[0]->drum_grid[dk][s.edit_bar.load()][cursor_step] = false;
         s.dirty[cursor_track].fetch_or(static_cast<uint16_t>(1) << cursor_step,
                                        std::memory_order_relaxed);
         return;
@@ -1237,7 +1246,7 @@ static bool handle_shared_track_command(SessionState& s, Event e) {
         auto now = clk::now();
         if (now - last_A <= CLEAR_ALL_WINDOW) {
             for (int k = 0; k < DRUM_KINDS; ++k)
-                for (int st = 0; st < STEPS; ++st) s.patterns[0]->drum_grid[k][st].store(false);
+                for (int st = 0; st < STEPS; ++st) s.patterns[0]->drum_grid[k][s.edit_bar.load()][st].store(false);
             for (int m = 0; m < MELODIC_VOICES; ++m) s.patterns[0]->melodic_notes[m].clear();
             for (int t = 0; t < TRACKS; ++t) s.dirty[t].fetch_or(0xFFFFu);
             for (int m = 0; m < MELODIC_VOICES; ++m) s.melodic_dirty[m].store(true);
@@ -1246,7 +1255,7 @@ static bool handle_shared_track_command(SessionState& s, Event e) {
         }
         if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
             int dk = TRACK_DEFS[cursor_track].drum_kind;
-            for (int st = 0; st < STEPS; ++st) s.patterns[0]->drum_grid[dk][st].store(false);
+            for (int st = 0; st < STEPS; ++st) s.patterns[0]->drum_grid[dk][s.edit_bar.load()][st].store(false);
             s.dirty[cursor_track].fetch_or(0xFFFFu, std::memory_order_relaxed);
         } else {
             int midx = TRACK_DEFS[cursor_track].melodic_idx;
@@ -1313,7 +1322,7 @@ static bool dispatch_grid(SessionState& s, Event e) {
                 int step = window_start + (c - '1');
                 if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
                     int dk = TRACK_DEFS[cursor_track].drum_kind;
-                    s.patterns[0]->drum_grid[dk][step] = !s.patterns[0]->drum_grid[dk][step];
+                    s.patterns[0]->drum_grid[dk][s.edit_bar.load()][step] = !s.patterns[0]->drum_grid[dk][s.edit_bar.load()][step];
                     s.dirty[cursor_track].fetch_or(1u << step, std::memory_order_relaxed);
                 }
                 return true;
@@ -1329,7 +1338,7 @@ static bool dispatch_grid(SessionState& s, Event e) {
         if (e == Event::Character(' ')) {
             if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
                 int dk = TRACK_DEFS[cursor_track].drum_kind;
-                s.patterns[0]->drum_grid[dk][cursor_step] = !s.patterns[0]->drum_grid[dk][cursor_step];
+                s.patterns[0]->drum_grid[dk][s.edit_bar.load()][cursor_step] = !s.patterns[0]->drum_grid[dk][s.edit_bar.load()][cursor_step];
                 s.dirty[cursor_track].fetch_or(1u << cursor_step, std::memory_order_relaxed);
             } else {
                 // Place a 1-step note at root pitch. If a note already starts
@@ -1338,13 +1347,17 @@ static bool dispatch_grid(SessionState& s, Event e) {
                 uint8_t root = s.track_root_midi[cursor_track];
                 auto& notes = s.patterns[0]->melodic_notes[midx];
                 bool removed = false;
+                int cur_bar = s.edit_bar.load();
                 for (auto it = notes.begin(); it != notes.end(); ++it) {
-                    if (it->start_step == cursor_step && it->pitch_midi == root) {
+                    if (it->bar == cur_bar
+                        && it->start_step == cursor_step
+                        && it->pitch_midi == root) {
                         notes.erase(it); removed = true; break;
                     }
                 }
                 if (!removed) {
-                    Note n{ static_cast<uint8_t>(cursor_step), 1, root, 127 };
+                    Note n{ static_cast<uint8_t>(cur_bar),
+                            static_cast<uint8_t>(cursor_step), 1, root, 127 };
                     add_note(notes, n);
                 }
                 s.melodic_dirty[midx].store(true);
@@ -1415,11 +1428,39 @@ Component build_session_ui(ScreenInteractive& screen, SessionState& state) {
             state.bpm_dirty.store(true, std::memory_order_relaxed);
             return true;
         }
+        // Phase 2: ']' extends the current edit pattern by one bar (capped
+        // at MAX_BARS_PER_PATTERN); '[' shrinks by one bar (min 1). Both
+        // are non-destructive — shrunken bars retain their data.
         if (e == Event::Character(']')) {
-            state.loop_len = std::min(16, state.loop_len + 1); return true;
+            extend_pattern_length(state, 1); return true;
         }
         if (e == Event::Character('[')) {
-            state.loop_len = std::max(1, state.loop_len - 1); return true;
+            shrink_pattern_length(state, 1);
+            // Clamp edit_bar / play_bar into the new range.
+            if (!state.patterns.empty()) {
+                int len = state.patterns[0]->length_bars;
+                if (state.edit_bar.load() >= len) state.edit_bar.store(len - 1);
+                if (state.play_bar.load() >= len) state.play_bar.store(0);
+            }
+            return true;
+        }
+        // Phase 2: Cmd+← / Cmd+→ paging. FTXUI delivers Cmd-arrows as the
+        // special events ArrowLeftCtrl / ArrowRightCtrl on macOS — we treat
+        // those (and the home/end keys as fallback) as bar paging.
+        if (e == Event::ArrowLeftCtrl || e == Event::Home) {
+            int len = state.patterns.empty() ? 1
+                : std::max<uint8_t>(1, state.patterns[0]->length_bars);
+            int cur = state.edit_bar.load();
+            if (cur > 0) state.edit_bar.store(cur - 1);
+            (void)len;
+            return true;
+        }
+        if (e == Event::ArrowRightCtrl || e == Event::End) {
+            int len = state.patterns.empty() ? 1
+                : std::max<uint8_t>(1, state.patterns[0]->length_bars);
+            int cur = state.edit_bar.load();
+            if (cur < len - 1) state.edit_bar.store(cur + 1);
+            return true;
         }
 
         switch (nav_state) {

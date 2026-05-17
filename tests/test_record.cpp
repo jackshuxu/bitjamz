@@ -12,7 +12,7 @@ static void test_drum_record_writes_cell_and_dirty() {
 
     record_input(s, /*track=*/0, /*pitch=*/0);
 
-    assert(s.patterns[0]->drum_grid[DK_KICK][5] == true);
+    assert(s.patterns[0]->drum_grid[DK_KICK][0][5] == true);
     assert((s.dirty[0].load() & (1u << 5)) != 0);
     std::cout << "test_drum_record_writes_cell_and_dirty PASSED\n";
 }
@@ -25,7 +25,7 @@ static void test_record_input_noop_when_off() {
     record_input(s, /*track=*/0, /*pitch=*/0);
     record_input(s, /*track=*/8, /*pitch=*/60);  // melodic track (lead)
 
-    assert(s.patterns[0]->drum_grid[DK_KICK][5] == false);
+    assert(s.patterns[0]->drum_grid[DK_KICK][0][5] == false);
     assert(s.dirty[0].load() == 0);
     assert(s.patterns[0]->melodic_notes[0].empty());
     assert(s.melodic_dirty[0].load() == false);

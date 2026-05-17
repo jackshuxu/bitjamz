@@ -1,4 +1,5 @@
 build/
+build_dbg/
 .vscode/
 .DS_Store
 .cache/

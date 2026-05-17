@@ -11,10 +11,16 @@
 // Anything used by more than one module (audio, ui, net, main) lives here.
 // Per-module helpers live in that module's own .cpp as file-locals.
 
-inline constexpr int TRACKS         = 12;
-inline constexpr int STEPS          = 16;
-inline constexpr int MELODIC_VOICES = 4;
-inline constexpr int DRUM_KINDS     = 8;
+inline constexpr int TRACKS                = 12;
+inline constexpr int STEPS                 = 16;
+inline constexpr int MELODIC_VOICES        = 4;
+inline constexpr int DRUM_KINDS            = 8;
+
+// Phase 2: a Pattern may span up to MAX_BARS_PER_PATTERN bars. The drum_grid
+// is dimensioned [DRUM_KINDS][MAX_BARS][STEPS] so shrinking a pattern is
+// non-destructive — cells past length_bars are hidden during render and
+// playback but retained in storage. Extending re-exposes them.
+inline constexpr int MAX_BARS_PER_PATTERN  = 4;
 
 enum class TrackType { DRUM, MELODIC };
 
@@ -28,13 +34,15 @@ enum class RecordState { OFF, COUNTDOWN, RECORDING };
 // 64-cap keeps packets small and matches the UI's "1-bar" mental model.
 inline constexpr int MAX_NOTES_PER_MELODIC = 64;
 
-// One note in a melodic track. start_step + duration_steps may exceed
-// loop_len; the audio side only fires the onset.
+// One note in a melodic track. start_step + duration_steps may exceed the
+// bar's step count; the audio side only fires the onset and tail-clips at
+// bar boundary. `bar` is the 0-indexed bar this note lives in (Phase 2+).
 struct Note {
-    uint8_t start_step;
-    uint8_t duration_steps;
-    uint8_t pitch_midi;
-    uint8_t velocity;
+    uint8_t bar = 0;
+    uint8_t start_step = 0;
+    uint8_t duration_steps = 0;
+    uint8_t pitch_midi = 0;
+    uint8_t velocity = 0;
 };
 
 inline float midi_to_hz(uint8_t m) {
@@ -49,15 +57,21 @@ inline bool add_note(std::vector<Note>& notes, const Note& n) {
     return true;
 }
 
-// Same-row collision rule applied before placing a new note at (at_step) on
-// pitch (pitch_midi). For each existing note on the same pitch row whose
-// span [A, A+D) contains at_step:
+// Same-row collision rule applied before placing a new note at (bar, at_step)
+// on pitch (pitch_midi). For each existing note in the same bar on the same
+// pitch row whose span [A, A+D) contains at_step:
 //   A == at_step -> deleted
 //   A <  at_step -> duration shrunk to (at_step - A)
+//
+// Notes on other bars are unaffected. The `at_bar` parameter is Phase 2+.
+// Callers that don't yet care about bars pass 0.
 inline void clear_or_truncate_at(std::vector<Note>& notes,
-                                 uint8_t pitch_midi, uint8_t at_step) {
+                                 uint8_t pitch_midi, uint8_t at_step,
+                                 uint8_t at_bar = 0) {
     for (auto it = notes.begin(); it != notes.end();) {
-        if (it->pitch_midi != pitch_midi) { ++it; continue; }
+        if (it->pitch_midi != pitch_midi || it->bar != at_bar) {
+            ++it; continue;
+        }
         int a = it->start_step;
         int b = a + it->duration_steps - 1;
         if (a <= static_cast<int>(at_step) && static_cast<int>(at_step) <= b) {
@@ -81,9 +95,10 @@ struct ProjectedCell {
 // Walk a melodic track's notes and produce per-cell display info under the
 // "starters win (lowest-pitch tiebreak); continuation cells pick the
 // most-recently-started still-sustaining (lowest-pitch tiebreak)" stack
-// rule. Cells past loop_len are returned as { -1, false, false }.
+// rule. Cells past loop_len are returned as { -1, false, false }. Notes
+// whose `bar` field doesn't match `at_bar` are skipped.
 inline std::array<ProjectedCell, STEPS> project_row(
-    const std::vector<Note>& notes, int loop_len) {
+    const std::vector<Note>& notes, int loop_len, int at_bar = 0) {
     std::array<ProjectedCell, STEPS> out{};
     for (auto& c : out) c = { -1, false, false };
 
@@ -93,6 +108,7 @@ inline std::array<ProjectedCell, STEPS> project_row(
         // First pass: starters on this cell.
         for (size_t i = 0; i < notes.size(); ++i) {
             const Note& n = notes[i];
+            if (n.bar != at_bar) continue;
             if (n.start_step != c) continue;
             int end = n.start_step + n.duration_steps;
             if (c >= end) continue;
@@ -104,6 +120,7 @@ inline std::array<ProjectedCell, STEPS> project_row(
         if (best < 0) {
             for (size_t i = 0; i < notes.size(); ++i) {
                 const Note& n = notes[i];
+                if (n.bar != at_bar) continue;
                 int end = n.start_step + n.duration_steps;
                 if (c < n.start_step || c >= end) continue;
                 if (best < 0) { best = static_cast<int>(i); continue; }
@@ -141,11 +158,15 @@ enum DrumKind {
 // 8 drum tracks and 4 melodic voices. Held by SessionState as a
 // std::unique_ptr because the atomic drum cells and mutex are non-movable.
 //
-// Phase 1: a single Pattern with id=1 sits on every SessionState; multi-bar,
-// time-sig, and multi-pattern support arrive in later phases.
+// Phase 2: a Pattern carries length_bars (1..MAX_BARS_PER_PATTERN) and the
+// drum_grid is indexed [drum_kind][bar][step]. Cells past length_bars are
+// not rendered or fired but retained on shrink so widening restores them.
+// Melodic notes carry an explicit `bar`; notes outside [0..length_bars) are
+// hidden / unfired but kept in storage.
 struct Pattern {
     uint16_t id = 1;
-    std::atomic<bool> drum_grid[DRUM_KINDS][STEPS] = {};
+    uint8_t  length_bars = 1;
+    std::atomic<bool> drum_grid[DRUM_KINDS][MAX_BARS_PER_PATTERN][STEPS] = {};
     std::vector<Note> melodic_notes[MELODIC_VOICES];
     mutable std::mutex melodic_mutex;
 
@@ -234,6 +255,12 @@ public:
     // --- per-peer runtime (not synced) ---
     int               loop_len = STEPS;
     std::atomic<int>  play_step{0};
+    // Phase 2: the bar of the current pattern that's playing (0..length_bars-1).
+    // Solo-mode and single-pattern sessions wrap this at length_bars.
+    std::atomic<int>  play_bar{0};
+    // Phase 2: which bar of the current pattern the sequencer view shows.
+    // Multi-bar patterns are read one page (bar) at a time.
+    std::atomic<int>  edit_bar{0};
     std::atomic<bool> running{true};
     std::atomic<bool> playing{true};
 
@@ -322,6 +349,17 @@ void timing_thread(SessionState& s);
 //                     bounded by the 64-note cap
 // `pitch_midi` is unused for drum tracks.
 void record_input(SessionState& s, int track, uint8_t pitch_midi);
+
+// Phase 2: extend the current edit pattern's length by `n` bars. Caps at
+// MAX_BARS_PER_PATTERN. Non-destructive: existing cells/notes past the old
+// end are kept in storage; they were just hidden. No-op if n <= 0 or
+// already at the cap.
+void extend_pattern_length(SessionState& s, int n);
+
+// Phase 2: shrink the current edit pattern's length by `n` bars. Floors at 1.
+// Non-destructive: cells/notes in the trimmed-off bars are hidden but
+// retained, so a later extend restores them.
+void shrink_pattern_length(SessionState& s, int n);
 
 // Drive the record state machine on a `q` keypress.
 //   OFF (playing)  → RECORDING : no transport changes

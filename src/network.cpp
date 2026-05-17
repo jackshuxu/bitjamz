@@ -81,7 +81,7 @@ bool send_msg_state(int sock, const SessionState& s) {
     for (int k = 0; k < DRUM_KINDS; ++k) {
         uint16_t mask = 0;
         for (int st = 0; st < STEPS; ++st) {
-            if (s.patterns[0]->drum_grid[k][st]) mask |= static_cast<uint16_t>(1) << st;
+            if (s.patterns[0]->drum_grid[k][0][st]) mask |= static_cast<uint16_t>(1) << st;
         }
         uint16_t mn = htons(mask);
         std::memcpy(p, &mn, 2); p += 2;
@@ -121,7 +121,7 @@ bool recv_and_apply_msg_state(int sock, SessionState& s) {
         if (!recv_all(sock, &mn, 2)) return false;
         uint16_t mask = ntohs(mn);
         for (int st = 0; st < STEPS; ++st) {
-            s.patterns[0]->drum_grid[k][st] = (mask & (static_cast<uint16_t>(1) << st)) != 0;
+            s.patterns[0]->drum_grid[k][0][st] = (mask & (static_cast<uint16_t>(1) << st)) != 0;
         }
     }
 
@@ -173,7 +173,7 @@ size_t build_msg_edit(SessionState& s, uint8_t* buf, size_t buf_cap) {
             int step = bitjams_ctz(bits);
             *p++ = static_cast<uint8_t>(t);
             *p++ = static_cast<uint8_t>(step);
-            *p++ = s.patterns[0]->drum_grid[dk][step] ? 1 : 0;
+            *p++ = s.patterns[0]->drum_grid[dk][0][step] ? 1 : 0;
             ++cell_count;
             bits &= bits - 1;
         }
@@ -211,13 +211,13 @@ bool recv_and_apply_msg_edit(int sock, SessionState& s, bool is_joiner) {
         if (is_joiner) {
             if (s.dirty[t].load() & bit) continue;
             if (s.in_flight[t].load() & bit) {
-                s.patterns[0]->drum_grid[dk][step] = (v != 0);
+                s.patterns[0]->drum_grid[dk][0][step] = (v != 0);
                 s.in_flight[t].fetch_and(static_cast<uint16_t>(~bit));
                 continue;
             }
-            s.patterns[0]->drum_grid[dk][step] = (v != 0);
+            s.patterns[0]->drum_grid[dk][0][step] = (v != 0);
         } else {
-            s.patterns[0]->drum_grid[dk][step] = (v != 0);
+            s.patterns[0]->drum_grid[dk][0][step] = (v != 0);
             s.dirty[t].fetch_or(bit);
         }
     }
@@ -282,7 +282,15 @@ bool recv_and_apply_msg_melodic_track(int sock, SessionState& s, bool is_joiner)
     for (uint8_t i = 0; i < count; ++i) {
         uint8_t four[4];
         if (!recv_all(sock, four, 4)) return false;
-        incoming.push_back({four[0], four[1], four[2], four[3]});
+        // Wire format is still 4-byte (start, dur, pitch, vel); bar is
+        // implicit at 0 until Phase 5 widens the schema.
+        Note n{};
+        n.bar            = 0;
+        n.start_step     = four[0];
+        n.duration_steps = four[1];
+        n.pitch_midi     = four[2];
+        n.velocity       = four[3];
+        incoming.push_back(n);
     }
 
     if (track_id >= TRACKS) return true;
