@@ -75,12 +75,25 @@ void shrink_pattern_length(SessionState& s, int n) {
     p.length_bars = static_cast<uint8_t>(new_len);
 }
 
+void inc_pattern_time_sig(SessionState& s) {
+    if (s.patterns.empty()) return;
+    Pattern& p = *s.patterns[0];
+    p.time_sig_num = static_cast<uint8_t>(std::min<int>(8, p.time_sig_num + 1));
+}
+
+void dec_pattern_time_sig(SessionState& s) {
+    if (s.patterns.empty()) return;
+    Pattern& p = *s.patterns[0];
+    p.time_sig_num = static_cast<uint8_t>(std::max<int>(1, p.time_sig_num - 1));
+}
+
 void record_input(SessionState& s, int track, uint8_t pitch_midi) {
     if (s.rec_state.load() != RecordState::RECORDING) return;
     if (track < 0 || track >= TRACKS) return;
     if (s.patterns.empty()) return;
     Pattern& pat = *s.patterns[0];
-    int target_step = s.play_step.load() % s.loop_len;
+    int spb = steps_per_bar(pat.time_sig_num);
+    int target_step = s.play_step.load() % spb;
     int target_bar  = std::clamp<int>(s.play_bar.load(), 0,
                                       pat.length_bars - 1);
     const TrackDef& td = TRACK_DEFS[track];
@@ -217,22 +230,24 @@ void timing_thread(SessionState& s) {
 
         Pattern* pat = s.patterns.empty() ? nullptr : s.patterns[0].get();
         int len_bars = pat ? std::max<int>(1, pat->length_bars) : 1;
+        // Phase 3: bar length is derived from the pattern's time signature,
+        // not the per-peer loop_len (which is being phased out).
+        int spb = pat ? steps_per_bar(pat->time_sig_num)
+                      : steps_per_bar(4);
         int step = s.play_step.load();
         int bar  = s.play_bar.load();
         if (!first_iter_after_pause) {
             step = step + 1;
-            if (step >= s.loop_len) {
+            if (step >= spb) {
                 step = 0;
                 bar = (bar + 1) % len_bars;
                 s.play_bar.store(bar);
             }
             s.play_step.store(step);
         } else {
-            // On first iteration after pause, ensure play_bar is in-range.
-            if (bar >= len_bars) {
-                bar = 0;
-                s.play_bar.store(bar);
-            }
+            // On first iteration after pause, ensure play_bar/step in-range.
+            if (bar >= len_bars) { bar = 0; s.play_bar.store(bar); }
+            if (step >= spb)     { step = 0; s.play_step.store(step); }
         }
         first_iter_after_pause = false;
 

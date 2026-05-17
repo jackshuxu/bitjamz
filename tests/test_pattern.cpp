@@ -187,6 +187,60 @@ static void test_record_input_melodic_writes_bar() {
     std::cout << "test_record_input_melodic_writes_bar PASSED\n";
 }
 
+// --- Phase 3: time signatures ----------------------------------------------
+
+static void test_pattern_default_time_sig_4_4() {
+    SessionState s;
+    assert(s.patterns[0]->time_sig_num == 4);
+    std::cout << "test_pattern_default_time_sig_4_4 PASSED\n";
+}
+
+static void test_steps_per_bar_formula() {
+    assert(steps_per_bar(1) == 4);
+    assert(steps_per_bar(3) == 12);
+    assert(steps_per_bar(4) == 16);
+    assert(steps_per_bar(5) == 20);
+    assert(steps_per_bar(8) == 32);
+    std::cout << "test_steps_per_bar_formula PASSED\n";
+}
+
+static void test_inc_dec_time_sig() {
+    SessionState s;
+    inc_pattern_time_sig(s);
+    assert(s.patterns[0]->time_sig_num == 5);
+    inc_pattern_time_sig(s);
+    inc_pattern_time_sig(s);
+    inc_pattern_time_sig(s);
+    assert(s.patterns[0]->time_sig_num == 8);
+    // Cap at 8.
+    inc_pattern_time_sig(s);
+    assert(s.patterns[0]->time_sig_num == 8);
+    // Decrement.
+    dec_pattern_time_sig(s);
+    assert(s.patterns[0]->time_sig_num == 7);
+    // Floor at 1.
+    for (int i = 0; i < 20; ++i) dec_pattern_time_sig(s);
+    assert(s.patterns[0]->time_sig_num == 1);
+    std::cout << "test_inc_dec_time_sig PASSED\n";
+}
+
+static void test_time_sig_change_non_destructive() {
+    // Place a cell at step 18 (only visible in 5/4 or wider). Switch to 4/4
+    // (16 steps/bar) — the cell stays in storage but isn't fired.
+    SessionState s;
+    Pattern& p = *s.patterns[0];
+    p.time_sig_num = 8;  // 32 steps/bar
+    p.drum_grid[DK_SNARE][0][18].store(true);
+
+    p.time_sig_num = 4;
+    // Storage retained.
+    assert(p.drum_grid[DK_SNARE][0][18].load() == true);
+    // Widening restores visibility (data was already there).
+    p.time_sig_num = 8;
+    assert(p.drum_grid[DK_SNARE][0][18].load() == true);
+    std::cout << "test_time_sig_change_non_destructive PASSED\n";
+}
+
 int main() {
     test_session_has_one_pattern_id_1();
     test_pattern_default_drum_grid_all_false();
@@ -203,6 +257,11 @@ int main() {
     test_shrink_pattern_min_one_bar();
     test_record_input_drum_writes_to_current_bar();
     test_record_input_melodic_writes_bar();
+    // Phase 3
+    test_pattern_default_time_sig_4_4();
+    test_steps_per_bar_formula();
+    test_inc_dec_time_sig();
+    test_time_sig_change_non_destructive();
     std::cout << "All pattern tests passed.\n";
     return 0;
 }

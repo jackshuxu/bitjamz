@@ -262,11 +262,12 @@ static Element render_grid_view(SessionState& s) {
     // header
     {
         int len_bars = s.patterns.empty() ? 1 : s.patterns[0]->length_bars;
+        int tsn      = s.patterns.empty() ? 4 : s.patterns[0]->time_sig_num;
         int cur_bar  = s.edit_bar.load();
-        char head_buf[100];
+        char head_buf[120];
         std::snprintf(head_buf, sizeof(head_buf),
-                      "  bpm: %d  steps: %d  bar %d/%d  %s",
-                      s.bpm, s.loop_len, cur_bar + 1, len_bars,
+                      "  bpm: %d  %d/4  bar %d/%d  %s",
+                      s.bpm, tsn, cur_bar + 1, len_bars,
                       is_playing ? "▶" : "■");
 
         Elements header = {
@@ -308,12 +309,21 @@ static Element render_grid_view(SessionState& s) {
         lines.push_back(hbox(std::move(header)));
     }
 
+    // Phase 3: derive visible step count from the current pattern's time-sig.
+    int spb = s.patterns.empty() ? STEPS
+            : steps_per_bar(s.patterns[0]->time_sig_num);
+
     // step numbers — prefix is TITLE_COL_WIDTH + 1 to match the title+spacer
     // layout of each track row, so step labels align with the playhead glyph.
+    // Phase 3: bold every other beat group (beats 2, 4, 6...) to anchor the
+    // beat grid visually regardless of time signature.
+    auto beat_is_bold = [](int step) {
+        return ((step / STEPS_PER_BEAT) % 2) == 1;
+    };
     {
         Elements row;
         row.push_back(text(std::string(TITLE_COL_WIDTH + 1, ' ')));
-        for (int step = 0; step < STEPS; ++step) {
+        for (int step = 0; step < spb; ++step) {
             char buf[8];
             if (step < s.loop_len) {
                 std::snprintf(buf, sizeof(buf),
@@ -321,7 +331,9 @@ static Element render_grid_view(SessionState& s) {
             } else {
                 std::snprintf(buf, sizeof(buf), "%s", narrow ? "   " : "     ");
             }
-            row.push_back(text(buf) | color(COL_BRIGHT));
+            Element e = text(buf) | color(COL_BRIGHT);
+            if (beat_is_bold(step)) e = e | bold;
+            row.push_back(e);
         }
         lines.push_back(hbox(std::move(row)));
     }
@@ -330,7 +342,7 @@ static Element render_grid_view(SessionState& s) {
     {
         Elements row;
         row.push_back(text(std::string(TITLE_COL_WIDTH + 1, ' ')));
-        for (int step = 0; step < STEPS; ++step) {
+        for (int step = 0; step < spb; ++step) {
             const char* glyph;
             if (step == ps && is_playing) glyph = narrow ? " ▼ " : "  ▼  ";
             else                          glyph = narrow ? "   " : "     ";
@@ -357,42 +369,47 @@ static Element render_grid_view(SessionState& s) {
 
         if (td.type == TrackType::DRUM) {
             int dk = td.drum_kind;
-            for (int step = 0; step < STEPS; ++step) {
+            for (int step = 0; step < spb; ++step) {
                 bool active = s.patterns[0]->drum_grid[dk][s.edit_bar.load()][step];
-                bool in_loop = (step < s.loop_len);
+                bool in_loop = (step < spb);
                 // seq_mode is a GRID sub-mode only.
                 bool highlighted = show_cursor
                                 && is_cursor_track
                                 && (seq_mode && nav_state == NavState::GRID
                                     ? (step >= window_start && step < window_start + 8)
                                     : (step == cursor_step));
-                row.push_back(draw_drum_cell(active, highlighted, in_loop,
-                                             step == ps, is_playing, narrow));
+                Element cell = draw_drum_cell(active, highlighted, in_loop,
+                                              step == ps, is_playing, narrow);
+                if (beat_is_bold(step)) cell = cell | bold;
+                row.push_back(cell);
             }
         } else {
             const auto& notes = s.patterns[0]->melodic_notes[td.melodic_idx];
-            auto proj = project_row(notes, s.loop_len, s.edit_bar.load());
-            for (int step = 0; step < STEPS; ++step) {
-                bool in_loop = (step < s.loop_len);
+            auto proj = project_row(notes, spb, s.edit_bar.load());
+            for (int step = 0; step < spb; ++step) {
+                bool in_loop = (step < spb);
                 bool highlighted = show_cursor
                                 && is_cursor_track
                                 && (step == cursor_step);
+                Element cell;
                 if (!in_loop || proj[step].note_idx < 0) {
-                    row.push_back(draw_melodic_cell(0, nullptr, false,
-                                                    highlighted, in_loop,
-                                                    step == ps, is_playing, narrow));
-                    continue;
+                    cell = draw_melodic_cell(0, nullptr, false,
+                                             highlighted, in_loop,
+                                             step == ps, is_playing, narrow);
+                } else {
+                    const Note& n = notes[proj[step].note_idx];
+                    bool single = (n.duration_steps == 1);
+                    int kind;
+                    if (proj[step].is_start && (single || proj[step].is_end)) kind = 1;
+                    else if (proj[step].is_start)                              kind = 1;
+                    else if (proj[step].is_end)                                kind = 3;
+                    else                                                       kind = 2;
+                    cell = draw_melodic_cell(kind, &n, single,
+                                             highlighted, in_loop,
+                                             step == ps, is_playing, narrow);
                 }
-                const Note& n = notes[proj[step].note_idx];
-                bool single = (n.duration_steps == 1);
-                int kind;
-                if (proj[step].is_start && (single || proj[step].is_end)) kind = 1;
-                else if (proj[step].is_start)                              kind = 1;
-                else if (proj[step].is_end)                                kind = 3;
-                else                                                       kind = 2;
-                row.push_back(draw_melodic_cell(kind, &n, single,
-                                                highlighted, in_loop,
-                                                step == ps, is_playing, narrow));
+                if (beat_is_bold(step)) cell = cell | bold;
+                row.push_back(cell);
             }
         }
 
@@ -1441,6 +1458,21 @@ Component build_session_ui(ScreenInteractive& screen, SessionState& state) {
                 int len = state.patterns[0]->length_bars;
                 if (state.edit_bar.load() >= len) state.edit_bar.store(len - 1);
                 if (state.play_bar.load() >= len) state.play_bar.store(0);
+            }
+            return true;
+        }
+        // Phase 3: '.' bumps the time-sig numerator (capped at 8), ','
+        // shrinks (floor 1). Non-destructive — cells past the new bar end
+        // are retained.
+        if (e == Event::Character('.')) {
+            inc_pattern_time_sig(state); return true;
+        }
+        if (e == Event::Character(',')) {
+            dec_pattern_time_sig(state);
+            if (!state.patterns.empty()) {
+                int spb = steps_per_bar(state.patterns[0]->time_sig_num);
+                if (state.play_step.load() >= spb) state.play_step.store(0);
+                if (state.loop_len > spb) state.loop_len = spb;
             }
             return true;
         }

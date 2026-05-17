@@ -12,15 +12,35 @@
 // Per-module helpers live in that module's own .cpp as file-locals.
 
 inline constexpr int TRACKS                = 12;
-inline constexpr int STEPS                 = 16;
 inline constexpr int MELODIC_VOICES        = 4;
 inline constexpr int DRUM_KINDS            = 8;
 
+// Phase 3: a beat is always 4 steps (16th-note resolution). The time-sig
+// numerator counts beats per bar; the denominator is fixed at /4. The worst
+// case is 8/4 = 32 steps/bar; the drum_grid is sized for that.
+inline constexpr int STEPS_PER_BEAT        = 4;
+inline constexpr int MAX_STEPS_PER_BAR     = 32;
+
 // Phase 2: a Pattern may span up to MAX_BARS_PER_PATTERN bars. The drum_grid
-// is dimensioned [DRUM_KINDS][MAX_BARS][STEPS] so shrinking a pattern is
-// non-destructive — cells past length_bars are hidden during render and
-// playback but retained in storage. Extending re-exposes them.
+// is dimensioned [DRUM_KINDS][MAX_BARS][MAX_STEPS_PER_BAR] so shrinking and
+// narrowing the time-sig are both non-destructive — cells outside the
+// active region are hidden during render and playback but retained in
+// storage. Extending re-exposes them.
 inline constexpr int MAX_BARS_PER_PATTERN  = 4;
+
+// Number of 16th-note steps in one bar for the given time-signature
+// numerator (denom always 4). Per Phase 3, callers use this instead of the
+// retired global STEPS constant.
+inline int steps_per_bar(uint8_t time_sig_num) {
+    return static_cast<int>(time_sig_num) * STEPS_PER_BEAT;
+}
+
+// Backwards-compat shim: many call sites (and tests) used STEPS = 16 as the
+// step count of a 4/4 bar. New code should use steps_per_bar(p.time_sig_num)
+// instead; this remains as a constant for narrow-purpose call sites that
+// still hard-code 4/4 layouts (e.g. legacy MSG_EDIT wire format) and as the
+// default array stride.
+inline constexpr int STEPS                 = 16;
 
 enum class TrackType { DRUM, MELODIC };
 
@@ -96,10 +116,11 @@ struct ProjectedCell {
 // "starters win (lowest-pitch tiebreak); continuation cells pick the
 // most-recently-started still-sustaining (lowest-pitch tiebreak)" stack
 // rule. Cells past loop_len are returned as { -1, false, false }. Notes
-// whose `bar` field doesn't match `at_bar` are skipped.
-inline std::array<ProjectedCell, STEPS> project_row(
+// whose `bar` field doesn't match `at_bar` are skipped. The array is sized
+// MAX_STEPS_PER_BAR so 8/4 bars (32 steps) project cleanly.
+inline std::array<ProjectedCell, MAX_STEPS_PER_BAR> project_row(
     const std::vector<Note>& notes, int loop_len, int at_bar = 0) {
-    std::array<ProjectedCell, STEPS> out{};
+    std::array<ProjectedCell, MAX_STEPS_PER_BAR> out{};
     for (auto& c : out) c = { -1, false, false };
 
     for (int c = 0; c < loop_len; ++c) {
@@ -165,8 +186,9 @@ enum DrumKind {
 // hidden / unfired but kept in storage.
 struct Pattern {
     uint16_t id = 1;
-    uint8_t  length_bars = 1;
-    std::atomic<bool> drum_grid[DRUM_KINDS][MAX_BARS_PER_PATTERN][STEPS] = {};
+    uint8_t  length_bars  = 1;
+    uint8_t  time_sig_num = 4;  // 1..8; denom always /4
+    std::atomic<bool> drum_grid[DRUM_KINDS][MAX_BARS_PER_PATTERN][MAX_STEPS_PER_BAR] = {};
     std::vector<Note> melodic_notes[MELODIC_VOICES];
     mutable std::mutex melodic_mutex;
 
@@ -360,6 +382,15 @@ void extend_pattern_length(SessionState& s, int n);
 // Non-destructive: cells/notes in the trimmed-off bars are hidden but
 // retained, so a later extend restores them.
 void shrink_pattern_length(SessionState& s, int n);
+
+// Phase 3: bump the current edit pattern's time-sig numerator by one
+// (capped at 8). Non-destructive: cells/notes past the new bar end are
+// hidden during render/playback but retained in storage.
+void inc_pattern_time_sig(SessionState& s);
+
+// Phase 3: dec the current edit pattern's time-sig numerator (floor 1).
+// Non-destructive (see inc_pattern_time_sig).
+void dec_pattern_time_sig(SessionState& s);
 
 // Drive the record state machine on a `q` keypress.
 //   OFF (playing)  → RECORDING : no transport changes
