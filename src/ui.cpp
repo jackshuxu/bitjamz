@@ -266,13 +266,21 @@ static Element render_grid_view(SessionState& s) {
         int tsn      = cur.time_sig_num;
         int cur_bar  = s.edit_bar.load();
         bool ploop   = s.pattern_loop.load();
-        char head_buf[160];
+        // Phase 6: bar.beat.subdivision playhead position.
+        // play_bar is 0-indexed; beat = play_step/STEPS_PER_BEAT;
+        // subdivision = play_step % STEPS_PER_BEAT.
+        int play_step_now = s.play_step.load();
+        int play_bar_now  = s.play_bar.load();
+        int beat_idx      = play_step_now / STEPS_PER_BEAT;
+        int sub_idx       = play_step_now % STEPS_PER_BEAT;
+        char head_buf[200];
         std::snprintf(head_buf, sizeof(head_buf),
-                      "  P%02u  bpm: %d  %d/4  bar %d/%d  %s%s",
+                      "  P%02u  bpm: %d  %d/4  bar %d/%d  ▶ %d.%d.%d%s",
                       static_cast<unsigned>(cur.id),
                       s.bpm, tsn, cur_bar + 1, len_bars,
-                      is_playing ? "▶" : "■",
+                      play_bar_now + 1, beat_idx + 1, sub_idx + 1,
                       ploop ? "  [loop]" : "");
+        (void)is_playing;
 
         Elements header = {
             text("bitjams") | bold | color(COL_PURPLE),

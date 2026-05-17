@@ -314,6 +314,60 @@ static void test_song_place_at_bar_extends_song() {
     std::cout << "test_song_place_at_bar_extends_song PASSED\n";
 }
 
+// --- Phase 6: polish + edge cases ------------------------------------------
+
+static void test_solo_session_invariant_unchanged() {
+    // Critical invariant: solo launch is byte-equivalent to pre-PRD behavior.
+    // 1 pattern (id=1), 1 bar, 4/4, default kick/snare/chat groove, song=[1],
+    // pattern_loop off, song view not focused, current_edit_pattern_id=1.
+    auto s = make_solo_session_state();
+    assert(s->patterns.size() == 1);
+    assert(s->patterns[0]->id == 1);
+    assert(s->patterns[0]->length_bars == 1);
+    assert(s->patterns[0]->time_sig_num == 4);
+    assert(s->song.size() == 1);
+    assert(s->song[0] == 1);
+    assert(s->pattern_loop.load() == false);
+    assert(s->song_view_focused.load() == false);
+    assert(s->current_edit_pattern_id.load() == 1);
+    assert(s->play_song_bar.load() == 0);
+    assert(s->play_bar.load() == 0);
+    assert(s->edit_bar.load() == 0);
+    std::cout << "test_solo_session_invariant_unchanged PASSED\n";
+}
+
+static void test_pattern_loop_state_default_off() {
+    SessionState s;
+    assert(s.pattern_loop.load() == false);
+    s.pattern_loop.store(true);
+    assert(s.pattern_loop.load() == true);
+    std::cout << "test_pattern_loop_state_default_off PASSED\n";
+}
+
+static void test_song_capped_at_max_bars() {
+    SessionState s;
+    // Manually push entries to exceed the cap.
+    for (int i = 0; i < MAX_SONG_BARS + 10; ++i) {
+        song_place_pattern_at_bar(s, i, 1);
+    }
+    assert(static_cast<int>(s.song.size()) <= MAX_SONG_BARS);
+    std::cout << "test_song_capped_at_max_bars PASSED\n";
+}
+
+static void test_create_pattern_then_edit_focus_works() {
+    SessionState s;
+    uint16_t a = create_new_pattern(s);
+    assert(s.current_edit_pattern_id.load() == a);
+    // current_edit_pattern resolves correctly.
+    Pattern& cur = current_edit_pattern(s);
+    assert(cur.id == a);
+    // Editing through current_edit_pattern doesn't leak to pattern 1.
+    extend_pattern_length(s, 1);
+    assert(s.patterns[1]->length_bars == 2);
+    assert(s.patterns[0]->length_bars == 1);
+    std::cout << "test_create_pattern_then_edit_focus_works PASSED\n";
+}
+
 int main() {
     test_session_has_one_pattern_id_1();
     test_pattern_default_drum_grid_all_false();
@@ -341,6 +395,11 @@ int main() {
     test_duplicate_pattern_copies_content();
     test_lookup_pattern_by_id();
     test_song_place_at_bar_extends_song();
+    // Phase 6 invariants
+    test_solo_session_invariant_unchanged();
+    test_pattern_loop_state_default_off();
+    test_song_capped_at_max_bars();
+    test_create_pattern_then_edit_focus_works();
     std::cout << "All pattern tests passed.\n";
     return 0;
 }
