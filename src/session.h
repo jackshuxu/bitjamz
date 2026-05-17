@@ -28,6 +28,13 @@ inline constexpr int MAX_STEPS_PER_BAR     = 32;
 // storage. Extending re-exposes them.
 inline constexpr int MAX_BARS_PER_PATTERN  = 4;
 
+// Phase 4: maximum number of bars the song timeline can hold. Patterns
+// placed past this point are silently dropped.
+inline constexpr int MAX_SONG_BARS         = 128;
+
+// Phase 4: u8 id headroom for pattern allocation. Wire format uses u16.
+inline constexpr int MAX_PATTERNS          = 256;
+
 // Number of 16th-note steps in one bar for the given time-signature
 // numerator (denom always 4). Per Phase 3, callers use this instead of the
 // retired global STEPS constant.
@@ -251,12 +258,18 @@ public:
     uint16_t session_id = 0;
 
     // --- shared creative state (synced) ---
-    // Patterns: the musical sections. Phase 1 has exactly one pattern (id=1)
-    // and the rest of the codebase reaches drum cells / melodic notes via
-    // patterns[0]->drum_grid / melodic_notes. Later phases introduce
-    // multi-bar storage, time signatures, and multiple patterns referenced
-    // by a song timeline.
+    // Patterns: the musical sections. Always non-empty after construction;
+    // patterns[0] is the bootstrap pattern (id=1). Stored sorted by id for
+    // binary-search lookup; ids are monotonically allocated so insertion
+    // is always append.
     std::vector<std::unique_ptr<Pattern>> patterns;
+    // Bar-indexed song timeline (Phase 4). Each entry is a pattern id;
+    // consecutive identical entries play the same pattern back-to-back. The
+    // song loops forever by default; max length MAX_SONG_BARS.
+    std::vector<uint16_t> song;
+    // Guards `patterns` vector mutations and the `song` vector. Drum cells
+    // and melodic notes within a Pattern have their own atomic/mutex.
+    mutable std::mutex    patterns_mutex;
     // Per-track default root pitch in MIDI. Drum tracks use it as the
     // synthesized voice's base pitch; melodic tracks use it for grid-mode
     // space-entry and live-pad trigger.
@@ -283,6 +296,20 @@ public:
     // Phase 2: which bar of the current pattern the sequencer view shows.
     // Multi-bar patterns are read one page (bar) at a time.
     std::atomic<int>  edit_bar{0};
+    // Phase 4: which pattern the sequencer view focuses on (per-peer).
+    std::atomic<uint16_t> current_edit_pattern_id{1};
+    // Phase 4: which song-bar is currently playing. The timing thread reads
+    // this to pick the source pattern for each tick. Wraps to 0 at end of
+    // song (the song loops by default).
+    std::atomic<int>      play_song_bar{0};
+    // Phase 4: per-peer playback override. When true the playhead loops
+    // within the current edit pattern instead of advancing through `song`.
+    // Per the PRD: musical state syncs, play state does not.
+    std::atomic<bool>     pattern_loop{false};
+    // Phase 4: which view is focused (false = sequencer, true = song mode).
+    std::atomic<bool>     song_view_focused{false};
+    // Phase 4: song-mode cursor (bar index).
+    std::atomic<int>      song_view_cursor_bar{0};
     std::atomic<bool> running{true};
     std::atomic<bool> playing{true};
 
@@ -391,6 +418,38 @@ void inc_pattern_time_sig(SessionState& s);
 // Phase 3: dec the current edit pattern's time-sig numerator (floor 1).
 // Non-destructive (see inc_pattern_time_sig).
 void dec_pattern_time_sig(SessionState& s);
+
+// Phase 4: create a new blank pattern with a fresh id (monotonically
+// allocated, never reused). Defaults: length_bars=1, time_sig_num=4. The
+// new pattern is appended to `song` so it's immediately reachable from
+// playback. Edit focus moves to the new pattern. Returns the new id, or 0
+// on cap (MAX_PATTERNS reached).
+uint16_t create_new_pattern(SessionState& s);
+
+// Phase 4: duplicate the current edit pattern. Same content, new id. The
+// duplicate is appended to `song`; edit focus moves to it. Returns the new
+// id (or 0 on cap).
+uint16_t duplicate_current_pattern(SessionState& s);
+
+// Phase 4: lookup a pattern by id. O(log n) (vector is sorted by id).
+// Returns nullptr if the id is not present.
+Pattern* find_pattern(SessionState& s, uint16_t id);
+const Pattern* find_pattern(const SessionState& s, uint16_t id);
+
+// Phase 4: convenience — the pattern currently focused for editing
+// (`current_edit_pattern_id`), falling back to patterns[0] if the id is
+// missing for any reason. Callers are guaranteed a non-null reference as
+// long as the session was constructed normally.
+inline Pattern& current_edit_pattern(SessionState& s) {
+    Pattern* p = find_pattern(s, s.current_edit_pattern_id.load());
+    if (p) return *p;
+    return *s.patterns[0];
+}
+
+// Phase 4: place pattern `id` at song-bar `bar`. Grows `song` if needed,
+// pushing later entries right when the placed pattern is longer than the
+// gap before the next block. Overflow past MAX_SONG_BARS is dropped.
+void song_place_pattern_at_bar(SessionState& s, int bar, uint16_t id);
 
 // Drive the record state machine on a `q` keypress.
 //   OFF (playing)  → RECORDING : no transport changes

@@ -241,6 +241,79 @@ static void test_time_sig_change_non_destructive() {
     std::cout << "test_time_sig_change_non_destructive PASSED\n";
 }
 
+// --- Phase 4: multiple patterns + song mode --------------------------------
+
+static void test_session_song_starts_one_entry() {
+    SessionState s;
+    assert(s.song.size() == 1);
+    assert(s.song[0] == 1);
+    std::cout << "test_session_song_starts_one_entry PASSED\n";
+}
+
+static void test_create_new_pattern_appends_to_song() {
+    SessionState s;
+    uint16_t new_id = create_new_pattern(s);
+    assert(new_id != 0);
+    assert(new_id != 1);
+    assert(s.patterns.size() == 2);
+    assert(s.patterns[1]->id == new_id);
+    // Song length should grow by new pattern's length (1 bar default).
+    assert(s.song.size() == 2);
+    assert(s.song[1] == new_id);
+    // Edit focus moves to the new pattern.
+    assert(s.current_edit_pattern_id.load() == new_id);
+    std::cout << "test_create_new_pattern_appends_to_song PASSED\n";
+}
+
+static void test_duplicate_pattern_copies_content() {
+    SessionState s;
+    Pattern& p1 = *s.patterns[0];
+    p1.drum_grid[DK_KICK][0][7].store(true);
+    p1.length_bars = 2;
+    p1.time_sig_num = 3;
+    p1.melodic_notes[0].push_back({0, 4, 1, 60, 127});
+
+    uint16_t new_id = duplicate_current_pattern(s);
+    assert(s.patterns.size() == 2);
+    assert(new_id != 1);
+    Pattern& p2 = *s.patterns[1];
+    assert(p2.id == new_id);
+    assert(p2.length_bars == 2);
+    assert(p2.time_sig_num == 3);
+    assert(p2.drum_grid[DK_KICK][0][7].load() == true);
+    assert(p2.melodic_notes[0].size() == 1);
+    assert(p2.melodic_notes[0][0].pitch_midi == 60);
+    // Independent: editing p1 doesn't touch p2.
+    p1.drum_grid[DK_SNARE][0][3].store(true);
+    assert(p2.drum_grid[DK_SNARE][0][3].load() == false);
+    std::cout << "test_duplicate_pattern_copies_content PASSED\n";
+}
+
+static void test_lookup_pattern_by_id() {
+    SessionState s;
+    uint16_t a = create_new_pattern(s);
+    uint16_t b = create_new_pattern(s);
+    Pattern* pa = find_pattern(s, a);
+    Pattern* pb = find_pattern(s, b);
+    Pattern* p1 = find_pattern(s, 1);
+    Pattern* missing = find_pattern(s, 999);
+    assert(pa != nullptr && pa->id == a);
+    assert(pb != nullptr && pb->id == b);
+    assert(p1 != nullptr && p1->id == 1);
+    assert(missing == nullptr);
+    std::cout << "test_lookup_pattern_by_id PASSED\n";
+}
+
+static void test_song_place_at_bar_extends_song() {
+    SessionState s;
+    uint16_t a = create_new_pattern(s);
+    // Place pattern a at bar 5 — song must grow to include bar 5.
+    song_place_pattern_at_bar(s, /*bar=*/5, a);
+    assert(s.song.size() >= 6);
+    assert(s.song[5] == a);
+    std::cout << "test_song_place_at_bar_extends_song PASSED\n";
+}
+
 int main() {
     test_session_has_one_pattern_id_1();
     test_pattern_default_drum_grid_all_false();
@@ -262,6 +335,12 @@ int main() {
     test_steps_per_bar_formula();
     test_inc_dec_time_sig();
     test_time_sig_change_non_destructive();
+    // Phase 4
+    test_session_song_starts_one_entry();
+    test_create_new_pattern_appends_to_song();
+    test_duplicate_pattern_copies_content();
+    test_lookup_pattern_by_id();
+    test_song_place_at_bar_extends_song();
     std::cout << "All pattern tests passed.\n";
     return 0;
 }

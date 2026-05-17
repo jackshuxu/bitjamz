@@ -261,14 +261,18 @@ static Element render_grid_view(SessionState& s) {
 
     // header
     {
-        int len_bars = s.patterns.empty() ? 1 : s.patterns[0]->length_bars;
-        int tsn      = s.patterns.empty() ? 4 : s.patterns[0]->time_sig_num;
+        Pattern& cur = current_edit_pattern(s);
+        int len_bars = cur.length_bars;
+        int tsn      = cur.time_sig_num;
         int cur_bar  = s.edit_bar.load();
-        char head_buf[120];
+        bool ploop   = s.pattern_loop.load();
+        char head_buf[160];
         std::snprintf(head_buf, sizeof(head_buf),
-                      "  bpm: %d  %d/4  bar %d/%d  %s",
+                      "  P%02u  bpm: %d  %d/4  bar %d/%d  %s%s",
+                      static_cast<unsigned>(cur.id),
                       s.bpm, tsn, cur_bar + 1, len_bars,
-                      is_playing ? "▶" : "■");
+                      is_playing ? "▶" : "■",
+                      ploop ? "  [loop]" : "");
 
         Elements header = {
             text("bitjams") | bold | color(COL_PURPLE),
@@ -310,8 +314,7 @@ static Element render_grid_view(SessionState& s) {
     }
 
     // Phase 3: derive visible step count from the current pattern's time-sig.
-    int spb = s.patterns.empty() ? STEPS
-            : steps_per_bar(s.patterns[0]->time_sig_num);
+    int spb = steps_per_bar(current_edit_pattern(s).time_sig_num);
 
     // step numbers — prefix is TITLE_COL_WIDTH + 1 to match the title+spacer
     // layout of each track row, so step labels align with the playhead glyph.
@@ -370,7 +373,7 @@ static Element render_grid_view(SessionState& s) {
         if (td.type == TrackType::DRUM) {
             int dk = td.drum_kind;
             for (int step = 0; step < spb; ++step) {
-                bool active = s.patterns[0]->drum_grid[dk][s.edit_bar.load()][step];
+                bool active = current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][step];
                 bool in_loop = (step < spb);
                 // seq_mode is a GRID sub-mode only.
                 bool highlighted = show_cursor
@@ -384,7 +387,7 @@ static Element render_grid_view(SessionState& s) {
                 row.push_back(cell);
             }
         } else {
-            const auto& notes = s.patterns[0]->melodic_notes[td.melodic_idx];
+            const auto& notes = current_edit_pattern(s).melodic_notes[td.melodic_idx];
             auto proj = project_row(notes, spb, s.edit_bar.load());
             for (int step = 0; step < spb; ++step) {
                 bool in_loop = (step < spb);
@@ -487,7 +490,7 @@ static Element render_piano_roll(SessionState& s) {
         lines.push_back(hbox(std::move(row)));
     }
 
-    const auto& notes = s.patterns[0]->melodic_notes[td.melodic_idx];
+    const auto& notes = current_edit_pattern(s).melodic_notes[td.melodic_idx];
 
     // 12 chromatic pitch rows starting at piano_view_base_midi at the bottom.
     // Render top-down: row 11 (highest) first, row 0 last.
@@ -675,7 +678,7 @@ static void kbd_mark_dirty(SessionState& s, int melodic_idx) {
 static int kbd_resolve_active_index(SessionState& s) {
     if (kbd_active_track < 0 || kbd_active_note_idx < 0) return -1;
     int midx = TRACK_DEFS[kbd_active_track].melodic_idx;
-    if (kbd_active_note_idx < (int)s.patterns[0]->melodic_notes[midx].size())
+    if (kbd_active_note_idx < (int)current_edit_pattern(s).melodic_notes[midx].size())
         return kbd_active_note_idx;
     return -1;
 }
@@ -687,9 +690,9 @@ static int kbd_place_note(SessionState& s, uint8_t pitch_midi) {
     int midx = TRACK_DEFS[cursor_track].melodic_idx;
     Note n{ static_cast<uint8_t>(s.edit_bar.load()),
             static_cast<uint8_t>(cursor_step), 1, pitch_midi, 127 };
-    if (!add_note(s.patterns[0]->melodic_notes[midx], n)) return -1;
+    if (!add_note(current_edit_pattern(s).melodic_notes[midx], n)) return -1;
     kbd_mark_dirty(s, midx);
-    return static_cast<int>(s.patterns[0]->melodic_notes[midx].size() - 1);
+    return static_cast<int>(current_edit_pattern(s).melodic_notes[midx].size() - 1);
 }
 
 // Truncate the held note to end just before cursor_step. Caller advances
@@ -701,7 +704,7 @@ static void kbd_truncate_active_before(SessionState& s, int new_end_step) {
     int idx = kbd_resolve_active_index(s);
     if (idx < 0) return;
     int midx = TRACK_DEFS[kbd_active_track].melodic_idx;
-    Note& n = s.patterns[0]->melodic_notes[midx][idx];
+    Note& n = current_edit_pattern(s).melodic_notes[midx][idx];
     int new_dur = new_end_step - n.start_step;
     if (new_dur < 1) new_dur = 1;
     n.duration_steps = static_cast<uint8_t>(new_dur);
@@ -732,14 +735,14 @@ static int pr_place_note_at_cursor(SessionState& s, uint8_t duration_steps) {
     int midx = TRACK_DEFS[piano_track].melodic_idx;
     uint8_t pitch = pr_cursor_pitch();
     // Apply same-row collision rule before adding.
-    clear_or_truncate_at(s.patterns[0]->melodic_notes[midx], pitch,
+    clear_or_truncate_at(current_edit_pattern(s).melodic_notes[midx], pitch,
                          static_cast<uint8_t>(piano_cursor_step),
                          static_cast<uint8_t>(s.edit_bar.load()));
     Note n{ static_cast<uint8_t>(s.edit_bar.load()),
             static_cast<uint8_t>(piano_cursor_step), duration_steps, pitch, 127 };
-    if (!add_note(s.patterns[0]->melodic_notes[midx], n)) return -1;
+    if (!add_note(current_edit_pattern(s).melodic_notes[midx], n)) return -1;
     s.melodic_dirty[midx].store(true);
-    return static_cast<int>(s.patterns[0]->melodic_notes[midx].size() - 1);
+    return static_cast<int>(current_edit_pattern(s).melodic_notes[midx].size() - 1);
 }
 
 // ---- event dispatch ------------------------------------------------------
@@ -807,7 +810,7 @@ static bool dispatch_keyboard(SessionState& s, Event e) {
         if (has_active) {
             int idx = kbd_resolve_active_index(s);
             int midx = TRACK_DEFS[kbd_active_track].melodic_idx;
-            Note& n = s.patterns[0]->melodic_notes[midx][idx];
+            Note& n = current_edit_pattern(s).melodic_notes[midx][idx];
             if (n.duration_steps < s.loop_len) {
                 ++n.duration_steps;
                 s.melodic_dirty[midx].store(true);
@@ -822,7 +825,7 @@ static bool dispatch_keyboard(SessionState& s, Event e) {
         if (has_active) {
             int idx = kbd_resolve_active_index(s);
             int midx = TRACK_DEFS[kbd_active_track].melodic_idx;
-            Note& n = s.patterns[0]->melodic_notes[midx][idx];
+            Note& n = current_edit_pattern(s).melodic_notes[midx][idx];
             if (n.duration_steps > 1) {
                 --n.duration_steps;
                 s.melodic_dirty[midx].store(true);
@@ -894,7 +897,7 @@ static bool dispatch_keyboard(SessionState& s, Event e) {
         if (has_active) {
             int idx  = kbd_resolve_active_index(s);
             int midx = TRACK_DEFS[kbd_active_track].melodic_idx;
-            Note& n  = s.patterns[0]->melodic_notes[midx][idx];
+            Note& n  = current_edit_pattern(s).melodic_notes[midx][idx];
             if (cursor_step > n.start_step) {
                 // Held note was grown via ArrowRight. Truncate it so it ends
                 // just before the cursor, and place the new pitch at the
@@ -907,7 +910,7 @@ static bool dispatch_keyboard(SessionState& s, Event e) {
             } else {
                 // 1-cell held at the last cell: cursor can't advance. Delete
                 // the held note so the new pitch cleanly replaces it.
-                s.patterns[0]->melodic_notes[midx].erase(s.patterns[0]->melodic_notes[midx].begin() + idx);
+                current_edit_pattern(s).melodic_notes[midx].erase(current_edit_pattern(s).melodic_notes[midx].begin() + idx);
                 kbd_mark_dirty(s, midx);
             }
             kbd_release_active();
@@ -940,8 +943,8 @@ static bool dispatch_piano_roll(SessionState& s, Event e) {
     if (e == Event::ArrowRight) {
         if (piano_active_note_idx >= 0) {
             int midx = TRACK_DEFS[piano_track].melodic_idx;
-            if (piano_active_note_idx < (int)s.patterns[0]->melodic_notes[midx].size()) {
-                Note& n = s.patterns[0]->melodic_notes[midx][piano_active_note_idx];
+            if (piano_active_note_idx < (int)current_edit_pattern(s).melodic_notes[midx].size()) {
+                Note& n = current_edit_pattern(s).melodic_notes[midx][piano_active_note_idx];
                 if (n.duration_steps < s.loop_len) {
                     ++n.duration_steps;
                     s.melodic_dirty[midx].store(true);
@@ -956,13 +959,13 @@ static bool dispatch_piano_roll(SessionState& s, Event e) {
     if (e == Event::ArrowLeft) {
         if (piano_active_note_idx >= 0) {
             int midx = TRACK_DEFS[piano_track].melodic_idx;
-            if (piano_active_note_idx < (int)s.patterns[0]->melodic_notes[midx].size()) {
-                Note& n = s.patterns[0]->melodic_notes[midx][piano_active_note_idx];
+            if (piano_active_note_idx < (int)current_edit_pattern(s).melodic_notes[midx].size()) {
+                Note& n = current_edit_pattern(s).melodic_notes[midx][piano_active_note_idx];
                 if (n.duration_steps > 1) {
                     --n.duration_steps;
                     s.melodic_dirty[midx].store(true);
                 } else {
-                    s.patterns[0]->melodic_notes[midx].erase(s.patterns[0]->melodic_notes[midx].begin()
+                    current_edit_pattern(s).melodic_notes[midx].erase(current_edit_pattern(s).melodic_notes[midx].begin()
                                                 + piano_active_note_idx);
                     s.melodic_dirty[midx].store(true);
                     pr_release_active();
@@ -989,7 +992,7 @@ static bool dispatch_piano_roll(SessionState& s, Event e) {
     if (e == Event::Backspace) {
         // Delete the note under the cursor.
         int midx = TRACK_DEFS[piano_track].melodic_idx;
-        auto& notes = s.patterns[0]->melodic_notes[midx];
+        auto& notes = current_edit_pattern(s).melodic_notes[midx];
         uint8_t pitch = pr_cursor_pitch();
         for (auto it = notes.begin(); it != notes.end(); ++it) {
             if (it->pitch_midi != pitch) continue;
@@ -1035,7 +1038,7 @@ static bool dispatch_piano_roll(SessionState& s, Event e) {
         if (c == 'C') {
             // Shift+C clears the piano roll's entire pattern.
             int midx = TRACK_DEFS[piano_track].melodic_idx;
-            s.patterns[0]->melodic_notes[midx].clear();
+            current_edit_pattern(s).melodic_notes[midx].clear();
             pr_release_active();
             s.melodic_dirty[midx].store(true);
             return true;
@@ -1049,7 +1052,7 @@ static bool dispatch_piano_roll(SessionState& s, Event e) {
             // Copy duration of the note under cursor (if any).
             int midx = TRACK_DEFS[piano_track].melodic_idx;
             uint8_t pitch = pr_cursor_pitch();
-            for (const Note& n : s.patterns[0]->melodic_notes[midx]) {
+            for (const Note& n : current_edit_pattern(s).melodic_notes[midx]) {
                 if (n.pitch_midi != pitch) continue;
                 int end = n.start_step + n.duration_steps;
                 if (piano_cursor_step >= n.start_step && piano_cursor_step < end) {
@@ -1109,7 +1112,7 @@ static void fill_pattern(SessionState& s, int interval, int start) {
         int dk = TRACK_DEFS[cursor_track].drum_kind;
         uint16_t fill_mask = 0;
         for (int step = start; step < s.loop_len; step += interval) {
-            s.patterns[0]->drum_grid[dk][s.edit_bar.load()][step] = true;
+            current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][step] = true;
             fill_mask |= static_cast<uint16_t>(1) << step;
         }
         s.dirty[cursor_track].fetch_or(fill_mask, std::memory_order_relaxed);
@@ -1117,7 +1120,7 @@ static void fill_pattern(SessionState& s, int interval, int start) {
     }
     int midx = TRACK_DEFS[cursor_track].melodic_idx;
     uint8_t root = s.track_root_midi[cursor_track];
-    auto& notes = s.patterns[0]->melodic_notes[midx];
+    auto& notes = current_edit_pattern(s).melodic_notes[midx];
     bool changed = false;
     for (int step = start; step < s.loop_len; step += interval) {
         Note n{ static_cast<uint8_t>(s.edit_bar.load()),
@@ -1142,12 +1145,12 @@ static std::vector<Note> clip_notes;
 static void copy_cursor_track(SessionState& s) {
     if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
         int dk = TRACK_DEFS[cursor_track].drum_kind;
-        for (int st = 0; st < STEPS; ++st) clip_drum[st] = s.patterns[0]->drum_grid[dk][s.edit_bar.load()][st];
+        for (int st = 0; st < STEPS; ++st) clip_drum[st] = current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][st];
         clip_notes.clear();
         clip_kind = 0;
     } else {
         int midx = TRACK_DEFS[cursor_track].melodic_idx;
-        clip_notes = s.patterns[0]->melodic_notes[midx];
+        clip_notes = current_edit_pattern(s).melodic_notes[midx];
         for (int st = 0; st < STEPS; ++st) clip_drum[st] = false;
         clip_kind = 1;
     }
@@ -1158,19 +1161,19 @@ static void paste_to_cursor_track(SessionState& s) {
     if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
         int dk = TRACK_DEFS[cursor_track].drum_kind;
         if (clip_kind == 0) {
-            for (int st = 0; st < STEPS; ++st) s.patterns[0]->drum_grid[dk][s.edit_bar.load()][st] = clip_drum[st];
+            for (int st = 0; st < STEPS; ++st) current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][st] = clip_drum[st];
         } else {
             // melodic -> drum: hit on every note start_step.
-            for (int st = 0; st < STEPS; ++st) s.patterns[0]->drum_grid[dk][s.edit_bar.load()][st] = false;
+            for (int st = 0; st < STEPS; ++st) current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][st] = false;
             for (const Note& n : clip_notes) {
-                if (n.start_step < STEPS) s.patterns[0]->drum_grid[dk][s.edit_bar.load()][n.start_step] = true;
+                if (n.start_step < STEPS) current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][n.start_step] = true;
             }
         }
         s.dirty[cursor_track].fetch_or(0xFFFFu, std::memory_order_relaxed);
     } else {
         int midx = TRACK_DEFS[cursor_track].melodic_idx;
         uint8_t root = s.track_root_midi[cursor_track];
-        auto& notes = s.patterns[0]->melodic_notes[midx];
+        auto& notes = current_edit_pattern(s).melodic_notes[midx];
         notes.clear();
         if (clip_kind == 0) {
             // drum -> melodic: 1-step note at root pitch for every hit.
@@ -1193,14 +1196,14 @@ static void paste_to_cursor_track(SessionState& s) {
 static void delete_at_cursor_cell(SessionState& s) {
     if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
         int dk = TRACK_DEFS[cursor_track].drum_kind;
-        if (!s.patterns[0]->drum_grid[dk][s.edit_bar.load()][cursor_step]) return;
-        s.patterns[0]->drum_grid[dk][s.edit_bar.load()][cursor_step] = false;
+        if (!current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][cursor_step]) return;
+        current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][cursor_step] = false;
         s.dirty[cursor_track].fetch_or(static_cast<uint16_t>(1) << cursor_step,
                                        std::memory_order_relaxed);
         return;
     }
     int midx = TRACK_DEFS[cursor_track].melodic_idx;
-    auto& notes = s.patterns[0]->melodic_notes[midx];
+    auto& notes = current_edit_pattern(s).melodic_notes[midx];
     bool changed = false;
     for (auto it = notes.begin(); it != notes.end();) {
         int end = it->start_step + it->duration_steps;
@@ -1263,8 +1266,8 @@ static bool handle_shared_track_command(SessionState& s, Event e) {
         auto now = clk::now();
         if (now - last_A <= CLEAR_ALL_WINDOW) {
             for (int k = 0; k < DRUM_KINDS; ++k)
-                for (int st = 0; st < STEPS; ++st) s.patterns[0]->drum_grid[k][s.edit_bar.load()][st].store(false);
-            for (int m = 0; m < MELODIC_VOICES; ++m) s.patterns[0]->melodic_notes[m].clear();
+                for (int st = 0; st < STEPS; ++st) current_edit_pattern(s).drum_grid[k][s.edit_bar.load()][st].store(false);
+            for (int m = 0; m < MELODIC_VOICES; ++m) current_edit_pattern(s).melodic_notes[m].clear();
             for (int t = 0; t < TRACKS; ++t) s.dirty[t].fetch_or(0xFFFFu);
             for (int m = 0; m < MELODIC_VOICES; ++m) s.melodic_dirty[m].store(true);
             last_A = clk::time_point{};
@@ -1272,11 +1275,11 @@ static bool handle_shared_track_command(SessionState& s, Event e) {
         }
         if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
             int dk = TRACK_DEFS[cursor_track].drum_kind;
-            for (int st = 0; st < STEPS; ++st) s.patterns[0]->drum_grid[dk][s.edit_bar.load()][st].store(false);
+            for (int st = 0; st < STEPS; ++st) current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][st].store(false);
             s.dirty[cursor_track].fetch_or(0xFFFFu, std::memory_order_relaxed);
         } else {
             int midx = TRACK_DEFS[cursor_track].melodic_idx;
-            s.patterns[0]->melodic_notes[midx].clear();
+            current_edit_pattern(s).melodic_notes[midx].clear();
             s.melodic_dirty[midx].store(true);
         }
         return true;
@@ -1339,7 +1342,7 @@ static bool dispatch_grid(SessionState& s, Event e) {
                 int step = window_start + (c - '1');
                 if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
                     int dk = TRACK_DEFS[cursor_track].drum_kind;
-                    s.patterns[0]->drum_grid[dk][s.edit_bar.load()][step] = !s.patterns[0]->drum_grid[dk][s.edit_bar.load()][step];
+                    current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][step] = !current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][step];
                     s.dirty[cursor_track].fetch_or(1u << step, std::memory_order_relaxed);
                 }
                 return true;
@@ -1355,14 +1358,14 @@ static bool dispatch_grid(SessionState& s, Event e) {
         if (e == Event::Character(' ')) {
             if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
                 int dk = TRACK_DEFS[cursor_track].drum_kind;
-                s.patterns[0]->drum_grid[dk][s.edit_bar.load()][cursor_step] = !s.patterns[0]->drum_grid[dk][s.edit_bar.load()][cursor_step];
+                current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][cursor_step] = !current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][cursor_step];
                 s.dirty[cursor_track].fetch_or(1u << cursor_step, std::memory_order_relaxed);
             } else {
                 // Place a 1-step note at root pitch. If a note already starts
                 // at this cell on the root pitch, remove it (toggle feel).
                 int midx = TRACK_DEFS[cursor_track].melodic_idx;
                 uint8_t root = s.track_root_midi[cursor_track];
-                auto& notes = s.patterns[0]->melodic_notes[midx];
+                auto& notes = current_edit_pattern(s).melodic_notes[midx];
                 bool removed = false;
                 int cur_bar = s.edit_bar.load();
                 for (auto it = notes.begin(); it != notes.end(); ++it) {
@@ -1385,10 +1388,84 @@ static bool dispatch_grid(SessionState& s, Event e) {
     return false;
 }
 
+// Phase 4: song-mode view. Renders the song timeline as a horizontal strip
+// of bars; each pattern occupies a block whose width matches its length.
+// The cursor highlights one bar; numeric digits 0..9 accumulate a 2-digit
+// pattern id; the second digit (or a non-digit / timeout) commits.
+static int g_song_digit_buf = -1;  // -1 = no pending digit
+static Element render_song_mode_view(SessionState& s) {
+    Elements lines;
+    char head[160];
+    std::snprintf(head, sizeof(head),
+                  "  SONG MODE  bpm: %d  song bars: %zu  cursor bar: %d  %s",
+                  s.bpm, s.song.size(), s.song_view_cursor_bar.load() + 1,
+                  s.playing.load() ? "▶" : "■");
+    lines.push_back(text("bitjams") | bold | color(COL_PURPLE));
+    lines.push_back(text(head) | color(COL_PURPLE));
+    lines.push_back(text(""));
+
+    int cursor_bar = s.song_view_cursor_bar.load();
+    int play_song_bar = s.play_song_bar.load();
+    int per_row = 16;
+    int rows = static_cast<int>((s.song.size() + per_row - 1) / per_row);
+    if (rows < 1) rows = 1;
+
+    for (int r = 0; r < rows; ++r) {
+        // bar numbers
+        Elements num_row;
+        Elements blk_row;
+        for (int c = 0; c < per_row; ++c) {
+            int bar = r * per_row + c;
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), " %3d ", bar + 1);
+            Element n = text(buf) | color(COL_BRIGHT);
+            num_row.push_back(n);
+
+            Element cell;
+            if (bar < static_cast<int>(s.song.size())) {
+                uint16_t pid = s.song[bar];
+                char cbuf[8];
+                if (pid == 0)         std::snprintf(cbuf, sizeof(cbuf), "  ·  ");
+                else                  std::snprintf(cbuf, sizeof(cbuf), " P%02u ", static_cast<unsigned>(pid));
+                cell = text(cbuf);
+                if (bar == play_song_bar && s.playing.load()) cell = cell | color(COL_HEAD) | bold;
+                else if (pid != 0)                            cell = cell | color(COL_GREEN);
+                else                                          cell = cell | color(COL_DIM);
+            } else {
+                cell = text("  -  ") | color(COL_DIM);
+            }
+            if (bar == cursor_bar) cell = cell | inverted;
+            blk_row.push_back(cell);
+        }
+        lines.push_back(hbox(std::move(num_row)));
+        lines.push_back(hbox(std::move(blk_row)));
+        lines.push_back(text(""));
+    }
+
+    // Pattern legend
+    {
+        Elements legend;
+        legend.push_back(text("  patterns:  ") | color(COL_DIM));
+        for (const auto& p : s.patterns) {
+            char buf[20];
+            std::snprintf(buf, sizeof(buf), "P%02u(%db) ",
+                          static_cast<unsigned>(p->id), p->length_bars);
+            legend.push_back(text(buf) | color(COL_GREEN));
+        }
+        lines.push_back(hbox(std::move(legend)));
+    }
+    lines.push_back(text("  arrows: move cursor   0-9: type pattern id   shift+tab: seq view")
+                    | color(COL_DIM));
+
+    return vbox(std::move(lines));
+}
+
 Component build_session_ui(ScreenInteractive& screen, SessionState& state) {
     auto root = Renderer([&state] {
         Element page;
-        if (nav_state == NavState::PARAM_PAGE) {
+        if (state.song_view_focused.load()) {
+            page = render_song_mode_view(state);
+        } else if (nav_state == NavState::PARAM_PAGE) {
             ensure_cursor_visible(state);
             page = (TRACK_DEFS[cursor_track].type == TrackType::MELODIC)
                  ? render_melodic_param_page(state, cursor_track)
@@ -1435,7 +1512,9 @@ Component build_session_ui(ScreenInteractive& screen, SessionState& state) {
             if (!state.playing.load()) state.play_step.store(0);
             return true;
         }
-        if (e == Event::Character('+') || e == Event::Character('=')) {
+        // Phase 4: '+' is reassigned to "new pattern" (see below); BPM still
+        // bumps on '='. BPM down stays on '-'.
+        if (e == Event::Character('=')) {
             state.bpm = std::min(300, state.bpm + 5);
             state.bpm_dirty.store(true, std::memory_order_relaxed);
             return true;
@@ -1455,7 +1534,7 @@ Component build_session_ui(ScreenInteractive& screen, SessionState& state) {
             shrink_pattern_length(state, 1);
             // Clamp edit_bar / play_bar into the new range.
             if (!state.patterns.empty()) {
-                int len = state.patterns[0]->length_bars;
+                int len = current_edit_pattern(state).length_bars;
                 if (state.edit_bar.load() >= len) state.edit_bar.store(len - 1);
                 if (state.play_bar.load() >= len) state.play_bar.store(0);
             }
@@ -1470,7 +1549,7 @@ Component build_session_ui(ScreenInteractive& screen, SessionState& state) {
         if (e == Event::Character(',')) {
             dec_pattern_time_sig(state);
             if (!state.patterns.empty()) {
-                int spb = steps_per_bar(state.patterns[0]->time_sig_num);
+                int spb = steps_per_bar(current_edit_pattern(state).time_sig_num);
                 if (state.play_step.load() >= spb) state.play_step.store(0);
                 if (state.loop_len > spb) state.loop_len = spb;
             }
@@ -1480,19 +1559,85 @@ Component build_session_ui(ScreenInteractive& screen, SessionState& state) {
         // special events ArrowLeftCtrl / ArrowRightCtrl on macOS — we treat
         // those (and the home/end keys as fallback) as bar paging.
         if (e == Event::ArrowLeftCtrl || e == Event::Home) {
-            int len = state.patterns.empty() ? 1
-                : std::max<uint8_t>(1, state.patterns[0]->length_bars);
             int cur = state.edit_bar.load();
             if (cur > 0) state.edit_bar.store(cur - 1);
-            (void)len;
             return true;
         }
         if (e == Event::ArrowRightCtrl || e == Event::End) {
             int len = state.patterns.empty() ? 1
-                : std::max<uint8_t>(1, state.patterns[0]->length_bars);
+                : std::max<uint8_t>(1, current_edit_pattern(state).length_bars);
             int cur = state.edit_bar.load();
             if (cur < len - 1) state.edit_bar.store(cur + 1);
             return true;
+        }
+        // Phase 4: '+' creates a new blank pattern and appends it to the
+        // song (also moves edit focus). 'Shift+L' toggles pattern-loop
+        // (per-peer playback override). 'Shift+Tab' toggles between
+        // sequencer and song-mode views.
+        //
+        // Note on Cmd+Plus: FTXUI on macOS exposes that as a different
+        // character sequence depending on terminal. We map '*' (Shift+8 on
+        // many layouts) as a fallback for "duplicate"; mainline '+' creates
+        // a blank pattern.
+        if (e == Event::Character('+')) {
+            create_new_pattern(state);
+            return true;
+        }
+        if (e == Event::Character('*')) {
+            duplicate_current_pattern(state);
+            return true;
+        }
+        if (e == Event::Character('L')) {
+            state.pattern_loop.store(!state.pattern_loop.load());
+            return true;
+        }
+        if (e == Event::TabReverse || e == Event::Special("\x1b[Z")) {
+            state.song_view_focused.store(!state.song_view_focused.load());
+            return true;
+        }
+
+        // Phase 4: when the song-mode view is focused, intercept arrows
+        // (move the bar cursor) and digits (compose a 2-digit pattern id
+        // and commit on the second digit). All other keys still pass
+        // through to the global key chain (record, transport, etc.).
+        if (state.song_view_focused.load()) {
+            if (e == Event::ArrowLeft) {
+                int c = state.song_view_cursor_bar.load();
+                if (c > 0) state.song_view_cursor_bar.store(c - 1);
+                g_song_digit_buf = -1;
+                return true;
+            }
+            if (e == Event::ArrowRight) {
+                int c = state.song_view_cursor_bar.load();
+                if (c < MAX_SONG_BARS - 1) state.song_view_cursor_bar.store(c + 1);
+                g_song_digit_buf = -1;
+                return true;
+            }
+            // Digit accumulation: first digit waits for a second; second
+            // digit commits the 2-digit value. Pattern id 0 is "clear".
+            if (e.is_character() && e.character().size() == 1
+                && e.character()[0] >= '0' && e.character()[0] <= '9') {
+                int d = e.character()[0] - '0';
+                if (g_song_digit_buf < 0) {
+                    g_song_digit_buf = d;
+                } else {
+                    int pid = g_song_digit_buf * 10 + d;
+                    g_song_digit_buf = -1;
+                    int bar = state.song_view_cursor_bar.load();
+                    if (pid == 0) {
+                        if (bar < static_cast<int>(state.song.size())) {
+                            state.song[bar] = 0;
+                        }
+                    } else if (find_pattern(state, static_cast<uint16_t>(pid))) {
+                        song_place_pattern_at_bar(state, bar,
+                                                  static_cast<uint16_t>(pid));
+                    }
+                }
+                return true;
+            }
+            // Any other key clears the pending digit.
+            g_song_digit_buf = -1;
+            // Fall through so transport / record / quit etc. still work.
         }
 
         switch (nav_state) {

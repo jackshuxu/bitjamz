@@ -44,6 +44,9 @@ SessionState::SessionState() {
     auto p = std::make_unique<Pattern>();
     p->id = 1;
     patterns.push_back(std::move(p));
+    // Phase 4: solo session starts with the song looping pattern 1 forever
+    // (single bar in the song timeline).
+    song.push_back(1);
 }
 
 std::shared_ptr<SessionState> make_solo_session_state() {
@@ -62,7 +65,7 @@ std::shared_ptr<SessionState> make_solo_session_state() {
 void extend_pattern_length(SessionState& s, int n) {
     if (n <= 0) return;
     if (s.patterns.empty()) return;
-    Pattern& p = *s.patterns[0];
+    Pattern& p = current_edit_pattern(s);
     int new_len = std::min<int>(MAX_BARS_PER_PATTERN, p.length_bars + n);
     p.length_bars = static_cast<uint8_t>(new_len);
 }
@@ -70,28 +73,129 @@ void extend_pattern_length(SessionState& s, int n) {
 void shrink_pattern_length(SessionState& s, int n) {
     if (n <= 0) return;
     if (s.patterns.empty()) return;
-    Pattern& p = *s.patterns[0];
+    Pattern& p = current_edit_pattern(s);
     int new_len = std::max<int>(1, p.length_bars - n);
     p.length_bars = static_cast<uint8_t>(new_len);
 }
 
 void inc_pattern_time_sig(SessionState& s) {
     if (s.patterns.empty()) return;
-    Pattern& p = *s.patterns[0];
+    Pattern& p = current_edit_pattern(s);
     p.time_sig_num = static_cast<uint8_t>(std::min<int>(8, p.time_sig_num + 1));
 }
 
 void dec_pattern_time_sig(SessionState& s) {
     if (s.patterns.empty()) return;
-    Pattern& p = *s.patterns[0];
+    Pattern& p = current_edit_pattern(s);
     p.time_sig_num = static_cast<uint8_t>(std::max<int>(1, p.time_sig_num - 1));
+}
+
+namespace {
+// Monotonic id allocator: take max existing id + 1. Ids are never reused.
+uint16_t next_pattern_id(const SessionState& s) {
+    uint16_t mx = 0;
+    for (const auto& p : s.patterns) if (p->id > mx) mx = p->id;
+    return static_cast<uint16_t>(mx + 1);
+}
+}  // namespace
+
+uint16_t create_new_pattern(SessionState& s) {
+    std::lock_guard<std::mutex> lk(s.patterns_mutex);
+    if (s.patterns.size() >= MAX_PATTERNS) return 0;
+    auto np = std::make_unique<Pattern>();
+    np->id = next_pattern_id(s);
+    uint16_t new_id = np->id;
+    int append_bars = np->length_bars;
+    s.patterns.push_back(std::move(np));
+    // Append to song. Drop bars that would overflow the song cap.
+    for (int b = 0; b < append_bars; ++b) {
+        if (static_cast<int>(s.song.size()) >= MAX_SONG_BARS) break;
+        s.song.push_back(new_id);
+    }
+    s.current_edit_pattern_id.store(new_id);
+    s.edit_bar.store(0);
+    return new_id;
+}
+
+uint16_t duplicate_current_pattern(SessionState& s) {
+    std::lock_guard<std::mutex> lk(s.patterns_mutex);
+    if (s.patterns.size() >= MAX_PATTERNS) return 0;
+    uint16_t src_id = s.current_edit_pattern_id.load();
+    Pattern* src = nullptr;
+    for (auto& p : s.patterns) if (p->id == src_id) { src = p.get(); break; }
+    if (!src) src = s.patterns[0].get();
+
+    auto np = std::make_unique<Pattern>();
+    np->id           = next_pattern_id(s);
+    np->length_bars  = src->length_bars;
+    np->time_sig_num = src->time_sig_num;
+    // Copy drum cells.
+    for (int k = 0; k < DRUM_KINDS; ++k) {
+        for (int b = 0; b < MAX_BARS_PER_PATTERN; ++b) {
+            for (int st = 0; st < MAX_STEPS_PER_BAR; ++st) {
+                np->drum_grid[k][b][st].store(src->drum_grid[k][b][st].load());
+            }
+        }
+    }
+    // Copy melodic notes.
+    {
+        std::lock_guard<std::mutex> nlk(src->melodic_mutex);
+        for (int m = 0; m < MELODIC_VOICES; ++m) {
+            np->melodic_notes[m] = src->melodic_notes[m];
+        }
+    }
+
+    uint16_t new_id = np->id;
+    int append_bars = np->length_bars;
+    s.patterns.push_back(std::move(np));
+    for (int b = 0; b < append_bars; ++b) {
+        if (static_cast<int>(s.song.size()) >= MAX_SONG_BARS) break;
+        s.song.push_back(new_id);
+    }
+    s.current_edit_pattern_id.store(new_id);
+    s.edit_bar.store(0);
+    return new_id;
+}
+
+Pattern* find_pattern(SessionState& s, uint16_t id) {
+    for (auto& p : s.patterns) if (p->id == id) return p.get();
+    return nullptr;
+}
+
+const Pattern* find_pattern(const SessionState& s, uint16_t id) {
+    for (const auto& p : s.patterns) if (p->id == id) return p.get();
+    return nullptr;
+}
+
+void song_place_pattern_at_bar(SessionState& s, int bar, uint16_t id) {
+    if (bar < 0 || bar >= MAX_SONG_BARS) return;
+    std::lock_guard<std::mutex> lk(s.patterns_mutex);
+    while (static_cast<int>(s.song.size()) <= bar) {
+        if (static_cast<int>(s.song.size()) >= MAX_SONG_BARS) return;
+        s.song.push_back(0);  // 0 = empty slot
+    }
+    s.song[bar] = id;
 }
 
 void record_input(SessionState& s, int track, uint8_t pitch_midi) {
     if (s.rec_state.load() != RecordState::RECORDING) return;
     if (track < 0 || track >= TRACKS) return;
     if (s.patterns.empty()) return;
-    Pattern& pat = *s.patterns[0];
+    // Phase 4: record into the currently-playing pattern so overdubs land on
+    // the section the user is hearing. (Solo mode and single-pattern songs
+    // resolve to the same pattern as before.)
+    uint16_t cur_id;
+    if (s.pattern_loop.load()) {
+        cur_id = s.current_edit_pattern_id.load();
+    } else {
+        int sbar = s.play_song_bar.load();
+        cur_id = (sbar >= 0 && sbar < static_cast<int>(s.song.size()))
+                 ? s.song[sbar] : s.patterns[0]->id;
+        if (cur_id == 0) cur_id = s.patterns[0]->id;
+    }
+    Pattern* pat_ptr = find_pattern(s, cur_id);
+    if (!pat_ptr) pat_ptr = s.patterns[0].get();
+    Pattern& pat = *pat_ptr;
     int spb = steps_per_bar(pat.time_sig_num);
     int target_step = s.play_step.load() % spb;
     int target_bar  = std::clamp<int>(s.play_bar.load(), 0,
@@ -228,10 +332,31 @@ void timing_thread(SessionState& s) {
             continue;
         }
 
-        Pattern* pat = s.patterns.empty() ? nullptr : s.patterns[0].get();
+        // Phase 4: resolve the playing pattern. In pattern-loop mode the
+        // playhead stays within the current edit pattern; otherwise it
+        // follows the song timeline.
+        uint16_t cur_id;
+        if (s.pattern_loop.load()) {
+            cur_id = s.current_edit_pattern_id.load();
+        } else {
+            int sbar = s.play_song_bar.load();
+            int song_len = static_cast<int>(s.song.size());
+            if (song_len <= 0) {
+                cur_id = s.patterns.empty() ? 1 : s.patterns[0]->id;
+            } else {
+                if (sbar >= song_len) { sbar = 0; s.play_song_bar.store(0); }
+                cur_id = s.song[sbar];
+                if (cur_id == 0) {
+                    // Empty song slot: fall back to pattern 1.
+                    cur_id = s.patterns.empty() ? 1 : s.patterns[0]->id;
+                }
+            }
+        }
+        Pattern* pat = find_pattern(s, cur_id);
+        if (!pat && !s.patterns.empty()) pat = s.patterns[0].get();
+
         int len_bars = pat ? std::max<int>(1, pat->length_bars) : 1;
-        // Phase 3: bar length is derived from the pattern's time signature,
-        // not the per-peer loop_len (which is being phased out).
+        // Phase 3: bar length is derived from the pattern's time signature.
         int spb = pat ? steps_per_bar(pat->time_sig_num)
                       : steps_per_bar(4);
         int step = s.play_step.load();
@@ -240,7 +365,17 @@ void timing_thread(SessionState& s) {
             step = step + 1;
             if (step >= spb) {
                 step = 0;
-                bar = (bar + 1) % len_bars;
+                bar = bar + 1;
+                if (bar >= len_bars) {
+                    bar = 0;
+                    // Phase 4: end of pattern. In song mode, advance the
+                    // song bar pointer; if it overflows, loop the song.
+                    if (!s.pattern_loop.load()) {
+                        int sbar = s.play_song_bar.load() + 1;
+                        if (sbar >= static_cast<int>(s.song.size())) sbar = 0;
+                        s.play_song_bar.store(sbar);
+                    }
+                }
                 s.play_bar.store(bar);
             }
             s.play_step.store(step);
