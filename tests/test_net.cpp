@@ -17,7 +17,8 @@ namespace bitjams_net_internal {
     bool   recv_and_apply_msg_state(int sock, SessionState& s);
     size_t build_msg_edit(SessionState& s, uint8_t* buf, size_t buf_cap);
     bool   recv_and_apply_msg_edit(int sock, SessionState& s, bool is_joiner);
-    size_t build_msg_melodic_track(int melodic_idx, const std::vector<Note>& notes,
+    size_t build_msg_melodic_track(uint16_t pattern_id, int melodic_idx,
+                                   const std::vector<Note>& notes,
                                    uint8_t* buf, size_t buf_cap);
     bool   recv_and_apply_msg_melodic_track(int sock, SessionState& s, bool is_joiner);
     size_t build_pending_aux(SessionState& s, uint8_t* buf, size_t buf_cap);
@@ -524,7 +525,7 @@ static void test_msg_melodic_track_roundtrip() {
     };
     uint8_t buf[1024];
     size_t n = bitjams_net_internal::build_msg_melodic_track(
-        /*melodic_idx=*/1, notes, buf, sizeof(buf));
+        /*pattern_id=*/1, /*melodic_idx=*/1, notes, buf, sizeof(buf));
     assert(n > 0);
     int s = ::send(sv[0], reinterpret_cast<const char*>(buf), static_cast<int>(n), 0);
     assert(s == static_cast<int>(n));

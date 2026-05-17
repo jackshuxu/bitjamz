@@ -8,27 +8,56 @@ inline constexpr int      NET_FLUSH_MS = 50;
 
 // MSG_EDIT — drum-cell sparse edit batch (one per NET_FLUSH_MS window):
 //   uint8_t  cell_count
-//   { uint8_t track, uint8_t step, uint8_t value }[cell_count]   (track 0..7)
+//   for each cell:
+//     uint16_t pattern_id  (NBO; Phase 5)
+//     uint8_t  track       (0..7)
+//     uint8_t  bar         (0..MAX_BARS_PER_PATTERN-1)
+//     uint8_t  step        (0..MAX_STEPS_PER_BAR-1)
+//     uint8_t  value       (0 or 1)
 //   uint8_t  bpm_present
-//   int32_t  bpm                       (network byte order; always present)
+//   int32_t  bpm                       (NBO; always present)
 //
-// MSG_MELODIC_TRACK — whole-list resend for one melodic track:
-//   uint8_t  track_id                  (8..11; validated on recv)
-//   uint8_t  note_count
-//   { uint8_t start_step, duration_steps, pitch_midi, velocity }[note_count]
+// MSG_MELODIC_TRACK — whole-list resend for one melodic track of one pattern:
+//   uint16_t pattern_id   (NBO)
+//   uint8_t  track_id     (8..11; validated on recv)
+//   uint16_t note_count   (NBO; was u8 in Phase 4 and earlier)
+//   { uint8_t bar, start_step, duration_steps, pitch_midi, velocity }[note_count]
 //
 // MSG_TRACK_ROOT_MIDI — scalar:
 //   uint8_t  track_id                  (0..11)
 //   uint8_t  midi
 //
-// MSG_STATE — variable-length handshake snapshot:
+// MSG_PATTERN_NEW — Phase 5; tell peer to allocate a new pattern shell:
+//   uint16_t pattern_id   (NBO)
+//   uint8_t  length_bars
+//   uint8_t  time_sig_num
+//
+// MSG_PATTERN_META — Phase 5; pattern metadata change:
+//   uint16_t pattern_id   (NBO)
+//   uint8_t  length_bars
+//   uint8_t  time_sig_num
+//
+// MSG_SONG_EDIT — Phase 5; one song-bar slot edit:
+//   uint16_t bar_index    (NBO; 0..MAX_SONG_BARS-1)
+//   uint16_t pattern_id   (NBO; 0 = clear)
+//
+// MSG_STATE — variable-length handshake snapshot. Phase 5 widens to carry
+// the full patterns vector and song timeline:
 //   uint16_t session_id                (NBO)
 //   int32_t  bpm                       (NBO)
 //   uint8_t  track_root_midi[12]
-//   uint16_t drum_grid_mask[8]         (NBO, per-drum-kind 16-bit step mask)
-//   for melodic_idx in 0..3:
-//       uint8_t note_count
-//       { uint8_t start_step, duration_steps, pitch_midi, velocity }[note_count]
+//   uint16_t pattern_count             (NBO)
+//   for each pattern:
+//     uint16_t id                      (NBO)
+//     uint8_t  length_bars
+//     uint8_t  time_sig_num
+//     uint8_t  drum_grid_packed[DRUM_KINDS][MAX_BARS][MAX_STEPS_PER_BAR/8]
+//                                       (128 bytes per pattern)
+//     for melodic_idx 0..3:
+//       uint16_t note_count             (NBO)
+//       { uint8_t bar, start, dur, pitch, vel }[note_count]
+//   uint16_t song_len                  (NBO)
+//   { uint16_t pattern_id }[song_len]  (NBO each)
 
 enum MsgType : uint8_t {
     MSG_HANDSHAKE        = 0x00,
@@ -37,6 +66,9 @@ enum MsgType : uint8_t {
     MSG_EDIT             = 0x03,
     MSG_MELODIC_TRACK    = 0x04,
     MSG_TRACK_ROOT_MIDI  = 0x05,
+    MSG_PATTERN_NEW      = 0x06,
+    MSG_PATTERN_META     = 0x07,
+    MSG_SONG_EDIT        = 0x08,
 };
 
 class Network {
