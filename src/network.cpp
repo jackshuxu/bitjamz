@@ -61,45 +61,72 @@ bool recv_all(int sock, void* buf, size_t len) {
 namespace bitjams_net_internal {
 
 // ---- MSG_STATE (variable length) ----
+//
+// Phase 5 schema. Carries the full patterns vector + song timeline. Body
+// size grows with the number of patterns and notes. We size the send
+// buffer dynamically (std::vector) to avoid the prior fixed-cap risk.
+
+namespace {
+// Helper: write a uint16_t in network byte order, advancing the cursor.
+void put_u16(std::vector<uint8_t>& buf, uint16_t v) {
+    uint16_t n = htons(v);
+    buf.insert(buf.end(),
+               reinterpret_cast<uint8_t*>(&n),
+               reinterpret_cast<uint8_t*>(&n) + 2);
+}
+void put_u8(std::vector<uint8_t>& buf, uint8_t v) { buf.push_back(v); }
+void put_i32(std::vector<uint8_t>& buf, int32_t v) {
+    int32_t n = htonl(v);
+    buf.insert(buf.end(),
+               reinterpret_cast<uint8_t*>(&n),
+               reinterpret_cast<uint8_t*>(&n) + 4);
+}
+}  // namespace
 
 bool send_msg_state(int sock, const SessionState& s) {
-    // Header is bounded; melodic body is up to 4 × (1 + 64*4) = 1028.
-    // 46 + 1028 = 1074 max body. Plus 1 tag byte.
-    uint8_t buf[1100];
-    uint8_t* p = buf;
+    std::vector<uint8_t> buf;
+    buf.reserve(2048);
+    buf.push_back(MSG_STATE);
+    put_u16(buf, s.session_id);
+    put_i32(buf, s.bpm);
+    for (int t = 0; t < TRACKS; ++t) buf.push_back(s.track_root_midi[t]);
 
-    *p++ = MSG_STATE;
-
-    uint16_t sid_n = htons(s.session_id);
-    std::memcpy(p, &sid_n, 2); p += 2;
-
-    int32_t bpm_n = htonl(s.bpm);
-    std::memcpy(p, &bpm_n, 4); p += 4;
-
-    for (int t = 0; t < TRACKS; ++t) *p++ = s.track_root_midi[t];
-
-    for (int k = 0; k < DRUM_KINDS; ++k) {
-        uint16_t mask = 0;
-        for (int st = 0; st < STEPS; ++st) {
-            if (s.drum_grid[k][st]) mask |= static_cast<uint16_t>(1) << st;
+    put_u16(buf, static_cast<uint16_t>(s.patterns.size()));
+    for (const auto& pp : s.patterns) {
+        const Pattern& p = *pp;
+        put_u16(buf, p.id);
+        put_u8(buf, p.length_bars);
+        put_u8(buf, p.time_sig_num);
+        // drum_grid_packed: 8 × 4 × 4 = 128 bytes (bit per step, packed LSB-first).
+        for (int k = 0; k < DRUM_KINDS; ++k) {
+            for (int b = 0; b < MAX_BARS_PER_PATTERN; ++b) {
+                for (int byte = 0; byte < MAX_STEPS_PER_BAR / 8; ++byte) {
+                    uint8_t v = 0;
+                    for (int bit = 0; bit < 8; ++bit) {
+                        int st = byte * 8 + bit;
+                        if (p.drum_grid[k][b][st].load()) v |= (1u << bit);
+                    }
+                    buf.push_back(v);
+                }
+            }
         }
-        uint16_t mn = htons(mask);
-        std::memcpy(p, &mn, 2); p += 2;
-    }
-
-    for (int m = 0; m < MELODIC_VOICES; ++m) {
-        const auto& notes = s.melodic_notes[m];
-        uint8_t count = static_cast<uint8_t>(notes.size());
-        *p++ = count;
-        for (uint8_t i = 0; i < count; ++i) {
-            *p++ = notes[i].start_step;
-            *p++ = notes[i].duration_steps;
-            *p++ = notes[i].pitch_midi;
-            *p++ = notes[i].velocity;
+        for (int m = 0; m < MELODIC_VOICES; ++m) {
+            std::lock_guard<std::mutex> lk(p.melodic_mutex);
+            const auto& notes = p.melodic_notes[m];
+            put_u16(buf, static_cast<uint16_t>(notes.size()));
+            for (const Note& n : notes) {
+                buf.push_back(n.bar);
+                buf.push_back(n.start_step);
+                buf.push_back(n.duration_steps);
+                buf.push_back(n.pitch_midi);
+                buf.push_back(n.velocity);
+            }
         }
     }
+    put_u16(buf, static_cast<uint16_t>(s.song.size()));
+    for (uint16_t pid : s.song) put_u16(buf, pid);
 
-    return send_all(sock, buf, static_cast<size_t>(p - buf));
+    return send_all(sock, buf.data(), buf.size());
 }
 
 bool recv_and_apply_msg_state(int sock, SessionState& s) {
@@ -116,38 +143,88 @@ bool recv_and_apply_msg_state(int sock, SessionState& s) {
     if (!recv_all(sock, roots, TRACKS)) return false;
     for (int t = 0; t < TRACKS; ++t) s.track_root_midi[t] = roots[t];
 
-    for (int k = 0; k < DRUM_KINDS; ++k) {
-        uint16_t mn = 0;
-        if (!recv_all(sock, &mn, 2)) return false;
-        uint16_t mask = ntohs(mn);
-        for (int st = 0; st < STEPS; ++st) {
-            s.drum_grid[k][st] = (mask & (static_cast<uint16_t>(1) << st)) != 0;
+    uint16_t pc_n = 0;
+    if (!recv_all(sock, &pc_n, 2)) return false;
+    uint16_t pc = ntohs(pc_n);
+
+    // Reset patterns; the host's snapshot is authoritative.
+    s.patterns.clear();
+    s.patterns.reserve(pc);
+    for (uint16_t i = 0; i < pc; ++i) {
+        auto np = std::make_unique<Pattern>();
+        uint16_t id_n;
+        if (!recv_all(sock, &id_n, 2)) return false;
+        np->id = ntohs(id_n);
+        uint8_t lb = 0, tsn = 0;
+        if (!recv_all(sock, &lb, 1))  return false;
+        if (!recv_all(sock, &tsn, 1)) return false;
+        np->length_bars  = lb;
+        np->time_sig_num = tsn;
+        for (int k = 0; k < DRUM_KINDS; ++k) {
+            for (int b = 0; b < MAX_BARS_PER_PATTERN; ++b) {
+                for (int byte = 0; byte < MAX_STEPS_PER_BAR / 8; ++byte) {
+                    uint8_t v = 0;
+                    if (!recv_all(sock, &v, 1)) return false;
+                    for (int bit = 0; bit < 8; ++bit) {
+                        int st = byte * 8 + bit;
+                        np->drum_grid[k][b][st].store((v >> bit) & 1u);
+                    }
+                }
+            }
         }
+        for (int m = 0; m < MELODIC_VOICES; ++m) {
+            uint16_t nc_n = 0;
+            if (!recv_all(sock, &nc_n, 2)) return false;
+            uint16_t nc = ntohs(nc_n);
+            np->melodic_notes[m].reserve(std::max<size_t>(MAX_NOTES_PER_MELODIC, nc));
+            for (uint16_t j = 0; j < nc; ++j) {
+                Note n{};
+                uint8_t five[5];
+                if (!recv_all(sock, five, 5)) return false;
+                n.bar            = five[0];
+                n.start_step     = five[1];
+                n.duration_steps = five[2];
+                n.pitch_midi     = five[3];
+                n.velocity       = five[4];
+                np->melodic_notes[m].push_back(n);
+            }
+        }
+        s.patterns.push_back(std::move(np));
+    }
+    // If host sent zero patterns (shouldn't happen) ensure a stub exists.
+    if (s.patterns.empty()) {
+        auto np = std::make_unique<Pattern>();
+        np->id = 1;
+        s.patterns.push_back(std::move(np));
     }
 
-    for (int m = 0; m < MELODIC_VOICES; ++m) {
-        uint8_t count = 0;
-        if (!recv_all(sock, &count, 1)) return false;
-        s.melodic_notes[m].clear();
-        s.melodic_notes[m].reserve(count);
-        for (uint8_t i = 0; i < count; ++i) {
-            Note n{};
-            uint8_t four[4];
-            if (!recv_all(sock, four, 4)) return false;
-            n.start_step     = four[0];
-            n.duration_steps = four[1];
-            n.pitch_midi     = four[2];
-            n.velocity       = four[3];
-            s.melodic_notes[m].push_back(n);
-        }
+    uint16_t sl_n = 0;
+    if (!recv_all(sock, &sl_n, 2)) return false;
+    uint16_t sl = ntohs(sl_n);
+    s.song.clear();
+    s.song.reserve(sl);
+    for (uint16_t i = 0; i < sl; ++i) {
+        uint16_t pid_n = 0;
+        if (!recv_all(sock, &pid_n, 2)) return false;
+        s.song.push_back(ntohs(pid_n));
     }
+    if (s.song.empty()) s.song.push_back(s.patterns[0]->id);
     return true;
 }
 
 // ---- MSG_EDIT (drum-only) ----
+//
+// Phase 5 wire layout per cell: pattern_id (u16 NBO) + track (u8) + bar (u8)
+// + step (u8) + value (u8) = 6 bytes/cell. The dirty bitmask plumbing still
+// tracks one bit per (track, step) — meaning a single flush window can only
+// emit edits for one (pattern, bar) tuple. For solo / single-pattern jam
+// the active pattern is always the edit pattern; multi-pattern simultaneous
+// edits are sequenced across flush windows.
 
 size_t build_msg_edit(SessionState& s, uint8_t* buf, size_t buf_cap) {
-    // Layout written: [count][cells...][bpm_present][bpm32][ta_present][ta_mask16]
+    // Header: [count][cells...][bpm_present][bpm32]
+    // Each cell now occupies 6 bytes (was 3). Safety check: 16 tracks * 32
+    // bits * 6 bytes = 3072 max payload, plus header.
     if (buf_cap < 9) return 0;
 
     uint8_t* p = buf;
@@ -156,10 +233,25 @@ size_t build_msg_edit(SessionState& s, uint8_t* buf, size_t buf_cap) {
 
     bool joiner_path = s.network_alive.load() && s.is_joiner;
 
+    // The pattern + bar context for these dirty bits is the user's current
+    // edit focus when the dirty bit was set. We snapshot once at flush time.
+    uint16_t pid = s.current_edit_pattern_id.load();
+    uint8_t  bar = static_cast<uint8_t>(s.edit_bar.load());
+    Pattern* pat = find_pattern(s, pid);
+    if (!pat && !s.patterns.empty()) {
+        pat = s.patterns[0].get();
+        pid = pat->id;
+    }
+    if (!pat) {
+        *count_ptr = 0;
+        *p++ = 0;
+        int32_t zero = 0;
+        std::memcpy(p, &zero, 4); p += 4;
+        return 0;
+    }
+
     for (int t = 0; t < TRACKS; ++t) {
         if (TRACK_DEFS[t].type != TrackType::DRUM) {
-            // Defensive: melodic tracks should never set bits here, but if
-            // they do, drop them so we don't ship garbage.
             s.dirty[t].exchange(0);
             continue;
         }
@@ -171,9 +263,12 @@ size_t build_msg_edit(SessionState& s, uint8_t* buf, size_t buf_cap) {
         int dk = TRACK_DEFS[t].drum_kind;
         while (bits) {
             int step = bitjams_ctz(bits);
+            uint16_t pid_n = htons(pid);
+            std::memcpy(p, &pid_n, 2); p += 2;
             *p++ = static_cast<uint8_t>(t);
+            *p++ = bar;
             *p++ = static_cast<uint8_t>(step);
-            *p++ = s.drum_grid[dk][step] ? 1 : 0;
+            *p++ = pat->drum_grid[dk][bar][step].load() ? 1 : 0;
             ++cell_count;
             bits &= bits - 1;
         }
@@ -198,27 +293,40 @@ bool recv_and_apply_msg_edit(int sock, SessionState& s, bool is_joiner) {
     if (!recv_all(sock, &cell_count, 1)) return false;
 
     for (int i = 0; i < cell_count; ++i) {
-        uint8_t triple[3];
-        if (!recv_all(sock, triple, 3)) return false;
-        uint8_t t = triple[0];
-        uint8_t step = triple[1];
-        uint8_t v = triple[2];
-        if (t >= TRACKS || step >= STEPS) continue;
-        if (TRACK_DEFS[t].type != TrackType::DRUM) continue;  // drum-only path
+        uint8_t hdr[6];
+        if (!recv_all(sock, hdr, 6)) return false;
+        uint16_t pid = static_cast<uint16_t>(hdr[0] << 8 | hdr[1]);
+        uint8_t  t   = hdr[2];
+        uint8_t  bar = hdr[3];
+        uint8_t  step = hdr[4];
+        uint8_t  v   = hdr[5];
+        if (t >= TRACKS || step >= MAX_STEPS_PER_BAR
+            || bar >= MAX_BARS_PER_PATTERN) continue;
+        if (TRACK_DEFS[t].type != TrackType::DRUM) continue;
+        Pattern* pat = find_pattern(s, pid);
+        if (!pat) continue;
         int dk = TRACK_DEFS[t].drum_kind;
 
         uint16_t bit = static_cast<uint16_t>(1) << step;
-        if (is_joiner) {
+        // Only track in_flight against the local edit-focus pattern/bar; for
+        // other patterns we just apply the inbound edit (Rule Y degrades to
+        // last-writer-wins for non-current-focus edits in this Phase 5).
+        bool current_focus = (pid == s.current_edit_pattern_id.load()
+                              && bar == s.edit_bar.load());
+        if (is_joiner && current_focus) {
             if (s.dirty[t].load() & bit) continue;
             if (s.in_flight[t].load() & bit) {
-                s.drum_grid[dk][step] = (v != 0);
+                pat->drum_grid[dk][bar][step] = (v != 0);
                 s.in_flight[t].fetch_and(static_cast<uint16_t>(~bit));
                 continue;
             }
-            s.drum_grid[dk][step] = (v != 0);
+            pat->drum_grid[dk][bar][step] = (v != 0);
+        } else if (is_joiner) {
+            pat->drum_grid[dk][bar][step] = (v != 0);
         } else {
-            s.drum_grid[dk][step] = (v != 0);
-            s.dirty[t].fetch_or(bit);
+            // Host: apply + redirty so we relay to peers.
+            pat->drum_grid[dk][bar][step] = (v != 0);
+            if (current_focus) s.dirty[t].fetch_or(bit);
         }
     }
 
@@ -244,14 +352,19 @@ bool recv_and_apply_msg_edit(int sock, SessionState& s, bool is_joiner) {
 
 // ---- MSG_MELODIC_TRACK ----
 
-size_t build_msg_melodic_track(int melodic_idx, const std::vector<Note>& notes,
+// Phase 5: melodic track resend now carries pattern_id (u16 NBO) + u16
+// note_count + 5-byte notes (bar prepended). Caller passes the pattern_id
+// to associate the resend with.
+size_t build_msg_melodic_track(uint16_t pattern_id, int melodic_idx,
+                               const std::vector<Note>& notes,
                                uint8_t* buf, size_t buf_cap) {
-    // tag(1) + track_id(1) + note_count(1) + notes(4*N)
-    size_t need = 3 + 4 * notes.size();
+    // tag(1) + pid(2) + track_id(1) + count(2) + notes(5*N)
+    size_t need = 6 + 5 * notes.size();
     if (buf_cap < need) return 0;
     uint8_t* p = buf;
     *p++ = MSG_MELODIC_TRACK;
-    // Wire uses the track index 8..11 (matches TRACKS layout), not melodic_idx.
+    uint16_t pid_n = htons(pattern_id);
+    std::memcpy(p, &pid_n, 2); p += 2;
     int track_id = -1;
     for (int t = 0; t < TRACKS; ++t) {
         if (TRACK_DEFS[t].type == TrackType::MELODIC &&
@@ -261,8 +374,10 @@ size_t build_msg_melodic_track(int melodic_idx, const std::vector<Note>& notes,
     }
     if (track_id < 0) return 0;
     *p++ = static_cast<uint8_t>(track_id);
-    *p++ = static_cast<uint8_t>(notes.size());
+    uint16_t cnt_n = htons(static_cast<uint16_t>(notes.size()));
+    std::memcpy(p, &cnt_n, 2); p += 2;
     for (const Note& n : notes) {
+        *p++ = n.bar;
         *p++ = n.start_step;
         *p++ = n.duration_steps;
         *p++ = n.pitch_midi;
@@ -272,44 +387,117 @@ size_t build_msg_melodic_track(int melodic_idx, const std::vector<Note>& notes,
 }
 
 bool recv_and_apply_msg_melodic_track(int sock, SessionState& s, bool is_joiner) {
-    uint8_t track_id = 0;
-    uint8_t count = 0;
+    uint16_t pid_n = 0;
+    if (!recv_all(sock, &pid_n, 2)) return false;
+    uint16_t pid = ntohs(pid_n);
+    uint8_t  track_id = 0;
     if (!recv_all(sock, &track_id, 1)) return false;
-    if (!recv_all(sock, &count, 1))    return false;
+    uint16_t cnt_n = 0;
+    if (!recv_all(sock, &cnt_n, 2)) return false;
+    uint16_t count = ntohs(cnt_n);
 
     std::vector<Note> incoming;
     incoming.reserve(count);
-    for (uint8_t i = 0; i < count; ++i) {
-        uint8_t four[4];
-        if (!recv_all(sock, four, 4)) return false;
-        incoming.push_back({four[0], four[1], four[2], four[3]});
+    for (uint16_t i = 0; i < count; ++i) {
+        uint8_t five[5];
+        if (!recv_all(sock, five, 5)) return false;
+        Note n{};
+        n.bar            = five[0];
+        n.start_step     = five[1];
+        n.duration_steps = five[2];
+        n.pitch_midi     = five[3];
+        n.velocity       = five[4];
+        incoming.push_back(n);
     }
 
     if (track_id >= TRACKS) return true;
     if (TRACK_DEFS[track_id].type != TrackType::MELODIC) return true;
     int idx = TRACK_DEFS[track_id].melodic_idx;
 
-    // Network-applied move overwrites the vector wholesale; restore the
-    // reserve() guarantee so the timing thread's concurrent iteration of
-    // melodic_notes can't race a future reallocating push_back.
-    std::lock_guard<std::mutex> lk(s.melodic_mutex);
-    if (is_joiner) {
-        // Rule Y: drop inbound if we have an unsent local edit (dirty);
-        // accept if it's our own echo (in_flight); otherwise apply.
+    Pattern* pat = find_pattern(s, pid);
+    if (!pat && !s.patterns.empty()) pat = s.patterns[0].get();
+    if (!pat) return true;
+
+    std::lock_guard<std::mutex> lk(pat->melodic_mutex);
+    // Phase 5 simplification: melodic_dirty/in_flight remains a single
+    // global bit per melodic-idx (not per-pattern). The optimistic-edit
+    // guard therefore only protects edits to the currently-focused pattern.
+    bool current_focus = (pid == s.current_edit_pattern_id.load());
+    if (is_joiner && current_focus) {
         if (s.melodic_dirty[idx].load()) return true;
         if (s.melodic_in_flight[idx].load()) {
-            s.melodic_notes[idx] = std::move(incoming);
-            s.melodic_notes[idx].reserve(MAX_NOTES_PER_MELODIC);
+            pat->melodic_notes[idx] = std::move(incoming);
+            pat->melodic_notes[idx].reserve(MAX_NOTES_PER_MELODIC);
             s.melodic_in_flight[idx].store(false);
             return true;
         }
-        s.melodic_notes[idx] = std::move(incoming);
-        s.melodic_notes[idx].reserve(MAX_NOTES_PER_MELODIC);
+        pat->melodic_notes[idx] = std::move(incoming);
+        pat->melodic_notes[idx].reserve(MAX_NOTES_PER_MELODIC);
+    } else if (is_joiner) {
+        pat->melodic_notes[idx] = std::move(incoming);
+        pat->melodic_notes[idx].reserve(MAX_NOTES_PER_MELODIC);
     } else {
-        s.melodic_notes[idx] = std::move(incoming);
-        s.melodic_notes[idx].reserve(MAX_NOTES_PER_MELODIC);
-        s.melodic_dirty[idx].store(true);  // relay to other peers
+        pat->melodic_notes[idx] = std::move(incoming);
+        pat->melodic_notes[idx].reserve(MAX_NOTES_PER_MELODIC);
+        if (current_focus) s.melodic_dirty[idx].store(true);
     }
+    return true;
+}
+
+// ---- MSG_PATTERN_NEW ----
+
+bool recv_and_apply_msg_pattern_new(int sock, SessionState& s, bool is_joiner) {
+    (void)is_joiner;
+    uint16_t pid_n = 0;
+    if (!recv_all(sock, &pid_n, 2)) return false;
+    uint16_t pid = ntohs(pid_n);
+    uint8_t lb = 0, tsn = 0;
+    if (!recv_all(sock, &lb, 1))  return false;
+    if (!recv_all(sock, &tsn, 1)) return false;
+
+    std::lock_guard<std::mutex> lk(s.patterns_mutex);
+    if (find_pattern(s, pid)) return true;  // dedup
+    auto np = std::make_unique<Pattern>();
+    np->id = pid;
+    np->length_bars = lb;
+    np->time_sig_num = tsn;
+    s.patterns.push_back(std::move(np));
+    return true;
+}
+
+// ---- MSG_PATTERN_META ----
+
+bool recv_and_apply_msg_pattern_meta(int sock, SessionState& s, bool is_joiner) {
+    (void)is_joiner;
+    uint16_t pid_n = 0;
+    if (!recv_all(sock, &pid_n, 2)) return false;
+    uint16_t pid = ntohs(pid_n);
+    uint8_t lb = 0, tsn = 0;
+    if (!recv_all(sock, &lb, 1))  return false;
+    if (!recv_all(sock, &tsn, 1)) return false;
+    Pattern* pat = find_pattern(s, pid);
+    if (!pat) return true;
+    pat->length_bars  = lb;
+    pat->time_sig_num = tsn;
+    return true;
+}
+
+// ---- MSG_SONG_EDIT ----
+
+bool recv_and_apply_msg_song_edit(int sock, SessionState& s, bool is_joiner) {
+    (void)is_joiner;
+    uint16_t bar_n = 0, pid_n = 0;
+    if (!recv_all(sock, &bar_n, 2)) return false;
+    if (!recv_all(sock, &pid_n, 2)) return false;
+    uint16_t bar = ntohs(bar_n);
+    uint16_t pid = ntohs(pid_n);
+    if (bar >= MAX_SONG_BARS) return true;
+    std::lock_guard<std::mutex> lk(s.patterns_mutex);
+    while (s.song.size() <= bar) {
+        if (s.song.size() >= MAX_SONG_BARS) return true;
+        s.song.push_back(0);
+    }
+    s.song[bar] = pid;
     return true;
 }
 
@@ -338,9 +526,36 @@ bool recv_and_apply_msg_track_root_midi(int sock, SessionState& s, bool is_joine
     return true;
 }
 
+// Claim the lowest-set bit from any of `mask_lanes` 64-bit atomic words,
+// clearing it. Returns the global bit index (lane*64 + position), or -1 if
+// no bit was set.
+static int claim_lowest_bit(std::atomic<uint64_t>* mask, int lanes) {
+    for (int l = 0; l < lanes; ++l) {
+        uint64_t v = mask[l].load();
+        while (v) {
+            // Find lowest set bit.
+#ifdef _MSC_VER
+            unsigned long pos = 0;
+            _BitScanForward64(&pos, v);
+            int b = static_cast<int>(pos);
+#else
+            int b = __builtin_ctzll(v);
+#endif
+            uint64_t bit = static_cast<uint64_t>(1) << b;
+            uint64_t prev = v;
+            if (mask[l].compare_exchange_weak(prev, v & ~bit)) {
+                return l * 64 + b;
+            }
+            v = mask[l].load();
+        }
+    }
+    return -1;
+}
+
 // Returns the number of bytes written to buf (tag + payload), or 0 if
-// nothing dirty. Sends at most one MSG_MELODIC_TRACK or MSG_TRACK_ROOT_MIDI
-// per call; caller invokes repeatedly to drain.
+// nothing dirty. Sends at most one of: MSG_MELODIC_TRACK, MSG_TRACK_ROOT_MIDI,
+// MSG_PATTERN_NEW, MSG_PATTERN_META, MSG_SONG_EDIT per call; caller invokes
+// repeatedly to drain.
 size_t build_pending_aux(SessionState& s, uint8_t* buf, size_t buf_cap) {
     bool joiner_path = s.network_alive.load() && s.is_joiner;
 
@@ -348,8 +563,15 @@ size_t build_pending_aux(SessionState& s, uint8_t* buf, size_t buf_cap) {
         bool expected = true;
         if (s.melodic_dirty[m].compare_exchange_strong(expected, false)) {
             if (joiner_path) s.melodic_in_flight[m].store(true);
-            std::lock_guard<std::mutex> lk(s.melodic_mutex);
-            return build_msg_melodic_track(m, s.melodic_notes[m], buf, buf_cap);
+            uint16_t pid = s.current_edit_pattern_id.load();
+            Pattern* pat = find_pattern(s, pid);
+            if (!pat && !s.patterns.empty()) {
+                pat = s.patterns[0].get(); pid = pat->id;
+            }
+            if (!pat) return 0;
+            std::lock_guard<std::mutex> lk(pat->melodic_mutex);
+            return build_msg_melodic_track(pid, m, pat->melodic_notes[m],
+                                           buf, buf_cap);
         }
     }
 
@@ -365,6 +587,50 @@ size_t build_pending_aux(SessionState& s, uint8_t* buf, size_t buf_cap) {
         buf[1] = static_cast<uint8_t>(t);
         buf[2] = s.track_root_midi[t];
         return 3;
+    }
+
+    // MSG_PATTERN_NEW: tag(1) + pid(2) + length_bars(1) + time_sig_num(1) = 5
+    int pn = claim_lowest_bit(s.pattern_new_dirty, 4);
+    if (pn >= 0) {
+        Pattern* pat = find_pattern(s, static_cast<uint16_t>(pn));
+        if (pat && buf_cap >= 5) {
+            buf[0] = MSG_PATTERN_NEW;
+            uint16_t pid_n = htons(static_cast<uint16_t>(pn));
+            std::memcpy(buf + 1, &pid_n, 2);
+            buf[3] = pat->length_bars;
+            buf[4] = pat->time_sig_num;
+            return 5;
+        }
+        // Pattern vanished (shouldn't happen); drop the bit and continue.
+    }
+
+    // MSG_PATTERN_META: same shape as MSG_PATTERN_NEW.
+    int pm = claim_lowest_bit(s.pattern_meta_dirty, 4);
+    if (pm >= 0) {
+        Pattern* pat = find_pattern(s, static_cast<uint16_t>(pm));
+        if (pat && buf_cap >= 5) {
+            buf[0] = MSG_PATTERN_META;
+            uint16_t pid_n = htons(static_cast<uint16_t>(pm));
+            std::memcpy(buf + 1, &pid_n, 2);
+            buf[3] = pat->length_bars;
+            buf[4] = pat->time_sig_num;
+            return 5;
+        }
+    }
+
+    // MSG_SONG_EDIT: tag(1) + bar(2) + pid(2) = 5
+    int sb = claim_lowest_bit(s.song_dirty, 2);
+    if (sb >= 0) {
+        uint16_t pid = 0;
+        if (sb < static_cast<int>(s.song.size())) pid = s.song[sb];
+        if (buf_cap >= 5) {
+            buf[0] = MSG_SONG_EDIT;
+            uint16_t bar_n = htons(static_cast<uint16_t>(sb));
+            uint16_t pid_n = htons(pid);
+            std::memcpy(buf + 1, &bar_n, 2);
+            std::memcpy(buf + 3, &pid_n, 2);
+            return 5;
+        }
     }
     return 0;
 }
@@ -389,6 +655,12 @@ bool dispatch_inbound(int sock, SessionState& state, uint8_t tag, bool is_joiner
             return recv_and_apply_msg_melodic_track(sock, state, is_joiner);
         case MSG_TRACK_ROOT_MIDI:
             return recv_and_apply_msg_track_root_midi(sock, state, is_joiner);
+        case MSG_PATTERN_NEW:
+            return bitjams_net_internal::recv_and_apply_msg_pattern_new(sock, state, is_joiner);
+        case MSG_PATTERN_META:
+            return bitjams_net_internal::recv_and_apply_msg_pattern_meta(sock, state, is_joiner);
+        case MSG_SONG_EDIT:
+            return bitjams_net_internal::recv_and_apply_msg_song_edit(sock, state, is_joiner);
         default:
             return false;
     }

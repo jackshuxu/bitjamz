@@ -26,6 +26,50 @@ static int cursor_track = 0;
 static int cursor_step  = 0;
 static int window_start = 0;
 
+// Phase 6 horizontal viewport. When the current bar's step count exceeds
+// VIEWPORT_STEPS, render only [view_offset_step .. view_offset_step+VIEWPORT_STEPS).
+// Indicator glyphs `‹` / `›` at the row edges show off-viewport content.
+static constexpr int VIEWPORT_STEPS = 16;
+static int view_offset_step = 0;
+// Follow mode: when playing, keep edit_bar / current_edit_pattern_id locked to
+// the playhead so the user always sees the bar being played. On by default;
+// toggled by Shift+F.
+static bool follow_mode = true;
+
+// Steps-per-bar of the currently-focused edit pattern.
+static inline int current_spb(SessionState& s) {
+    if (s.patterns.empty()) return STEPS;
+    return steps_per_bar(current_edit_pattern(s).time_sig_num);
+}
+
+// Resolve which pattern id the playback engine is currently iterating. Mirrors
+// the resolution in session.cpp's timer loop: pattern_loop → edit pattern;
+// otherwise the song slot under play_song_bar (with fallback to patterns[0]).
+static inline uint16_t playing_pattern_id(SessionState& s) {
+    if (s.patterns.empty()) return 0;
+    if (s.pattern_loop.load()) return s.current_edit_pattern_id.load();
+    int sbar = s.play_song_bar.load();
+    int song_len = static_cast<int>(s.song.size());
+    if (song_len <= 0 || sbar < 0 || sbar >= song_len) return s.patterns[0]->id;
+    uint16_t pid = s.song[sbar];
+    if (pid == 0) return s.patterns[0]->id;
+    return pid;
+}
+
+// Keep cursor_step / view_offset_step in range after a bar/time-sig change.
+static inline void clamp_cursor_to_spb(int spb) {
+    if (cursor_step >= spb) cursor_step = spb - 1;
+    if (cursor_step < 0)    cursor_step = 0;
+    int max_off = std::max(0, spb - VIEWPORT_STEPS);
+    if (view_offset_step > max_off) view_offset_step = max_off;
+    if (view_offset_step < 0)       view_offset_step = 0;
+    // Slide the viewport so the cursor stays visible.
+    if (cursor_step < view_offset_step) view_offset_step = cursor_step;
+    else if (cursor_step >= view_offset_step + VIEWPORT_STEPS)
+        view_offset_step = cursor_step - VIEWPORT_STEPS + 1;
+    if (view_offset_step < 0) view_offset_step = 0;
+}
+
 // keyboard mode
 static int  kbd_octave           = 4;
 static int  kbd_active_track     = -1;   // melodic track whose active note is held
@@ -201,11 +245,16 @@ static Element render_track_title(int t, bool focused, bool silenced) {
 // Draw a 5-char drum cell. `narrow` collapses to 3 chars for sub-90col terms.
 // Active hits render the bare ■ glyph in bright+bold so the rhythmic content
 // stands out without changing layout width.
+// `bold_beat` is true on beats 2, 4, 6... — empty cells use `•` instead of `·`
+// to visually anchor the beat grid (Phase 3, user story #18).
 static Element draw_drum_cell(bool hit, bool highlighted, bool in_loop,
-                              bool on_playhead, bool playing, bool narrow) {
+                              bool on_playhead, bool playing, bool narrow,
+                              bool bold_beat) {
     (void)on_playhead; (void)playing;
-    const char* glyph_full = hit ? "  ■  " : "  ·  ";
-    const char* glyph_thin = hit ? " ■ "   : " · ";
+    const char* empty_full = bold_beat ? "  •  " : "  ·  ";
+    const char* empty_thin = bold_beat ? " • "   : " · ";
+    const char* glyph_full = hit ? "  ■  " : empty_full;
+    const char* glyph_thin = hit ? " ■ "   : empty_thin;
     const char* g = narrow ? glyph_thin : glyph_full;
     if (!in_loop)    return text(narrow ? " · " : "  ·  ") | color(COL_DIM);
     if (highlighted) return text(g) | color(COL_PURPLE) | inverted;
@@ -215,13 +264,21 @@ static Element draw_drum_cell(bool hit, bool highlighted, bool in_loop,
 
 // Draw a 5-char melodic cell given the projection info.
 // kind 0=silence, 1=start (single-step or starts >=2), 2=middle, 3=end
+// `bold_beat` swaps `·` for `•` on silent cells only; sustained-note middle
+// keeps `·` since it carries note-continuation meaning, not beat-marker.
 static Element draw_melodic_cell(int kind, const Note* n, bool single_step,
                                  bool highlighted, bool in_loop,
-                                 bool on_playhead, bool playing, bool narrow) {
+                                 bool on_playhead, bool playing, bool narrow,
+                                 bool bold_beat) {
     if (!in_loop) return text(narrow ? " · " : "  ·  ") | color(COL_DIM);
 
     char buf[8];
-    if (kind == 0 || kind == 2) {
+    if (kind == 0) {
+        const char* dot = bold_beat
+                            ? (narrow ? " • " : "  •  ")
+                            : (narrow ? " · " : "  ·  ");
+        std::snprintf(buf, sizeof(buf), "%s", dot);
+    } else if (kind == 2) {
         std::snprintf(buf, sizeof(buf), "%s", narrow ? " · " : "  ·  ");
     } else if (kind == 1 && n) {
         NoteName nm = note_name(n->pitch_midi);
@@ -250,6 +307,28 @@ static Element render_grid_view(SessionState& s) {
     int  ps         = s.play_step.load();
     bool is_playing = s.playing.load();
 
+    // Phase 7: follow mode keeps the editor view locked to the playhead while
+    // the transport is running, so the user always sees the bar being played.
+    // Off → user-driven edit cursor; user disables with Shift+F.
+    if (follow_mode && is_playing && !s.patterns.empty()) {
+        uint16_t play_pid = playing_pattern_id(s);
+        if (play_pid != 0 && play_pid != s.current_edit_pattern_id.load()) {
+            s.current_edit_pattern_id.store(play_pid);
+        }
+        int pbar = s.play_bar.load();
+        if (pbar != s.edit_bar.load()) {
+            s.edit_bar.store(pbar);
+        }
+    }
+
+    // Playhead is only "in view" when the bar being played is also the bar
+    // being edited (and, if the song is playing a different pattern than the
+    // one in focus, suppress entirely). Cells and the ▼ glyph use this gate.
+    bool play_in_view = is_playing
+                     && !s.patterns.empty()
+                     && playing_pattern_id(s) == s.current_edit_pattern_id.load()
+                     && s.play_bar.load() == s.edit_bar.load();
+
     // Width-aware fallback: target 10 + 16*5 = 90 cols for the full row.
     // ftxui doesn't tell us screen width inside a Renderer; the fallback is
     // mostly cosmetic, so we always render full-width here. Narrow terms
@@ -261,9 +340,27 @@ static Element render_grid_view(SessionState& s) {
 
     // header
     {
-        char head_buf[80];
-        std::snprintf(head_buf, sizeof(head_buf), "  bpm: %d  steps: %d  %s",
-                      s.bpm, s.loop_len, is_playing ? "▶" : "■");
+        Pattern& cur = current_edit_pattern(s);
+        int len_bars = cur.length_bars;
+        int tsn      = cur.time_sig_num;
+        int cur_bar  = s.edit_bar.load();
+        bool ploop   = s.pattern_loop.load();
+        // Phase 6: bar.beat.subdivision playhead position.
+        // play_bar is 0-indexed; beat = play_step/STEPS_PER_BEAT;
+        // subdivision = play_step % STEPS_PER_BEAT.
+        int play_step_now = s.play_step.load();
+        int play_bar_now  = s.play_bar.load();
+        int beat_idx      = play_step_now / STEPS_PER_BEAT;
+        int sub_idx       = play_step_now % STEPS_PER_BEAT;
+        char head_buf[220];
+        std::snprintf(head_buf, sizeof(head_buf),
+                      "  P%02u  bpm: %d  %d/4  bar %d/%d  ▶ %d.%d.%d%s%s",
+                      static_cast<unsigned>(cur.id),
+                      s.bpm, tsn, cur_bar + 1, len_bars,
+                      play_bar_now + 1, beat_idx + 1, sub_idx + 1,
+                      ploop ? "  [loop]" : "",
+                      follow_mode ? "" : "  [free]");
+        (void)is_playing;
 
         Elements header = {
             text("bitjams") | bold | color(COL_PURPLE),
@@ -304,12 +401,34 @@ static Element render_grid_view(SessionState& s) {
         lines.push_back(hbox(std::move(header)));
     }
 
+    // Phase 3: derive visible step count from the current pattern's time-sig.
+    int spb = steps_per_bar(current_edit_pattern(s).time_sig_num);
+
+    // Phase 6: horizontal viewport. When `spb > VIEWPORT_STEPS`, the grid
+    // scrolls horizontally — render only [vstart..vend). Cursor moves drag
+    // the viewport (see clamp_cursor_to_spb). `‹` at the left and `›` at the
+    // right edge indicate off-viewport content.
+    clamp_cursor_to_spb(spb);
+    int vstart = (spb > VIEWPORT_STEPS) ? view_offset_step : 0;
+    int vend   = (spb > VIEWPORT_STEPS) ? std::min(spb, vstart + VIEWPORT_STEPS) : spb;
+    bool scroll_left  = (vstart > 0);
+    bool scroll_right = (vend < spb);
+
     // step numbers — prefix is TITLE_COL_WIDTH + 1 to match the title+spacer
     // layout of each track row, so step labels align with the playhead glyph.
+    // Phase 3: bold every other beat group (beats 2, 4, 6...) to anchor the
+    // beat grid visually regardless of time signature.
+    auto beat_is_bold = [](int step) {
+        return ((step / STEPS_PER_BEAT) % 2) == 1;
+    };
+    auto edge_glyph = [&](bool active, const char* on, const char* off) {
+        return text(active ? on : off) | (active ? color(COL_BRIGHT) : color(COL_DIM));
+    };
     {
         Elements row;
-        row.push_back(text(std::string(TITLE_COL_WIDTH + 1, ' ')));
-        for (int step = 0; step < STEPS; ++step) {
+        row.push_back(text(std::string(TITLE_COL_WIDTH, ' ')));
+        row.push_back(edge_glyph(scroll_left, "‹", " "));
+        for (int step = vstart; step < vend; ++step) {
             char buf[8];
             if (step < s.loop_len) {
                 std::snprintf(buf, sizeof(buf),
@@ -317,21 +436,26 @@ static Element render_grid_view(SessionState& s) {
             } else {
                 std::snprintf(buf, sizeof(buf), "%s", narrow ? "   " : "     ");
             }
-            row.push_back(text(buf) | color(COL_BRIGHT));
+            Element e = text(buf) | color(COL_BRIGHT);
+            if (beat_is_bold(step)) e = e | bold;
+            row.push_back(e);
         }
+        row.push_back(edge_glyph(scroll_right, "›", " "));
         lines.push_back(hbox(std::move(row)));
     }
 
-    // playhead arrow
+    // playhead arrow — only visible when play_bar == edit_bar (so the user
+    // doesn't see a ghost playhead on a different bar than the one playing).
     {
         Elements row;
         row.push_back(text(std::string(TITLE_COL_WIDTH + 1, ' ')));
-        for (int step = 0; step < STEPS; ++step) {
+        row.push_back(text(" "));  // align under the leading scroll glyph
+        for (int step = vstart; step < vend; ++step) {
             const char* glyph;
-            if (step == ps && is_playing) glyph = narrow ? " ▼ " : "  ▼  ";
-            else                          glyph = narrow ? "   " : "     ";
+            if (step == ps && play_in_view) glyph = narrow ? " ▼ " : "  ▼  ";
+            else                            glyph = narrow ? "   " : "     ";
             Element e = text(glyph);
-            if (step == ps && is_playing) e = e | color(COL_HEAD);
+            if (step == ps && play_in_view) e = e | color(COL_HEAD);
             row.push_back(e);
         }
         lines.push_back(hbox(std::move(row)));
@@ -340,7 +464,7 @@ static Element render_grid_view(SessionState& s) {
     auto render_track_row = [&](int t) -> Element {
         Elements row;
         row.push_back(render_track_title(t, false, track_is_silenced(s, t)));
-        row.push_back(text(" "));   // spacer between title and first cell
+        row.push_back(text(" "));   // align under the leading scroll glyph
 
         const TrackDef& td = TRACK_DEFS[t];
         bool is_cursor_track = (t == cursor_track);
@@ -353,42 +477,50 @@ static Element render_grid_view(SessionState& s) {
 
         if (td.type == TrackType::DRUM) {
             int dk = td.drum_kind;
-            for (int step = 0; step < STEPS; ++step) {
-                bool active = s.drum_grid[dk][step];
-                bool in_loop = (step < s.loop_len);
+            for (int step = vstart; step < vend; ++step) {
+                bool active = current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][step];
+                bool in_loop = (step < spb);
                 // seq_mode is a GRID sub-mode only.
                 bool highlighted = show_cursor
                                 && is_cursor_track
                                 && (seq_mode && nav_state == NavState::GRID
                                     ? (step >= window_start && step < window_start + 8)
                                     : (step == cursor_step));
-                row.push_back(draw_drum_cell(active, highlighted, in_loop,
-                                             step == ps, is_playing, narrow));
+                Element cell = draw_drum_cell(active, highlighted, in_loop,
+                                              step == ps, play_in_view, narrow,
+                                              beat_is_bold(step));
+                if (beat_is_bold(step)) cell = cell | bold;
+                row.push_back(cell);
             }
         } else {
-            const auto& notes = s.melodic_notes[td.melodic_idx];
-            auto proj = project_row(notes, s.loop_len);
-            for (int step = 0; step < STEPS; ++step) {
-                bool in_loop = (step < s.loop_len);
+            const auto& notes = current_edit_pattern(s).melodic_notes[td.melodic_idx];
+            auto proj = project_row(notes, spb, s.edit_bar.load());
+            for (int step = vstart; step < vend; ++step) {
+                bool in_loop = (step < spb);
                 bool highlighted = show_cursor
                                 && is_cursor_track
                                 && (step == cursor_step);
+                Element cell;
                 if (!in_loop || proj[step].note_idx < 0) {
-                    row.push_back(draw_melodic_cell(0, nullptr, false,
-                                                    highlighted, in_loop,
-                                                    step == ps, is_playing, narrow));
-                    continue;
+                    cell = draw_melodic_cell(0, nullptr, false,
+                                             highlighted, in_loop,
+                                             step == ps, play_in_view, narrow,
+                                             beat_is_bold(step));
+                } else {
+                    const Note& n = notes[proj[step].note_idx];
+                    bool single = (n.duration_steps == 1);
+                    int kind;
+                    if (proj[step].is_start && (single || proj[step].is_end)) kind = 1;
+                    else if (proj[step].is_start)                              kind = 1;
+                    else if (proj[step].is_end)                                kind = 3;
+                    else                                                       kind = 2;
+                    cell = draw_melodic_cell(kind, &n, single,
+                                             highlighted, in_loop,
+                                             step == ps, play_in_view, narrow,
+                                             beat_is_bold(step));
                 }
-                const Note& n = notes[proj[step].note_idx];
-                bool single = (n.duration_steps == 1);
-                int kind;
-                if (proj[step].is_start && (single || proj[step].is_end)) kind = 1;
-                else if (proj[step].is_start)                              kind = 1;
-                else if (proj[step].is_end)                                kind = 3;
-                else                                                       kind = 2;
-                row.push_back(draw_melodic_cell(kind, &n, single,
-                                                highlighted, in_loop,
-                                                step == ps, is_playing, narrow));
+                if (beat_is_bold(step)) cell = cell | bold;
+                row.push_back(cell);
             }
         }
 
@@ -466,7 +598,7 @@ static Element render_piano_roll(SessionState& s) {
         lines.push_back(hbox(std::move(row)));
     }
 
-    const auto& notes = s.melodic_notes[td.melodic_idx];
+    const auto& notes = current_edit_pattern(s).melodic_notes[td.melodic_idx];
 
     // 12 chromatic pitch rows starting at piano_view_base_midi at the bottom.
     // Render top-down: row 11 (highest) first, row 0 last.
@@ -654,7 +786,7 @@ static void kbd_mark_dirty(SessionState& s, int melodic_idx) {
 static int kbd_resolve_active_index(SessionState& s) {
     if (kbd_active_track < 0 || kbd_active_note_idx < 0) return -1;
     int midx = TRACK_DEFS[kbd_active_track].melodic_idx;
-    if (kbd_active_note_idx < (int)s.melodic_notes[midx].size())
+    if (kbd_active_note_idx < (int)current_edit_pattern(s).melodic_notes[midx].size())
         return kbd_active_note_idx;
     return -1;
 }
@@ -664,10 +796,11 @@ static int kbd_resolve_active_index(SessionState& s) {
 static int kbd_place_note(SessionState& s, uint8_t pitch_midi) {
     if (TRACK_DEFS[cursor_track].type != TrackType::MELODIC) return -1;
     int midx = TRACK_DEFS[cursor_track].melodic_idx;
-    Note n{ static_cast<uint8_t>(cursor_step), 1, pitch_midi, 127 };
-    if (!add_note(s.melodic_notes[midx], n)) return -1;
+    Note n{ static_cast<uint8_t>(s.edit_bar.load()),
+            static_cast<uint8_t>(cursor_step), 1, pitch_midi, 127 };
+    if (!add_note(current_edit_pattern(s).melodic_notes[midx], n)) return -1;
     kbd_mark_dirty(s, midx);
-    return static_cast<int>(s.melodic_notes[midx].size() - 1);
+    return static_cast<int>(current_edit_pattern(s).melodic_notes[midx].size() - 1);
 }
 
 // Truncate the held note to end just before cursor_step. Caller advances
@@ -679,7 +812,7 @@ static void kbd_truncate_active_before(SessionState& s, int new_end_step) {
     int idx = kbd_resolve_active_index(s);
     if (idx < 0) return;
     int midx = TRACK_DEFS[kbd_active_track].melodic_idx;
-    Note& n = s.melodic_notes[midx][idx];
+    Note& n = current_edit_pattern(s).melodic_notes[midx][idx];
     int new_dur = new_end_step - n.start_step;
     if (new_dur < 1) new_dur = 1;
     n.duration_steps = static_cast<uint8_t>(new_dur);
@@ -710,12 +843,14 @@ static int pr_place_note_at_cursor(SessionState& s, uint8_t duration_steps) {
     int midx = TRACK_DEFS[piano_track].melodic_idx;
     uint8_t pitch = pr_cursor_pitch();
     // Apply same-row collision rule before adding.
-    clear_or_truncate_at(s.melodic_notes[midx], pitch,
-                         static_cast<uint8_t>(piano_cursor_step));
-    Note n{ static_cast<uint8_t>(piano_cursor_step), duration_steps, pitch, 127 };
-    if (!add_note(s.melodic_notes[midx], n)) return -1;
+    clear_or_truncate_at(current_edit_pattern(s).melodic_notes[midx], pitch,
+                         static_cast<uint8_t>(piano_cursor_step),
+                         static_cast<uint8_t>(s.edit_bar.load()));
+    Note n{ static_cast<uint8_t>(s.edit_bar.load()),
+            static_cast<uint8_t>(piano_cursor_step), duration_steps, pitch, 127 };
+    if (!add_note(current_edit_pattern(s).melodic_notes[midx], n)) return -1;
     s.melodic_dirty[midx].store(true);
-    return static_cast<int>(s.melodic_notes[midx].size() - 1);
+    return static_cast<int>(current_edit_pattern(s).melodic_notes[midx].size() - 1);
 }
 
 // ---- event dispatch ------------------------------------------------------
@@ -783,7 +918,7 @@ static bool dispatch_keyboard(SessionState& s, Event e) {
         if (has_active) {
             int idx = kbd_resolve_active_index(s);
             int midx = TRACK_DEFS[kbd_active_track].melodic_idx;
-            Note& n = s.melodic_notes[midx][idx];
+            Note& n = current_edit_pattern(s).melodic_notes[midx][idx];
             if (n.duration_steps < s.loop_len) {
                 ++n.duration_steps;
                 s.melodic_dirty[midx].store(true);
@@ -798,7 +933,7 @@ static bool dispatch_keyboard(SessionState& s, Event e) {
         if (has_active) {
             int idx = kbd_resolve_active_index(s);
             int midx = TRACK_DEFS[kbd_active_track].melodic_idx;
-            Note& n = s.melodic_notes[midx][idx];
+            Note& n = current_edit_pattern(s).melodic_notes[midx][idx];
             if (n.duration_steps > 1) {
                 --n.duration_steps;
                 s.melodic_dirty[midx].store(true);
@@ -870,7 +1005,7 @@ static bool dispatch_keyboard(SessionState& s, Event e) {
         if (has_active) {
             int idx  = kbd_resolve_active_index(s);
             int midx = TRACK_DEFS[kbd_active_track].melodic_idx;
-            Note& n  = s.melodic_notes[midx][idx];
+            Note& n  = current_edit_pattern(s).melodic_notes[midx][idx];
             if (cursor_step > n.start_step) {
                 // Held note was grown via ArrowRight. Truncate it so it ends
                 // just before the cursor, and place the new pitch at the
@@ -883,7 +1018,7 @@ static bool dispatch_keyboard(SessionState& s, Event e) {
             } else {
                 // 1-cell held at the last cell: cursor can't advance. Delete
                 // the held note so the new pitch cleanly replaces it.
-                s.melodic_notes[midx].erase(s.melodic_notes[midx].begin() + idx);
+                current_edit_pattern(s).melodic_notes[midx].erase(current_edit_pattern(s).melodic_notes[midx].begin() + idx);
                 kbd_mark_dirty(s, midx);
             }
             kbd_release_active();
@@ -916,8 +1051,8 @@ static bool dispatch_piano_roll(SessionState& s, Event e) {
     if (e == Event::ArrowRight) {
         if (piano_active_note_idx >= 0) {
             int midx = TRACK_DEFS[piano_track].melodic_idx;
-            if (piano_active_note_idx < (int)s.melodic_notes[midx].size()) {
-                Note& n = s.melodic_notes[midx][piano_active_note_idx];
+            if (piano_active_note_idx < (int)current_edit_pattern(s).melodic_notes[midx].size()) {
+                Note& n = current_edit_pattern(s).melodic_notes[midx][piano_active_note_idx];
                 if (n.duration_steps < s.loop_len) {
                     ++n.duration_steps;
                     s.melodic_dirty[midx].store(true);
@@ -932,13 +1067,13 @@ static bool dispatch_piano_roll(SessionState& s, Event e) {
     if (e == Event::ArrowLeft) {
         if (piano_active_note_idx >= 0) {
             int midx = TRACK_DEFS[piano_track].melodic_idx;
-            if (piano_active_note_idx < (int)s.melodic_notes[midx].size()) {
-                Note& n = s.melodic_notes[midx][piano_active_note_idx];
+            if (piano_active_note_idx < (int)current_edit_pattern(s).melodic_notes[midx].size()) {
+                Note& n = current_edit_pattern(s).melodic_notes[midx][piano_active_note_idx];
                 if (n.duration_steps > 1) {
                     --n.duration_steps;
                     s.melodic_dirty[midx].store(true);
                 } else {
-                    s.melodic_notes[midx].erase(s.melodic_notes[midx].begin()
+                    current_edit_pattern(s).melodic_notes[midx].erase(current_edit_pattern(s).melodic_notes[midx].begin()
                                                 + piano_active_note_idx);
                     s.melodic_dirty[midx].store(true);
                     pr_release_active();
@@ -965,7 +1100,7 @@ static bool dispatch_piano_roll(SessionState& s, Event e) {
     if (e == Event::Backspace) {
         // Delete the note under the cursor.
         int midx = TRACK_DEFS[piano_track].melodic_idx;
-        auto& notes = s.melodic_notes[midx];
+        auto& notes = current_edit_pattern(s).melodic_notes[midx];
         uint8_t pitch = pr_cursor_pitch();
         for (auto it = notes.begin(); it != notes.end(); ++it) {
             if (it->pitch_midi != pitch) continue;
@@ -1011,7 +1146,7 @@ static bool dispatch_piano_roll(SessionState& s, Event e) {
         if (c == 'C') {
             // Shift+C clears the piano roll's entire pattern.
             int midx = TRACK_DEFS[piano_track].melodic_idx;
-            s.melodic_notes[midx].clear();
+            current_edit_pattern(s).melodic_notes[midx].clear();
             pr_release_active();
             s.melodic_dirty[midx].store(true);
             return true;
@@ -1025,7 +1160,7 @@ static bool dispatch_piano_roll(SessionState& s, Event e) {
             // Copy duration of the note under cursor (if any).
             int midx = TRACK_DEFS[piano_track].melodic_idx;
             uint8_t pitch = pr_cursor_pitch();
-            for (const Note& n : s.melodic_notes[midx]) {
+            for (const Note& n : current_edit_pattern(s).melodic_notes[midx]) {
                 if (n.pitch_midi != pitch) continue;
                 int end = n.start_step + n.duration_steps;
                 if (piano_cursor_step >= n.start_step && piano_cursor_step < end) {
@@ -1085,7 +1220,7 @@ static void fill_pattern(SessionState& s, int interval, int start) {
         int dk = TRACK_DEFS[cursor_track].drum_kind;
         uint16_t fill_mask = 0;
         for (int step = start; step < s.loop_len; step += interval) {
-            s.drum_grid[dk][step] = true;
+            current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][step] = true;
             fill_mask |= static_cast<uint16_t>(1) << step;
         }
         s.dirty[cursor_track].fetch_or(fill_mask, std::memory_order_relaxed);
@@ -1093,10 +1228,11 @@ static void fill_pattern(SessionState& s, int interval, int start) {
     }
     int midx = TRACK_DEFS[cursor_track].melodic_idx;
     uint8_t root = s.track_root_midi[cursor_track];
-    auto& notes = s.melodic_notes[midx];
+    auto& notes = current_edit_pattern(s).melodic_notes[midx];
     bool changed = false;
     for (int step = start; step < s.loop_len; step += interval) {
-        Note n{ static_cast<uint8_t>(step), 1, root, 127 };
+        Note n{ static_cast<uint8_t>(s.edit_bar.load()),
+                static_cast<uint8_t>(step), 1, root, 127 };
         if (add_note(notes, n)) changed = true;
     }
     if (changed) s.melodic_dirty[midx].store(true);
@@ -1111,51 +1247,81 @@ static void fill_pattern(SessionState& s, int interval, int start) {
 //                    pitches discarded).
 // Native-type paste is a straight copy.
 static int               clip_kind = -1;  // -1 empty, 0 drum, 1 melodic
-static bool              clip_drum[STEPS] = {};
+static bool              clip_drum[MAX_STEPS_PER_BAR] = {};
+static int               clip_spb  = 0;
 static std::vector<Note> clip_notes;
 
+// Both copy and paste are bar-scoped: copy snapshots only the cells/notes that
+// belong to the source bar (with melodic notes' bar field normalized to 0),
+// and paste rewrites only the destination bar (notes outside it are left
+// alone). This lets the user copy a bar and paste it into a different bar in
+// the same pattern.
 static void copy_cursor_track(SessionState& s) {
+    int spb = current_spb(s);
+    int sb  = s.edit_bar.load();
     if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
         int dk = TRACK_DEFS[cursor_track].drum_kind;
-        for (int st = 0; st < STEPS; ++st) clip_drum[st] = s.drum_grid[dk][st];
+        for (int st = 0; st < MAX_STEPS_PER_BAR; ++st)
+            clip_drum[st] = (st < spb) && current_edit_pattern(s).drum_grid[dk][sb][st];
         clip_notes.clear();
         clip_kind = 0;
+        clip_spb  = spb;
     } else {
         int midx = TRACK_DEFS[cursor_track].melodic_idx;
-        clip_notes = s.melodic_notes[midx];
-        for (int st = 0; st < STEPS; ++st) clip_drum[st] = false;
+        clip_notes.clear();
+        for (const Note& n : current_edit_pattern(s).melodic_notes[midx]) {
+            if (n.bar == sb) {
+                Note c = n;
+                c.bar = 0;  // normalized; paste rebases to target edit_bar
+                clip_notes.push_back(c);
+            }
+        }
+        for (int st = 0; st < MAX_STEPS_PER_BAR; ++st) clip_drum[st] = false;
         clip_kind = 1;
+        clip_spb  = spb;
     }
 }
 
 static void paste_to_cursor_track(SessionState& s) {
     if (clip_kind < 0) return;
+    int spb = current_spb(s);
+    int n   = std::min(spb, clip_spb > 0 ? clip_spb : spb);
+    int db  = s.edit_bar.load();
+    Pattern& pat = current_edit_pattern(s);
     if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
         int dk = TRACK_DEFS[cursor_track].drum_kind;
         if (clip_kind == 0) {
-            for (int st = 0; st < STEPS; ++st) s.drum_grid[dk][st] = clip_drum[st];
+            for (int st = 0; st < spb; ++st)
+                pat.drum_grid[dk][db][st] = (st < n) && clip_drum[st];
         } else {
-            // melodic -> drum: hit on every note start_step.
-            for (int st = 0; st < STEPS; ++st) s.drum_grid[dk][st] = false;
-            for (const Note& n : clip_notes) {
-                if (n.start_step < STEPS) s.drum_grid[dk][n.start_step] = true;
+            for (int st = 0; st < spb; ++st) pat.drum_grid[dk][db][st] = false;
+            for (const Note& n2 : clip_notes) {
+                if (n2.start_step < spb)
+                    pat.drum_grid[dk][db][n2.start_step] = true;
             }
         }
         s.dirty[cursor_track].fetch_or(0xFFFFu, std::memory_order_relaxed);
     } else {
         int midx = TRACK_DEFS[cursor_track].melodic_idx;
         uint8_t root = s.track_root_midi[cursor_track];
-        auto& notes = s.melodic_notes[midx];
-        notes.clear();
+        auto& notes = pat.melodic_notes[midx];
+        // Wipe only the destination bar so notes in other bars survive.
+        notes.erase(std::remove_if(notes.begin(), notes.end(),
+                                   [db](const Note& x){ return x.bar == db; }),
+                    notes.end());
         if (clip_kind == 0) {
-            // drum -> melodic: 1-step note at root pitch for every hit.
-            for (int st = 0; st < STEPS; ++st) {
+            for (int st = 0; st < n; ++st) {
                 if (!clip_drum[st]) continue;
-                Note n{ static_cast<uint8_t>(st), 1, root, 127 };
-                add_note(notes, n);
+                Note nn{ static_cast<uint8_t>(db),
+                         static_cast<uint8_t>(st), 1, root, 127 };
+                add_note(notes, nn);
             }
         } else {
-            for (const Note& n : clip_notes) add_note(notes, n);
+            for (const Note& n2 : clip_notes) {
+                Note nn = n2;
+                nn.bar = static_cast<uint8_t>(db);
+                add_note(notes, nn);
+            }
         }
         s.melodic_dirty[midx].store(true);
     }
@@ -1167,14 +1333,14 @@ static void paste_to_cursor_track(SessionState& s) {
 static void delete_at_cursor_cell(SessionState& s) {
     if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
         int dk = TRACK_DEFS[cursor_track].drum_kind;
-        if (!s.drum_grid[dk][cursor_step]) return;
-        s.drum_grid[dk][cursor_step] = false;
+        if (!current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][cursor_step]) return;
+        current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][cursor_step] = false;
         s.dirty[cursor_track].fetch_or(static_cast<uint16_t>(1) << cursor_step,
                                        std::memory_order_relaxed);
         return;
     }
     int midx = TRACK_DEFS[cursor_track].melodic_idx;
-    auto& notes = s.melodic_notes[midx];
+    auto& notes = current_edit_pattern(s).melodic_notes[midx];
     bool changed = false;
     for (auto it = notes.begin(); it != notes.end();) {
         int end = it->start_step + it->duration_steps;
@@ -1235,10 +1401,11 @@ static bool handle_shared_track_command(SessionState& s, Event e) {
     }
     if (e == Event::Character('D')) {
         auto now = clk::now();
+        int spb = current_spb(s);
         if (now - last_A <= CLEAR_ALL_WINDOW) {
             for (int k = 0; k < DRUM_KINDS; ++k)
-                for (int st = 0; st < STEPS; ++st) s.drum_grid[k][st].store(false);
-            for (int m = 0; m < MELODIC_VOICES; ++m) s.melodic_notes[m].clear();
+                for (int st = 0; st < spb; ++st) current_edit_pattern(s).drum_grid[k][s.edit_bar.load()][st].store(false);
+            for (int m = 0; m < MELODIC_VOICES; ++m) current_edit_pattern(s).melodic_notes[m].clear();
             for (int t = 0; t < TRACKS; ++t) s.dirty[t].fetch_or(0xFFFFu);
             for (int m = 0; m < MELODIC_VOICES; ++m) s.melodic_dirty[m].store(true);
             last_A = clk::time_point{};
@@ -1246,11 +1413,11 @@ static bool handle_shared_track_command(SessionState& s, Event e) {
         }
         if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
             int dk = TRACK_DEFS[cursor_track].drum_kind;
-            for (int st = 0; st < STEPS; ++st) s.drum_grid[dk][st].store(false);
+            for (int st = 0; st < spb; ++st) current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][st].store(false);
             s.dirty[cursor_track].fetch_or(0xFFFFu, std::memory_order_relaxed);
         } else {
             int midx = TRACK_DEFS[cursor_track].melodic_idx;
-            s.melodic_notes[midx].clear();
+            current_edit_pattern(s).melodic_notes[midx].clear();
             s.melodic_dirty[midx].store(true);
         }
         return true;
@@ -1305,46 +1472,112 @@ static bool dispatch_grid(SessionState& s, Event e) {
     if (e == Event::ArrowDown) { cycle_cursor_to_active(s, +1); return true; }
 
     if (seq_mode) {
-        if (e == Event::ArrowLeft)  { window_start = (window_start - 8 + 16) % 16; return true; }
-        if (e == Event::ArrowRight) { window_start = (window_start + 8) % 16;      return true; }
+        Pattern& cur = current_edit_pattern(s);
+        int spb = steps_per_bar(cur.time_sig_num);
+        int len = std::max<int>(1, cur.length_bars);
+        int eb  = s.edit_bar.load();
+        // Step through the 8-step window. At a bar boundary, cross into the
+        // adjacent bar if one exists; otherwise wrap within the current bar.
+        if (e == Event::ArrowLeft) {
+            if (window_start >= 8) {
+                window_start -= 8;
+            } else if (eb > 0) {
+                s.edit_bar.store(eb - 1);
+                int prev_spb = spb;  // same pattern, same time-sig
+                window_start = std::max(0, prev_spb - 8);
+            } else {
+                window_start = (window_start - 8 + spb) % spb;
+            }
+            return true;
+        }
+        if (e == Event::ArrowRight) {
+            if (window_start + 8 < spb) {
+                window_start += 8;
+            } else if (eb < len - 1) {
+                s.edit_bar.store(eb + 1);
+                window_start = 0;
+            } else {
+                window_start = (window_start + 8) % spb;
+            }
+            return true;
+        }
         if (e.is_character() && e.character().size() == 1) {
             char c = e.character()[0];
             if (c >= '1' && c <= '8') {
                 int step = window_start + (c - '1');
+                if (step >= spb) return true;
                 if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
                     int dk = TRACK_DEFS[cursor_track].drum_kind;
-                    s.drum_grid[dk][step] = !s.drum_grid[dk][step];
+                    current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][step] = !current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][step];
                     s.dirty[cursor_track].fetch_or(1u << step, std::memory_order_relaxed);
                 }
                 return true;
             }
         }
     } else {
+        // Phase 6: arrows traverse the full multi-bar pattern. At the last
+        // step of bar N (N < length_bars-1), → advances to step 0 of bar N+1;
+        // ← does the mirror. At the absolute pattern end, → wraps to step 0
+        // of bar 0; ← wraps to the last step of the last bar.
         if (e == Event::ArrowLeft) {
-            cursor_step = (cursor_step - 1 + STEPS) % STEPS; return true;
+            Pattern& cur = current_edit_pattern(s);
+            int spb = steps_per_bar(cur.time_sig_num);
+            int eb  = s.edit_bar.load();
+            int len = std::max<int>(1, cur.length_bars);
+            if (cursor_step > 0) {
+                --cursor_step;
+            } else if (eb > 0) {
+                s.edit_bar.store(eb - 1);
+                int new_spb = steps_per_bar(cur.time_sig_num);  // same pattern
+                cursor_step = new_spb - 1;
+            } else {
+                // Wrap to last bar, last step.
+                s.edit_bar.store(len - 1);
+                cursor_step = spb - 1;
+            }
+            clamp_cursor_to_spb(steps_per_bar(cur.time_sig_num));
+            return true;
         }
         if (e == Event::ArrowRight) {
-            cursor_step = (cursor_step + 1) % STEPS; return true;
+            Pattern& cur = current_edit_pattern(s);
+            int spb = steps_per_bar(cur.time_sig_num);
+            int eb  = s.edit_bar.load();
+            int len = std::max<int>(1, cur.length_bars);
+            if (cursor_step < spb - 1) {
+                ++cursor_step;
+            } else if (eb < len - 1) {
+                s.edit_bar.store(eb + 1);
+                cursor_step = 0;
+            } else {
+                s.edit_bar.store(0);
+                cursor_step = 0;
+            }
+            clamp_cursor_to_spb(steps_per_bar(cur.time_sig_num));
+            return true;
         }
         if (e == Event::Character(' ')) {
             if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
                 int dk = TRACK_DEFS[cursor_track].drum_kind;
-                s.drum_grid[dk][cursor_step] = !s.drum_grid[dk][cursor_step];
+                current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][cursor_step] = !current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][cursor_step];
                 s.dirty[cursor_track].fetch_or(1u << cursor_step, std::memory_order_relaxed);
             } else {
                 // Place a 1-step note at root pitch. If a note already starts
                 // at this cell on the root pitch, remove it (toggle feel).
                 int midx = TRACK_DEFS[cursor_track].melodic_idx;
                 uint8_t root = s.track_root_midi[cursor_track];
-                auto& notes = s.melodic_notes[midx];
+                auto& notes = current_edit_pattern(s).melodic_notes[midx];
                 bool removed = false;
+                int cur_bar = s.edit_bar.load();
                 for (auto it = notes.begin(); it != notes.end(); ++it) {
-                    if (it->start_step == cursor_step && it->pitch_midi == root) {
+                    if (it->bar == cur_bar
+                        && it->start_step == cursor_step
+                        && it->pitch_midi == root) {
                         notes.erase(it); removed = true; break;
                     }
                 }
                 if (!removed) {
-                    Note n{ static_cast<uint8_t>(cursor_step), 1, root, 127 };
+                    Note n{ static_cast<uint8_t>(cur_bar),
+                            static_cast<uint8_t>(cursor_step), 1, root, 127 };
                     add_note(notes, n);
                 }
                 s.melodic_dirty[midx].store(true);
@@ -1355,10 +1588,102 @@ static bool dispatch_grid(SessionState& s, Event e) {
     return false;
 }
 
+// Phase 4: song-mode view. Renders the song timeline as a horizontal strip
+// of bars; each pattern occupies a block whose width matches its length.
+// The cursor highlights one bar; numeric digits 0..9 accumulate a 2-digit
+// pattern id; the second digit (or a non-digit / timeout) commits.
+static int g_song_digit_buf = -1;  // -1 = no pending digit
+static std::chrono::steady_clock::time_point g_song_digit_t0;
+static constexpr int SONG_DIGIT_TIMEOUT_MS = 1000;
+
+// Apply a resolved pattern id at the song cursor: 0 clears, otherwise place
+// (only if a pattern with that id exists).
+static void commit_song_digit(SessionState& s, int pid) {
+    int bar = s.song_view_cursor_bar.load();
+    if (pid == 0) {
+        if (bar < static_cast<int>(s.song.size())) {
+            s.song[bar] = 0;
+            set_bar_bit(s.song_dirty, bar);
+        }
+        return;
+    }
+    if (find_pattern(s, static_cast<uint16_t>(pid))) {
+        song_place_pattern_at_bar(s, bar, static_cast<uint16_t>(pid));
+    }
+}
+static Element render_song_mode_view(SessionState& s) {
+    Elements lines;
+    char head[160];
+    std::snprintf(head, sizeof(head),
+                  "  SONG MODE  bpm: %d  song bars: %zu  cursor bar: %d  %s",
+                  s.bpm, s.song.size(), s.song_view_cursor_bar.load() + 1,
+                  s.playing.load() ? "▶" : "■");
+    lines.push_back(text("bitjams") | bold | color(COL_PURPLE));
+    lines.push_back(text(head) | color(COL_PURPLE));
+    lines.push_back(text(""));
+
+    int cursor_bar = s.song_view_cursor_bar.load();
+    int play_song_bar = s.play_song_bar.load();
+    int per_row = 16;
+    int rows = static_cast<int>((s.song.size() + per_row - 1) / per_row);
+    if (rows < 1) rows = 1;
+
+    for (int r = 0; r < rows; ++r) {
+        // bar numbers
+        Elements num_row;
+        Elements blk_row;
+        for (int c = 0; c < per_row; ++c) {
+            int bar = r * per_row + c;
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), " %3d ", bar + 1);
+            Element n = text(buf) | color(COL_BRIGHT);
+            num_row.push_back(n);
+
+            Element cell;
+            if (bar < static_cast<int>(s.song.size())) {
+                uint16_t pid = s.song[bar];
+                char cbuf[8];
+                if (pid == 0)         std::snprintf(cbuf, sizeof(cbuf), "  ·  ");
+                else                  std::snprintf(cbuf, sizeof(cbuf), " P%02u ", static_cast<unsigned>(pid));
+                cell = text(cbuf);
+                if (bar == play_song_bar && s.playing.load()) cell = cell | color(COL_HEAD) | bold;
+                else if (pid != 0)                            cell = cell | color(COL_GREEN);
+                else                                          cell = cell | color(COL_DIM);
+            } else {
+                cell = text("  -  ") | color(COL_DIM);
+            }
+            if (bar == cursor_bar) cell = cell | inverted;
+            blk_row.push_back(cell);
+        }
+        lines.push_back(hbox(std::move(num_row)));
+        lines.push_back(hbox(std::move(blk_row)));
+        lines.push_back(text(""));
+    }
+
+    // Pattern legend
+    {
+        Elements legend;
+        legend.push_back(text("  patterns:  ") | color(COL_DIM));
+        for (const auto& p : s.patterns) {
+            char buf[20];
+            std::snprintf(buf, sizeof(buf), "P%02u(%db) ",
+                          static_cast<unsigned>(p->id), p->length_bars);
+            legend.push_back(text(buf) | color(COL_GREEN));
+        }
+        lines.push_back(hbox(std::move(legend)));
+    }
+    lines.push_back(text("  arrows: move cursor   0-9: type pattern id   shift+tab: seq view")
+                    | color(COL_DIM));
+
+    return vbox(std::move(lines));
+}
+
 Component build_session_ui(ScreenInteractive& screen, SessionState& state) {
     auto root = Renderer([&state] {
         Element page;
-        if (nav_state == NavState::PARAM_PAGE) {
+        if (state.song_view_focused.load()) {
+            page = render_song_mode_view(state);
+        } else if (nav_state == NavState::PARAM_PAGE) {
             ensure_cursor_visible(state);
             page = (TRACK_DEFS[cursor_track].type == TrackType::MELODIC)
                  ? render_melodic_param_page(state, cursor_track)
@@ -1405,7 +1730,9 @@ Component build_session_ui(ScreenInteractive& screen, SessionState& state) {
             if (!state.playing.load()) state.play_step.store(0);
             return true;
         }
-        if (e == Event::Character('+') || e == Event::Character('=')) {
+        // Phase 4: '+' is reassigned to "new pattern" (see below); BPM still
+        // bumps on '='. BPM down stays on '-'.
+        if (e == Event::Character('=')) {
             state.bpm = std::min(300, state.bpm + 5);
             state.bpm_dirty.store(true, std::memory_order_relaxed);
             return true;
@@ -1415,11 +1742,161 @@ Component build_session_ui(ScreenInteractive& screen, SessionState& state) {
             state.bpm_dirty.store(true, std::memory_order_relaxed);
             return true;
         }
+        // Phase 2: ']' extends the current edit pattern by one bar (capped
+        // at MAX_BARS_PER_PATTERN); '[' shrinks by one bar (min 1). Both
+        // are non-destructive — shrunken bars retain their data.
         if (e == Event::Character(']')) {
-            state.loop_len = std::min(16, state.loop_len + 1); return true;
+            extend_pattern_length(state, 1); return true;
         }
         if (e == Event::Character('[')) {
-            state.loop_len = std::max(1, state.loop_len - 1); return true;
+            shrink_pattern_length(state, 1);
+            // Clamp edit_bar / play_bar into the new range.
+            if (!state.patterns.empty()) {
+                int len = current_edit_pattern(state).length_bars;
+                if (state.edit_bar.load() >= len) state.edit_bar.store(len - 1);
+                if (state.play_bar.load() >= len) state.play_bar.store(0);
+            }
+            return true;
+        }
+        // Phase 3: '.' bumps the time-sig numerator (capped at 8), ','
+        // shrinks (floor 1). Non-destructive — cells past the new bar end
+        // are retained.
+        if (e == Event::Character('.')) {
+            inc_pattern_time_sig(state); return true;
+        }
+        if (e == Event::Character(',')) {
+            dec_pattern_time_sig(state);
+            if (!state.patterns.empty()) {
+                int spb = steps_per_bar(current_edit_pattern(state).time_sig_num);
+                if (state.play_step.load() >= spb) state.play_step.store(0);
+                if (state.loop_len > spb) state.loop_len = spb;
+            }
+            return true;
+        }
+        // Phase 6/7: bar-edge jump, two-press semantics. First press snaps the
+        // cursor to the bar's edge (step 0 for left, last step for right)
+        // without changing edit_bar; a second consecutive press pages to the
+        // adjacent bar with cursor anchored to the same edge.
+        //
+        // Bindings: Shift+← / Shift+→ are the primary keys (terminals deliver
+        // them as CSI 1;2D / 1;2C). Ctrl+← / Ctrl+→ (ArrowLeftCtrl / Ctrl)
+        // and Home / End are accepted as fallbacks. macOS Cmd+arrow is not
+        // forwarded by most terminals, so it was retired here.
+        if (e == Event::ArrowLeftCtrl || e == Event::Home
+            || e == Event::Special("\x1B[1;2D")) {
+            int spb = current_spb(state);
+            int eb  = state.edit_bar.load();
+            if (cursor_step != 0) {
+                cursor_step = 0;
+            } else if (eb > 0) {
+                state.edit_bar.store(eb - 1);
+                cursor_step = 0;
+            }
+            clamp_cursor_to_spb(spb);
+            return true;
+        }
+        if (e == Event::ArrowRightCtrl || e == Event::End
+            || e == Event::Special("\x1B[1;2C")) {
+            Pattern& cur = current_edit_pattern(state);
+            int spb = steps_per_bar(cur.time_sig_num);
+            int len = std::max<int>(1, cur.length_bars);
+            int eb  = state.edit_bar.load();
+            int last = spb - 1;
+            if (cursor_step != last) {
+                cursor_step = last;
+            } else if (eb < len - 1) {
+                state.edit_bar.store(eb + 1);
+                cursor_step = steps_per_bar(cur.time_sig_num) - 1;
+            }
+            clamp_cursor_to_spb(steps_per_bar(cur.time_sig_num));
+            return true;
+        }
+        // Phase 4: '+' creates a new blank pattern and appends it to the
+        // song (also moves edit focus). 'Shift+L' toggles pattern-loop
+        // (per-peer playback override). 'Shift+Tab' toggles between
+        // sequencer and song-mode views.
+        //
+        // Note on Cmd+Plus: FTXUI on macOS exposes that as a different
+        // character sequence depending on terminal. We map '*' (Shift+8 on
+        // many layouts) as a fallback for "duplicate"; mainline '+' creates
+        // a blank pattern.
+        if (e == Event::Character('+')) {
+            create_new_pattern(state);
+            return true;
+        }
+        if (e == Event::Character('*')) {
+            duplicate_current_pattern(state);
+            return true;
+        }
+        if (e == Event::Character('L')) {
+            state.pattern_loop.store(!state.pattern_loop.load());
+            return true;
+        }
+        // Phase 7: Shift+F toggles follow mode (lock editor view to playhead).
+        if (e == Event::Character('F')) {
+            follow_mode = !follow_mode;
+            return true;
+        }
+        // Phase 7: Shift+B duplicates the bar under the edit cursor (inserts a
+        // copy immediately after it). No-op at MAX_BARS_PER_PATTERN.
+        if (e == Event::Character('B')) {
+            duplicate_current_bar(state);
+            return true;
+        }
+        if (e == Event::TabReverse || e == Event::Special("\x1b[Z")) {
+            state.song_view_focused.store(!state.song_view_focused.load());
+            return true;
+        }
+
+        // Phase 4 + Phase 6: when the song-mode view is focused, intercept
+        // arrows (move the bar cursor) and digits. First digit buffers for
+        // up to SONG_DIGIT_TIMEOUT_MS; a second digit within that window
+        // composes a 2-digit pid; otherwise the single digit commits on
+        // timeout. Refresh-driven Event::Custom ticks drive the timeout
+        // check, so the buffer is NOT cleared by them.
+        if (state.song_view_focused.load()) {
+            if (g_song_digit_buf >= 0) {
+                auto now = std::chrono::steady_clock::now();
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - g_song_digit_t0).count();
+                if (elapsed >= SONG_DIGIT_TIMEOUT_MS) {
+                    int pid = g_song_digit_buf;
+                    g_song_digit_buf = -1;
+                    commit_song_digit(state, pid);
+                }
+            }
+            if (e == Event::ArrowLeft) {
+                int c = state.song_view_cursor_bar.load();
+                if (c > 0) state.song_view_cursor_bar.store(c - 1);
+                g_song_digit_buf = -1;
+                return true;
+            }
+            if (e == Event::ArrowRight) {
+                int c = state.song_view_cursor_bar.load();
+                if (c < MAX_SONG_BARS - 1) state.song_view_cursor_bar.store(c + 1);
+                g_song_digit_buf = -1;
+                return true;
+            }
+            if (e.is_character() && e.character().size() == 1
+                && e.character()[0] >= '0' && e.character()[0] <= '9') {
+                int d = e.character()[0] - '0';
+                if (g_song_digit_buf < 0) {
+                    g_song_digit_buf = d;
+                    g_song_digit_t0  = std::chrono::steady_clock::now();
+                } else {
+                    int pid = g_song_digit_buf * 10 + d;
+                    g_song_digit_buf = -1;
+                    commit_song_digit(state, pid);
+                }
+                return true;
+            }
+            // Non-digit character cancels the pending digit (e.g., user
+            // pressed `+` or `p` instead of finishing the number). Custom
+            // and other non-character events leave the buffer alone.
+            if (e.is_character()) {
+                g_song_digit_buf = -1;
+            }
+            // Fall through so transport / record / quit etc. still work.
         }
 
         switch (nav_state) {

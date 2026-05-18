@@ -17,7 +17,8 @@ namespace bitjams_net_internal {
     bool   recv_and_apply_msg_state(int sock, SessionState& s);
     size_t build_msg_edit(SessionState& s, uint8_t* buf, size_t buf_cap);
     bool   recv_and_apply_msg_edit(int sock, SessionState& s, bool is_joiner);
-    size_t build_msg_melodic_track(int melodic_idx, const std::vector<Note>& notes,
+    size_t build_msg_melodic_track(uint16_t pattern_id, int melodic_idx,
+                                   const std::vector<Note>& notes,
                                    uint8_t* buf, size_t buf_cap);
     bool   recv_and_apply_msg_melodic_track(int sock, SessionState& s, bool is_joiner);
     size_t build_pending_aux(SessionState& s, uint8_t* buf, size_t buf_cap);
@@ -173,10 +174,10 @@ static void test_state_sync() {
     auto host_state = std::make_shared<SessionState>();
     host_state->session_id      = 4242;
     host_state->bpm             = 137;
-    host_state->drum_grid[DK_CLAP][5]   = true;
-    host_state->drum_grid[DK_CYMBAL][9] = true;
+    host_state->patterns[0]->drum_grid[DK_CLAP][0][5]   = true;
+    host_state->patterns[0]->drum_grid[DK_CYMBAL][0][9] = true;
     // A melodic note on the drone track must also propagate.
-    host_state->melodic_notes[3 /*drone*/].push_back({15, 1, 60, 127});
+    host_state->patterns[0]->melodic_notes[3 /*drone*/].push_back({0, 15, 1, 60, 127});
     host_state->track_root_midi[9] = 55;  // bass: change from default
 
     Network::host(host_state);
@@ -186,12 +187,12 @@ static void test_state_sync() {
     assert(joiner_state != nullptr);
     assert(joiner_state->session_id == 4242);
     assert(joiner_state->bpm == 137);
-    assert(joiner_state->drum_grid[DK_CLAP][5]   == true);
-    assert(joiner_state->drum_grid[DK_CYMBAL][9] == true);
-    assert(joiner_state->drum_grid[DK_KICK][0]   == false);
-    assert(joiner_state->melodic_notes[3].size() == 1);
-    assert(joiner_state->melodic_notes[3][0].start_step == 15);
-    assert(joiner_state->melodic_notes[3][0].pitch_midi == 60);
+    assert(joiner_state->patterns[0]->drum_grid[DK_CLAP][0][5]   == true);
+    assert(joiner_state->patterns[0]->drum_grid[DK_CYMBAL][0][9] == true);
+    assert(joiner_state->patterns[0]->drum_grid[DK_KICK][0][0]   == false);
+    assert(joiner_state->patterns[0]->melodic_notes[3].size() == 1);
+    assert(joiner_state->patterns[0]->melodic_notes[3][0].start_step == 15);
+    assert(joiner_state->patterns[0]->melodic_notes[3][0].pitch_midi == 60);
     assert(joiner_state->track_root_midi[9] == 55);
 
     Network::stop();
@@ -229,15 +230,15 @@ static void test_edit_propagates_host_to_joiner() {
 
     auto joiner_state = Network::join("127.0.0.1", 5050);
     assert(joiner_state != nullptr);
-    assert(joiner_state->drum_grid[DK_CLOSED_HAT][7] == false);
+    assert(joiner_state->patterns[0]->drum_grid[DK_CLOSED_HAT][0][7] == false);
 
     // Simulate a host UI mutation. Track 3 = chat = closed_hat drum_kind.
-    host_state->drum_grid[DK_CLOSED_HAT][7] = true;
+    host_state->patterns[0]->drum_grid[DK_CLOSED_HAT][0][7] = true;
     host_state->dirty[3].fetch_or(static_cast<uint16_t>(1) << 7);
 
     wait_flush_windows();
 
-    assert(joiner_state->drum_grid[DK_CLOSED_HAT][7] == true);
+    assert(joiner_state->patterns[0]->drum_grid[DK_CLOSED_HAT][0][7] == true);
 
     Network::stop();
     std::cout << "test_edit_propagates_host_to_joiner PASSED\n";
@@ -254,13 +255,13 @@ static void test_edit_propagates_joiner_to_host() {
     assert(joiner_state != nullptr);
 
     // Simulate joiner UI mutation. Track 5 = cowb = DK_COWBELL drum_kind.
-    joiner_state->drum_grid[DK_COWBELL][2] = true;
+    joiner_state->patterns[0]->drum_grid[DK_COWBELL][0][2] = true;
     joiner_state->dirty[5].fetch_or(static_cast<uint16_t>(1) << 2);
 
     wait_flush_windows();
 
     // Host received and applied the edit.
-    assert(host_state->drum_grid[DK_COWBELL][2] == true);
+    assert(host_state->patterns[0]->drum_grid[DK_COWBELL][0][2] == true);
 
     // Host's relay echo arrived back at the joiner and cleared the in-flight
     // guard.
@@ -285,20 +286,20 @@ static void test_two_joiners_non_conflicting() {
     assert(joiner_b != nullptr);
 
     // Different drum cells, no conflict. Track 1 = snare, track 6 = tom.
-    joiner_a->drum_grid[DK_SNARE][4] = true;
+    joiner_a->patterns[0]->drum_grid[DK_SNARE][0][4] = true;
     joiner_a->dirty[1].fetch_or(static_cast<uint16_t>(1) << 4);
 
-    joiner_b->state->drum_grid[DK_TOM][12] = true;
+    joiner_b->state->patterns[0]->drum_grid[DK_TOM][0][12] = true;
     joiner_b->state->dirty[6].fetch_or(static_cast<uint16_t>(1) << 12);
 
     wait_flush_windows();
 
-    assert(host_state->drum_grid[DK_SNARE][4]    == true);
-    assert(host_state->drum_grid[DK_TOM][12]     == true);
-    assert(joiner_a->drum_grid[DK_SNARE][4]      == true);
-    assert(joiner_a->drum_grid[DK_TOM][12]       == true);
-    assert(joiner_b->state->drum_grid[DK_SNARE][4]  == true);
-    assert(joiner_b->state->drum_grid[DK_TOM][12]   == true);
+    assert(host_state->patterns[0]->drum_grid[DK_SNARE][0][4]    == true);
+    assert(host_state->patterns[0]->drum_grid[DK_TOM][0][12]     == true);
+    assert(joiner_a->patterns[0]->drum_grid[DK_SNARE][0][4]      == true);
+    assert(joiner_a->patterns[0]->drum_grid[DK_TOM][0][12]       == true);
+    assert(joiner_b->state->patterns[0]->drum_grid[DK_SNARE][0][4]  == true);
+    assert(joiner_b->state->patterns[0]->drum_grid[DK_TOM][0][12]   == true);
 
     joiner_b.reset();
     Network::stop();
@@ -321,18 +322,18 @@ static void test_two_joiners_conflicting_converge() {
     // Same cell. Joiner A wants true, joiner B wants false. Both flush at
     // ~the same time. The host's relay is authoritative.
     // Same drum cell (chat track). Joiner A wants true, joiner B wants false.
-    joiner_a->drum_grid[DK_CLOSED_HAT][5] = true;
+    joiner_a->patterns[0]->drum_grid[DK_CLOSED_HAT][0][5] = true;
     joiner_a->dirty[3].fetch_or(static_cast<uint16_t>(1) << 5);
 
-    joiner_b->state->drum_grid[DK_CLOSED_HAT][5] = false;
+    joiner_b->state->patterns[0]->drum_grid[DK_CLOSED_HAT][0][5] = false;
     joiner_b->state->dirty[3].fetch_or(static_cast<uint16_t>(1) << 5);
 
     // Extra window — gives the conflict-flicker time to resolve.
     wait_flush_windows(4);
 
-    bool host_v = host_state->drum_grid[DK_CLOSED_HAT][5];
-    assert(joiner_a->drum_grid[DK_CLOSED_HAT][5]        == host_v);
-    assert(joiner_b->state->drum_grid[DK_CLOSED_HAT][5] == host_v);
+    bool host_v = host_state->patterns[0]->drum_grid[DK_CLOSED_HAT][0][5];
+    assert(joiner_a->patterns[0]->drum_grid[DK_CLOSED_HAT][0][5]        == host_v);
+    assert(joiner_b->state->patterns[0]->drum_grid[DK_CLOSED_HAT][0][5] == host_v);
 
     joiner_b.reset();
     Network::stop();
@@ -360,13 +361,13 @@ static void test_joiner_disconnect_does_not_crash_host() {
 
     // Surviving joiner B can still send edits and the host applies + relays.
     // Track 2 = clap = DK_CLAP.
-    joiner_b->drum_grid[DK_CLAP][2] = true;
+    joiner_b->patterns[0]->drum_grid[DK_CLAP][0][2] = true;
     joiner_b->dirty[2].fetch_or(static_cast<uint16_t>(1) << 2);
 
     wait_flush_windows();
 
-    assert(host_state->drum_grid[DK_CLAP][2] == true);
-    assert(joiner_b->drum_grid[DK_CLAP][2]   == true);
+    assert(host_state->patterns[0]->drum_grid[DK_CLAP][0][2] == true);
+    assert(joiner_b->patterns[0]->drum_grid[DK_CLAP][0][2]   == true);
 
     joiner_a.reset();
     Network::stop();
@@ -375,8 +376,8 @@ static void test_joiner_disconnect_does_not_crash_host() {
 
 static void test_projection_lowest_wins() {
     std::vector<Note> notes;
-    notes.push_back({0, 4, 69, 127});  // A4
-    notes.push_back({0, 4, 72, 127});  // C5
+    notes.push_back({0, 0, 4, 69, 127});  // A4
+    notes.push_back({0, 0, 4, 72, 127});  // C5
     auto proj = project_row(notes, 16);
     // Both notes start at cell 0; lowest-pitch wins -> A4 (idx 0).
     assert(proj[0].note_idx == 0);
@@ -390,9 +391,9 @@ static void test_projection_lowest_wins() {
 
 static void test_projection_stack_preempt_and_return() {
     std::vector<Note> notes;
-    notes.push_back({0, 16, 69, 127});  // A4 covers entire loop
-    notes.push_back({0,  1, 71, 127});  // B4 at cell 0 only
-    notes.push_back({1,  2, 60, 127});  // C4 at cells 1..2
+    notes.push_back({0, 0, 16, 69, 127});  // A4 covers entire loop
+    notes.push_back({0, 0,  1, 71, 127});  // B4 at cell 0 only
+    notes.push_back({0, 1,  2, 60, 127});  // C4 at cells 1..2
     auto proj = project_row(notes, 16);
     // cell 0: starters {A4, B4} -> A4 (lower).
     assert(proj[0].note_idx == 0);
@@ -409,7 +410,7 @@ static void test_projection_stack_preempt_and_return() {
 
 static void test_collision_truncate() {
     std::vector<Note> notes;
-    notes.push_back({0, 4, 60, 127});  // C4 [0..3]
+    notes.push_back({0, 0, 4, 60, 127});  // C4 [0..3]
     clear_or_truncate_at(notes, /*pitch_midi=*/60, /*at_step=*/2);
     // A < C -> truncate to duration = C - A = 2 (covers cells 0..1).
     assert(notes.size() == 1);
@@ -420,7 +421,7 @@ static void test_collision_truncate() {
 
 static void test_collision_delete_on_exact_start() {
     std::vector<Note> notes;
-    notes.push_back({0, 4, 60, 127});  // C4 [0..3]
+    notes.push_back({0, 0, 4, 60, 127});  // C4 [0..3]
     clear_or_truncate_at(notes, 60, 0);
     // A == C -> delete entirely.
     assert(notes.empty());
@@ -429,8 +430,8 @@ static void test_collision_delete_on_exact_start() {
 
 static void test_collision_different_pitch_unaffected() {
     std::vector<Note> notes;
-    notes.push_back({0, 4, 60, 127});  // C4
-    notes.push_back({0, 4, 64, 127});  // E4 same range, different row
+    notes.push_back({0, 0, 4, 60, 127});  // C4
+    notes.push_back({0, 0, 4, 64, 127});  // E4 same range, different row
     clear_or_truncate_at(notes, /*pitch=*/64, /*at_step=*/0);
     // Only the E4 row collides; C4 is untouched.
     assert(notes.size() == 1);
@@ -442,10 +443,10 @@ static void test_collision_different_pitch_unaffected() {
 static void test_note_cap() {
     std::vector<Note> notes;
     for (int i = 0; i < MAX_NOTES_PER_MELODIC; ++i) {
-        Note n{0, 1, static_cast<uint8_t>(60), 127};
+        Note n{0, 0, 1, static_cast<uint8_t>(60), 127};
         assert(add_note(notes, n));
     }
-    Note overflow{0, 1, 60, 127};
+    Note overflow{0, 0, 1, 60, 127};
     assert(!add_note(notes, overflow));
     assert(notes.size() == MAX_NOTES_PER_MELODIC);
     std::cout << "test_note_cap PASSED\n";
@@ -474,13 +475,13 @@ static void test_msg_state_roundtrip() {
     SessionState src;
     src.session_id = 12345;
     src.bpm = 144;
-    src.drum_grid[DK_KICK][0] = true;
-    src.drum_grid[DK_KICK][8] = true;
-    src.drum_grid[DK_SNARE][4] = true;
+    src.patterns[0]->drum_grid[DK_KICK][0][0] = true;
+    src.patterns[0]->drum_grid[DK_KICK][0][8] = true;
+    src.patterns[0]->drum_grid[DK_SNARE][0][4] = true;
     src.track_root_midi[8] = 64;  // lead -> E4
-    src.melodic_notes[0].push_back({0, 4, 67, 127});
-    src.melodic_notes[0].push_back({4, 2, 60, 100});
-    src.melodic_notes[3].push_back({0, 16, 36, 127});
+    src.patterns[0]->melodic_notes[0].push_back({0, 0, 4, 67, 127});
+    src.patterns[0]->melodic_notes[0].push_back({0, 4, 2, 60, 100});
+    src.patterns[0]->melodic_notes[3].push_back({0, 0, 16, 36, 127});
 
     assert(bitjams_net_internal::send_msg_state(sv[0], src));
 
@@ -494,19 +495,19 @@ static void test_msg_state_roundtrip() {
     assert(bitjams_net_internal::recv_and_apply_msg_state(sv[1], dst));
     assert(dst.session_id == 12345);
     assert(dst.bpm == 144);
-    assert(dst.drum_grid[DK_KICK][0] == true);
-    assert(dst.drum_grid[DK_KICK][8] == true);
-    assert(dst.drum_grid[DK_SNARE][4] == true);
-    assert(dst.drum_grid[DK_SNARE][0] == false);
+    assert(dst.patterns[0]->drum_grid[DK_KICK][0][0] == true);
+    assert(dst.patterns[0]->drum_grid[DK_KICK][0][8] == true);
+    assert(dst.patterns[0]->drum_grid[DK_SNARE][0][4] == true);
+    assert(dst.patterns[0]->drum_grid[DK_SNARE][0][0] == false);
     assert(dst.track_root_midi[8] == 64);
-    assert(dst.melodic_notes[0].size() == 2);
-    assert(dst.melodic_notes[0][0].start_step == 0);
-    assert(dst.melodic_notes[0][0].duration_steps == 4);
-    assert(dst.melodic_notes[0][0].pitch_midi == 67);
-    assert(dst.melodic_notes[0][1].velocity == 100);
-    assert(dst.melodic_notes[3].size() == 1);
-    assert(dst.melodic_notes[3][0].duration_steps == 16);
-    assert(dst.melodic_notes[1].empty());
+    assert(dst.patterns[0]->melodic_notes[0].size() == 2);
+    assert(dst.patterns[0]->melodic_notes[0][0].start_step == 0);
+    assert(dst.patterns[0]->melodic_notes[0][0].duration_steps == 4);
+    assert(dst.patterns[0]->melodic_notes[0][0].pitch_midi == 67);
+    assert(dst.patterns[0]->melodic_notes[0][1].velocity == 100);
+    assert(dst.patterns[0]->melodic_notes[3].size() == 1);
+    assert(dst.patterns[0]->melodic_notes[3][0].duration_steps == 16);
+    assert(dst.patterns[0]->melodic_notes[1].empty());
 
     close_socket(sv[0]);
     close_socket(sv[1]);
@@ -518,13 +519,13 @@ static void test_msg_melodic_track_roundtrip() {
     if (!make_socket_pair(sv)) std::abort();
 
     std::vector<Note> notes = {
-        {0, 1, 60, 127},
-        {2, 4, 64, 90},
-        {7, 9, 67, 127},
+        {0, 0, 1, 60, 127},
+        {0, 2, 4, 64, 90},
+        {0, 7, 9, 67, 127},
     };
     uint8_t buf[1024];
     size_t n = bitjams_net_internal::build_msg_melodic_track(
-        /*melodic_idx=*/1, notes, buf, sizeof(buf));
+        /*pattern_id=*/1, /*melodic_idx=*/1, notes, buf, sizeof(buf));
     assert(n > 0);
     int s = ::send(sv[0], reinterpret_cast<const char*>(buf), static_cast<int>(n), 0);
     assert(s == static_cast<int>(n));
@@ -537,10 +538,10 @@ static void test_msg_melodic_track_roundtrip() {
     assert(bitjams_net_internal::recv_and_apply_msg_melodic_track(
         sv[1], dst, /*is_joiner=*/false));
     // melodic_idx=1 -> track 9 (bass).
-    assert(dst.melodic_notes[1].size() == 3);
-    assert(dst.melodic_notes[1][0].pitch_midi == 60);
-    assert(dst.melodic_notes[1][2].pitch_midi == 67);
-    assert(dst.melodic_notes[1][1].velocity == 90);
+    assert(dst.patterns[0]->melodic_notes[1].size() == 3);
+    assert(dst.patterns[0]->melodic_notes[1][0].pitch_midi == 60);
+    assert(dst.patterns[0]->melodic_notes[1][2].pitch_midi == 67);
+    assert(dst.patterns[0]->melodic_notes[1][1].velocity == 90);
 
     close_socket(sv[0]);
     close_socket(sv[1]);
@@ -556,19 +557,19 @@ static void test_melodic_track_propagates_host_to_joiner() {
 
     auto joiner_state = Network::join("127.0.0.1", 6060);
     assert(joiner_state != nullptr);
-    assert(joiner_state->melodic_notes[0].empty());
+    assert(joiner_state->patterns[0]->melodic_notes[0].empty());
 
     // Host writes a note on lead (melodic_idx=0) and dirties.
-    { std::lock_guard<std::mutex> lk(host_state->melodic_mutex);
-      host_state->melodic_notes[0].push_back({3, 2, 72, 127}); }
+    { std::lock_guard<std::mutex> lk(host_state->patterns[0]->melodic_mutex);
+      host_state->patterns[0]->melodic_notes[0].push_back({0, 3, 2, 72, 127}); }
     host_state->melodic_dirty[0].store(true);
 
     wait_flush_windows();
 
-    { std::lock_guard<std::mutex> lk(joiner_state->melodic_mutex);
-      assert(joiner_state->melodic_notes[0].size() == 1);
-      assert(joiner_state->melodic_notes[0][0].start_step == 3);
-      assert(joiner_state->melodic_notes[0][0].pitch_midi == 72); }
+    { std::lock_guard<std::mutex> lk(joiner_state->patterns[0]->melodic_mutex);
+      assert(joiner_state->patterns[0]->melodic_notes[0].size() == 1);
+      assert(joiner_state->patterns[0]->melodic_notes[0][0].start_step == 3);
+      assert(joiner_state->patterns[0]->melodic_notes[0][0].pitch_midi == 72); }
 
     Network::stop();
     std::cout << "test_melodic_track_propagates_host_to_joiner PASSED\n";
@@ -584,16 +585,16 @@ static void test_melodic_track_propagates_joiner_to_host() {
     auto joiner_state = Network::join("127.0.0.1", 6161);
     assert(joiner_state != nullptr);
 
-    { std::lock_guard<std::mutex> lk(joiner_state->melodic_mutex);
-      joiner_state->melodic_notes[2].push_back({0, 8, 60, 127});
-      joiner_state->melodic_notes[2].push_back({8, 8, 67, 127}); }
+    { std::lock_guard<std::mutex> lk(joiner_state->patterns[0]->melodic_mutex);
+      joiner_state->patterns[0]->melodic_notes[2].push_back({0, 0, 8, 60, 127});
+      joiner_state->patterns[0]->melodic_notes[2].push_back({0, 8, 8, 67, 127}); }
     joiner_state->melodic_dirty[2].store(true);
 
     wait_flush_windows();
 
-    { std::lock_guard<std::mutex> lk(host_state->melodic_mutex);
-      assert(host_state->melodic_notes[2].size() == 2);
-      assert(host_state->melodic_notes[2][1].pitch_midi == 67); }
+    { std::lock_guard<std::mutex> lk(host_state->patterns[0]->melodic_mutex);
+      assert(host_state->patterns[0]->melodic_notes[2].size() == 2);
+      assert(host_state->patterns[0]->melodic_notes[2][1].pitch_midi == 67); }
     // After the host echo, in_flight should clear.
     assert(joiner_state->melodic_in_flight[2].load() == false);
 

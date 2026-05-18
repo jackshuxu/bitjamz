@@ -11,10 +11,54 @@
 // Anything used by more than one module (audio, ui, net, main) lives here.
 // Per-module helpers live in that module's own .cpp as file-locals.
 
-inline constexpr int TRACKS         = 12;
-inline constexpr int STEPS          = 16;
-inline constexpr int MELODIC_VOICES = 4;
-inline constexpr int DRUM_KINDS     = 8;
+inline constexpr int TRACKS                = 12;
+inline constexpr int MELODIC_VOICES        = 4;
+inline constexpr int DRUM_KINDS            = 8;
+
+// Phase 3: a beat is always 4 steps (16th-note resolution). The time-sig
+// numerator counts beats per bar; the denominator is fixed at /4. The worst
+// case is 8/4 = 32 steps/bar; the drum_grid is sized for that.
+inline constexpr int STEPS_PER_BEAT        = 4;
+inline constexpr int MAX_STEPS_PER_BAR     = 32;
+
+// Phase 2: a Pattern may span up to MAX_BARS_PER_PATTERN bars. The drum_grid
+// is dimensioned [DRUM_KINDS][MAX_BARS][MAX_STEPS_PER_BAR] so shrinking and
+// narrowing the time-sig are both non-destructive — cells outside the
+// active region are hidden during render and playback but retained in
+// storage. Extending re-exposes them.
+inline constexpr int MAX_BARS_PER_PATTERN  = 4;
+
+// Phase 4: maximum number of bars the song timeline can hold. Patterns
+// placed past this point are silently dropped.
+inline constexpr int MAX_SONG_BARS         = 128;
+
+// Phase 4: u8 id headroom for pattern allocation. Wire format uses u16.
+inline constexpr int MAX_PATTERNS          = 256;
+
+// Number of 16th-note steps in one bar for the given time-signature
+// numerator (denom always 4). Per Phase 3, callers use this instead of the
+// retired global STEPS constant.
+inline int steps_per_bar(uint8_t time_sig_num) {
+    return static_cast<int>(time_sig_num) * STEPS_PER_BEAT;
+}
+
+// Mark a pattern id dirty in one of the outbound network masks. Bit N is set
+// within mask[N/64]. No-op if id is 0 or out of range.
+inline void set_id_bit(std::atomic<uint64_t>* mask, uint16_t id) {
+    if (id == 0 || id >= 256) return;
+    mask[id / 64].fetch_or(static_cast<uint64_t>(1) << (id % 64));
+}
+inline void set_bar_bit(std::atomic<uint64_t>* mask, int bar) {
+    if (bar < 0 || bar >= 128) return;
+    mask[bar / 64].fetch_or(static_cast<uint64_t>(1) << (bar % 64));
+}
+
+// Backwards-compat shim: many call sites (and tests) used STEPS = 16 as the
+// step count of a 4/4 bar. New code should use steps_per_bar(p.time_sig_num)
+// instead; this remains as a constant for narrow-purpose call sites that
+// still hard-code 4/4 layouts (e.g. legacy MSG_EDIT wire format) and as the
+// default array stride.
+inline constexpr int STEPS                 = 16;
 
 enum class TrackType { DRUM, MELODIC };
 
@@ -28,13 +72,15 @@ enum class RecordState { OFF, COUNTDOWN, RECORDING };
 // 64-cap keeps packets small and matches the UI's "1-bar" mental model.
 inline constexpr int MAX_NOTES_PER_MELODIC = 64;
 
-// One note in a melodic track. start_step + duration_steps may exceed
-// loop_len; the audio side only fires the onset.
+// One note in a melodic track. start_step + duration_steps may exceed the
+// bar's step count; the audio side only fires the onset and tail-clips at
+// bar boundary. `bar` is the 0-indexed bar this note lives in (Phase 2+).
 struct Note {
-    uint8_t start_step;
-    uint8_t duration_steps;
-    uint8_t pitch_midi;
-    uint8_t velocity;
+    uint8_t bar = 0;
+    uint8_t start_step = 0;
+    uint8_t duration_steps = 0;
+    uint8_t pitch_midi = 0;
+    uint8_t velocity = 0;
 };
 
 inline float midi_to_hz(uint8_t m) {
@@ -49,15 +95,21 @@ inline bool add_note(std::vector<Note>& notes, const Note& n) {
     return true;
 }
 
-// Same-row collision rule applied before placing a new note at (at_step) on
-// pitch (pitch_midi). For each existing note on the same pitch row whose
-// span [A, A+D) contains at_step:
+// Same-row collision rule applied before placing a new note at (bar, at_step)
+// on pitch (pitch_midi). For each existing note in the same bar on the same
+// pitch row whose span [A, A+D) contains at_step:
 //   A == at_step -> deleted
 //   A <  at_step -> duration shrunk to (at_step - A)
+//
+// Notes on other bars are unaffected. The `at_bar` parameter is Phase 2+.
+// Callers that don't yet care about bars pass 0.
 inline void clear_or_truncate_at(std::vector<Note>& notes,
-                                 uint8_t pitch_midi, uint8_t at_step) {
+                                 uint8_t pitch_midi, uint8_t at_step,
+                                 uint8_t at_bar = 0) {
     for (auto it = notes.begin(); it != notes.end();) {
-        if (it->pitch_midi != pitch_midi) { ++it; continue; }
+        if (it->pitch_midi != pitch_midi || it->bar != at_bar) {
+            ++it; continue;
+        }
         int a = it->start_step;
         int b = a + it->duration_steps - 1;
         if (a <= static_cast<int>(at_step) && static_cast<int>(at_step) <= b) {
@@ -81,10 +133,12 @@ struct ProjectedCell {
 // Walk a melodic track's notes and produce per-cell display info under the
 // "starters win (lowest-pitch tiebreak); continuation cells pick the
 // most-recently-started still-sustaining (lowest-pitch tiebreak)" stack
-// rule. Cells past loop_len are returned as { -1, false, false }.
-inline std::array<ProjectedCell, STEPS> project_row(
-    const std::vector<Note>& notes, int loop_len) {
-    std::array<ProjectedCell, STEPS> out{};
+// rule. Cells past loop_len are returned as { -1, false, false }. Notes
+// whose `bar` field doesn't match `at_bar` are skipped. The array is sized
+// MAX_STEPS_PER_BAR so 8/4 bars (32 steps) project cleanly.
+inline std::array<ProjectedCell, MAX_STEPS_PER_BAR> project_row(
+    const std::vector<Note>& notes, int loop_len, int at_bar = 0) {
+    std::array<ProjectedCell, MAX_STEPS_PER_BAR> out{};
     for (auto& c : out) c = { -1, false, false };
 
     for (int c = 0; c < loop_len; ++c) {
@@ -93,6 +147,7 @@ inline std::array<ProjectedCell, STEPS> project_row(
         // First pass: starters on this cell.
         for (size_t i = 0; i < notes.size(); ++i) {
             const Note& n = notes[i];
+            if (n.bar != at_bar) continue;
             if (n.start_step != c) continue;
             int end = n.start_step + n.duration_steps;
             if (c >= end) continue;
@@ -104,6 +159,7 @@ inline std::array<ProjectedCell, STEPS> project_row(
         if (best < 0) {
             for (size_t i = 0; i < notes.size(); ++i) {
                 const Note& n = notes[i];
+                if (n.bar != at_bar) continue;
                 int end = n.start_step + n.duration_steps;
                 if (c < n.start_step || c >= end) continue;
                 if (best < 0) { best = static_cast<int>(i); continue; }
@@ -135,6 +191,34 @@ enum DrumKind {
     DK_COWBELL,
     DK_TOM,
     DK_CYMBAL,
+};
+
+// A reusable musical section. Owns the drum cells and melodic note lists for
+// 8 drum tracks and 4 melodic voices. Held by SessionState as a
+// std::unique_ptr because the atomic drum cells and mutex are non-movable.
+//
+// Phase 2: a Pattern carries length_bars (1..MAX_BARS_PER_PATTERN) and the
+// drum_grid is indexed [drum_kind][bar][step]. Cells past length_bars are
+// not rendered or fired but retained on shrink so widening restores them.
+// Melodic notes carry an explicit `bar`; notes outside [0..length_bars) are
+// hidden / unfired but kept in storage.
+struct Pattern {
+    uint16_t id = 1;
+    // length_bars: NEVER assign directly outside session.cpp's
+    // set_pattern_length() — it owns the song-mode propagation invariant.
+    uint8_t  length_bars  = 1;
+    uint8_t  time_sig_num = 4;  // 1..8; denom always /4
+    std::atomic<bool> drum_grid[DRUM_KINDS][MAX_BARS_PER_PATTERN][MAX_STEPS_PER_BAR] = {};
+    std::vector<Note> melodic_notes[MELODIC_VOICES];
+    mutable std::mutex melodic_mutex;
+
+    Pattern() {
+        // Reserve up-front so the timing thread's concurrent iteration over
+        // melodic_notes can't race a reallocating push_back.
+        for (int m = 0; m < MELODIC_VOICES; ++m) {
+            melodic_notes[m].reserve(MAX_NOTES_PER_MELODIC);
+        }
+    }
 };
 
 struct TrackDef {
@@ -187,11 +271,18 @@ public:
     uint16_t session_id = 0;
 
     // --- shared creative state (synced) ---
-    // Drum tracks indexed by TRACK_DEFS[t].drum_kind (0..7). Melodic tracks
-    // indexed by TRACK_DEFS[t].melodic_idx (0..3).
-    std::atomic<bool> drum_grid[DRUM_KINDS][STEPS] = {};
-    std::vector<Note> melodic_notes[MELODIC_VOICES];
-    mutable std::mutex melodic_mutex;
+    // Patterns: the musical sections. Always non-empty after construction;
+    // patterns[0] is the bootstrap pattern (id=1). Stored sorted by id for
+    // binary-search lookup; ids are monotonically allocated so insertion
+    // is always append.
+    std::vector<std::unique_ptr<Pattern>> patterns;
+    // Bar-indexed song timeline (Phase 4). Each entry is a pattern id;
+    // consecutive identical entries play the same pattern back-to-back. The
+    // song loops forever by default; max length MAX_SONG_BARS.
+    std::vector<uint16_t> song;
+    // Guards `patterns` vector mutations and the `song` vector. Drum cells
+    // and melodic notes within a Pattern have their own atomic/mutex.
+    mutable std::mutex    patterns_mutex;
     // Per-track default root pitch in MIDI. Drum tracks use it as the
     // synthesized voice's base pitch; melodic tracks use it for grid-mode
     // space-entry and live-pad trigger.
@@ -212,6 +303,26 @@ public:
     // --- per-peer runtime (not synced) ---
     int               loop_len = STEPS;
     std::atomic<int>  play_step{0};
+    // Phase 2: the bar of the current pattern that's playing (0..length_bars-1).
+    // Solo-mode and single-pattern sessions wrap this at length_bars.
+    std::atomic<int>  play_bar{0};
+    // Phase 2: which bar of the current pattern the sequencer view shows.
+    // Multi-bar patterns are read one page (bar) at a time.
+    std::atomic<int>  edit_bar{0};
+    // Phase 4: which pattern the sequencer view focuses on (per-peer).
+    std::atomic<uint16_t> current_edit_pattern_id{1};
+    // Phase 4: which song-bar is currently playing. The timing thread reads
+    // this to pick the source pattern for each tick. Wraps to 0 at end of
+    // song (the song loops by default).
+    std::atomic<int>      play_song_bar{0};
+    // Phase 4: per-peer playback override. When true the playhead loops
+    // within the current edit pattern instead of advancing through `song`.
+    // Per the PRD: musical state syncs, play state does not.
+    std::atomic<bool>     pattern_loop{false};
+    // Phase 4: which view is focused (false = sequencer, true = song mode).
+    std::atomic<bool>     song_view_focused{false};
+    // Phase 4: song-mode cursor (bar index).
+    std::atomic<int>      song_view_cursor_bar{0};
     std::atomic<bool> running{true};
     std::atomic<bool> playing{true};
 
@@ -264,6 +375,18 @@ public:
     std::atomic<bool>     bpm_dirty{false};
     std::atomic<bool>     bpm_in_flight{false};
 
+    // Phase 5 outbound flush bitmasks. One bit per pattern id (id N -> bit N
+    // within mask N/64). id 0 is reserved (used as song "clear"); patterns
+    // start at id 1. Builders walk set bits and emit one PATTERN_NEW /
+    // PATTERN_META packet per bit, clearing as they go.
+    std::atomic<uint64_t> pattern_new_dirty[4]  = {};
+    std::atomic<uint64_t> pattern_meta_dirty[4] = {};
+
+    // Phase 5 outbound flush bitmask for the song timeline. One bit per
+    // song-bar index (0..MAX_SONG_BARS-1). Set on any song[bar] mutation;
+    // builder emits one MSG_SONG_EDIT per set bit.
+    std::atomic<uint64_t> song_dirty[2] = {};
+
     // Joiner-only label: lets the UI render "solo (host left)" once
     // network_alive falls. Set true in Network::join().
     bool is_joiner = false;
@@ -300,6 +423,65 @@ void timing_thread(SessionState& s);
 //                     bounded by the 64-note cap
 // `pitch_midi` is unused for drum tracks.
 void record_input(SessionState& s, int track, uint8_t pitch_midi);
+
+// Phase 2: extend the current edit pattern's length by `n` bars. Caps at
+// MAX_BARS_PER_PATTERN. Non-destructive: existing cells/notes past the old
+// end are kept in storage; they were just hidden. No-op if n <= 0 or
+// already at the cap.
+void extend_pattern_length(SessionState& s, int n);
+
+// Phase 2: shrink the current edit pattern's length by `n` bars. Floors at 1.
+// Non-destructive: cells/notes in the trimmed-off bars are hidden but
+// retained, so a later extend restores them.
+void shrink_pattern_length(SessionState& s, int n);
+
+// Phase 3: bump the current edit pattern's time-sig numerator by one
+// (capped at 8). Non-destructive: cells/notes past the new bar end are
+// hidden during render/playback but retained in storage.
+void inc_pattern_time_sig(SessionState& s);
+
+// Phase 3: dec the current edit pattern's time-sig numerator (floor 1).
+// Non-destructive (see inc_pattern_time_sig).
+void dec_pattern_time_sig(SessionState& s);
+
+// Phase 7: duplicate the bar under the edit cursor: insert a copy immediately
+// after it, shifting later bars right by one. Increments length_bars by 1.
+// No-op if length_bars is already MAX_BARS_PER_PATTERN. Affects both the drum
+// grid and melodic notes (notes at bar==edit_bar are duplicated with the new
+// bar index; notes past edit_bar shift up by one).
+void duplicate_current_bar(SessionState& s);
+
+// Phase 4: create a new blank pattern with a fresh id (monotonically
+// allocated, never reused). Defaults: length_bars=1, time_sig_num=4. The
+// new pattern is appended to `song` so it's immediately reachable from
+// playback. Edit focus moves to the new pattern. Returns the new id, or 0
+// on cap (MAX_PATTERNS reached).
+uint16_t create_new_pattern(SessionState& s);
+
+// Phase 4: duplicate the current edit pattern. Same content, new id. The
+// duplicate is appended to `song`; edit focus moves to it. Returns the new
+// id (or 0 on cap).
+uint16_t duplicate_current_pattern(SessionState& s);
+
+// Phase 4: lookup a pattern by id. O(log n) (vector is sorted by id).
+// Returns nullptr if the id is not present.
+Pattern* find_pattern(SessionState& s, uint16_t id);
+const Pattern* find_pattern(const SessionState& s, uint16_t id);
+
+// Phase 4: convenience — the pattern currently focused for editing
+// (`current_edit_pattern_id`), falling back to patterns[0] if the id is
+// missing for any reason. Callers are guaranteed a non-null reference as
+// long as the session was constructed normally.
+inline Pattern& current_edit_pattern(SessionState& s) {
+    Pattern* p = find_pattern(s, s.current_edit_pattern_id.load());
+    if (p) return *p;
+    return *s.patterns[0];
+}
+
+// Phase 4: place pattern `id` at song-bar `bar`. Grows `song` if needed,
+// pushing later entries right when the placed pattern is longer than the
+// gap before the next block. Overflow past MAX_SONG_BARS is dropped.
+void song_place_pattern_at_bar(SessionState& s, int bar, uint16_t id);
 
 // Drive the record state machine on a `q` keypress.
 //   OFF (playing)  → RECORDING : no transport changes
