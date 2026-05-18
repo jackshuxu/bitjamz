@@ -42,6 +42,17 @@ inline int steps_per_bar(uint8_t time_sig_num) {
     return static_cast<int>(time_sig_num) * STEPS_PER_BEAT;
 }
 
+// Mark a pattern id dirty in one of the outbound network masks. Bit N is set
+// within mask[N/64]. No-op if id is 0 or out of range.
+inline void set_id_bit(std::atomic<uint64_t>* mask, uint16_t id) {
+    if (id == 0 || id >= 256) return;
+    mask[id / 64].fetch_or(static_cast<uint64_t>(1) << (id % 64));
+}
+inline void set_bar_bit(std::atomic<uint64_t>* mask, int bar) {
+    if (bar < 0 || bar >= 128) return;
+    mask[bar / 64].fetch_or(static_cast<uint64_t>(1) << (bar % 64));
+}
+
 // Backwards-compat shim: many call sites (and tests) used STEPS = 16 as the
 // step count of a 4/4 bar. New code should use steps_per_bar(p.time_sig_num)
 // instead; this remains as a constant for narrow-purpose call sites that
@@ -193,6 +204,8 @@ enum DrumKind {
 // hidden / unfired but kept in storage.
 struct Pattern {
     uint16_t id = 1;
+    // length_bars: NEVER assign directly outside session.cpp's
+    // set_pattern_length() — it owns the song-mode propagation invariant.
     uint8_t  length_bars  = 1;
     uint8_t  time_sig_num = 4;  // 1..8; denom always /4
     std::atomic<bool> drum_grid[DRUM_KINDS][MAX_BARS_PER_PATTERN][MAX_STEPS_PER_BAR] = {};
@@ -362,6 +375,18 @@ public:
     std::atomic<bool>     bpm_dirty{false};
     std::atomic<bool>     bpm_in_flight{false};
 
+    // Phase 5 outbound flush bitmasks. One bit per pattern id (id N -> bit N
+    // within mask N/64). id 0 is reserved (used as song "clear"); patterns
+    // start at id 1. Builders walk set bits and emit one PATTERN_NEW /
+    // PATTERN_META packet per bit, clearing as they go.
+    std::atomic<uint64_t> pattern_new_dirty[4]  = {};
+    std::atomic<uint64_t> pattern_meta_dirty[4] = {};
+
+    // Phase 5 outbound flush bitmask for the song timeline. One bit per
+    // song-bar index (0..MAX_SONG_BARS-1). Set on any song[bar] mutation;
+    // builder emits one MSG_SONG_EDIT per set bit.
+    std::atomic<uint64_t> song_dirty[2] = {};
+
     // Joiner-only label: lets the UI render "solo (host left)" once
     // network_alive falls. Set true in Network::join().
     bool is_joiner = false;
@@ -418,6 +443,13 @@ void inc_pattern_time_sig(SessionState& s);
 // Phase 3: dec the current edit pattern's time-sig numerator (floor 1).
 // Non-destructive (see inc_pattern_time_sig).
 void dec_pattern_time_sig(SessionState& s);
+
+// Phase 7: duplicate the bar under the edit cursor: insert a copy immediately
+// after it, shifting later bars right by one. Increments length_bars by 1.
+// No-op if length_bars is already MAX_BARS_PER_PATTERN. Affects both the drum
+// grid and melodic notes (notes at bar==edit_bar are duplicated with the new
+// bar index; notes past edit_bar shift up by one).
+void duplicate_current_bar(SessionState& s);
 
 // Phase 4: create a new blank pattern with a fresh id (monotonically
 // allocated, never reused). Defaults: length_bars=1, time_sig_num=4. The

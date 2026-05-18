@@ -62,32 +62,150 @@ std::shared_ptr<SessionState> make_solo_session_state() {
     return s;
 }
 
-void extend_pattern_length(SessionState& s, int n) {
-    if (n <= 0) return;
-    if (s.patterns.empty()) return;
-    Pattern& p = current_edit_pattern(s);
-    int new_len = std::min<int>(MAX_BARS_PER_PATTERN, p.length_bars + n);
+namespace {
+// Grow every contiguous run of `pid` in s.song by inserting `delta` extra
+// cells of `pid` at each run's end. Cells past MAX_SONG_BARS are dropped.
+// Marks every shifted-or-inserted cell in song_dirty.
+void grow_song_runs_for_pid(SessionState& s, uint16_t pid, int delta) {
+    if (delta <= 0 || pid == 0) return;
+    int i = 0;
+    while (i < static_cast<int>(s.song.size())) {
+        if (s.song[i] != pid) { ++i; continue; }
+        int j = i;
+        while (j < static_cast<int>(s.song.size()) && s.song[j] == pid) ++j;
+        s.song.insert(s.song.begin() + j, delta, pid);
+        if (static_cast<int>(s.song.size()) > MAX_SONG_BARS) {
+            s.song.resize(MAX_SONG_BARS);
+        }
+        for (int k = i; k < static_cast<int>(s.song.size()); ++k) {
+            set_bar_bit(s.song_dirty, k);
+        }
+        i = std::min<int>(j + delta, static_cast<int>(s.song.size()));
+        while (i < static_cast<int>(s.song.size()) && s.song[i] == pid) ++i;
+    }
+}
+// Shrink every contiguous run of `pid` by erasing up to `delta` trailing cells
+// of each run; subsequent cells shift left. Marks shifted cells dirty.
+void shrink_song_runs_for_pid(SessionState& s, uint16_t pid, int delta) {
+    if (delta <= 0 || pid == 0) return;
+    int i = 0;
+    while (i < static_cast<int>(s.song.size())) {
+        if (s.song[i] != pid) { ++i; continue; }
+        int j = i;
+        while (j < static_cast<int>(s.song.size()) && s.song[j] == pid) ++j;
+        int run_len  = j - i;
+        int erase_n  = std::min(delta, run_len);
+        if (erase_n > 0) {
+            s.song.erase(s.song.begin() + j - erase_n, s.song.begin() + j);
+            for (int k = i; k < static_cast<int>(s.song.size()); ++k) {
+                set_bar_bit(s.song_dirty, k);
+            }
+        }
+        int next = j - erase_n;
+        while (next < static_cast<int>(s.song.size()) && s.song[next] == pid) ++next;
+        i = next;
+    }
+}
+// Single point of truth for pattern-length mutations. ALL code that changes
+// Pattern::length_bars must go through this helper so the three invariants
+// stay consistent:
+//   1. length_bars is clamped to [1, MAX_BARS_PER_PATTERN].
+//   2. pattern_meta_dirty is set so peers learn the new length.
+//   3. every contiguous run of this pattern in s.song grows or shrinks by the
+//      same delta (otherwise song-mode width drifts from pattern width).
+// Returns the delta actually applied (0 if clamped to no-op).
+int set_pattern_length(SessionState& s, Pattern& p, int new_len) {
+    new_len = std::clamp(new_len, 1, static_cast<int>(MAX_BARS_PER_PATTERN));
+    int old_len = p.length_bars;
+    if (new_len == old_len) return 0;
+    int delta = new_len - old_len;
+    uint16_t pid = p.id;
     p.length_bars = static_cast<uint8_t>(new_len);
+    set_id_bit(s.pattern_meta_dirty, pid);
+    std::lock_guard<std::mutex> lk(s.patterns_mutex);
+    if (delta > 0) grow_song_runs_for_pid(s, pid, delta);
+    else            shrink_song_runs_for_pid(s, pid, -delta);
+    return delta;
+}
+}  // namespace
+
+void extend_pattern_length(SessionState& s, int n) {
+    if (n <= 0 || s.patterns.empty()) return;
+    Pattern& p = current_edit_pattern(s);
+    set_pattern_length(s, p, p.length_bars + n);
 }
 
 void shrink_pattern_length(SessionState& s, int n) {
-    if (n <= 0) return;
-    if (s.patterns.empty()) return;
+    if (n <= 0 || s.patterns.empty()) return;
     Pattern& p = current_edit_pattern(s);
-    int new_len = std::max<int>(1, p.length_bars - n);
-    p.length_bars = static_cast<uint8_t>(new_len);
+    set_pattern_length(s, p, p.length_bars - n);
 }
 
 void inc_pattern_time_sig(SessionState& s) {
     if (s.patterns.empty()) return;
     Pattern& p = current_edit_pattern(s);
-    p.time_sig_num = static_cast<uint8_t>(std::min<int>(8, p.time_sig_num + 1));
+    uint8_t v = static_cast<uint8_t>(std::min<int>(8, p.time_sig_num + 1));
+    if (v == p.time_sig_num) return;
+    p.time_sig_num = v;
+    set_id_bit(s.pattern_meta_dirty, p.id);
 }
 
 void dec_pattern_time_sig(SessionState& s) {
     if (s.patterns.empty()) return;
     Pattern& p = current_edit_pattern(s);
-    p.time_sig_num = static_cast<uint8_t>(std::max<int>(1, p.time_sig_num - 1));
+    uint8_t v = static_cast<uint8_t>(std::max<int>(1, p.time_sig_num - 1));
+    if (v == p.time_sig_num) return;
+    p.time_sig_num = v;
+    set_id_bit(s.pattern_meta_dirty, p.id);
+}
+
+void duplicate_current_bar(SessionState& s) {
+    if (s.patterns.empty()) return;
+    Pattern& p = current_edit_pattern(s);
+    int old_len = p.length_bars;
+    if (old_len >= MAX_BARS_PER_PATTERN) return;
+    int src = s.edit_bar.load();
+    if (src < 0 || src >= old_len) return;
+
+    // Drum grid: shift bars (src+1 .. old_len-1) right by one, then copy src
+    // into src+1. Walk from the tail to avoid clobbering source cells.
+    for (int b = old_len - 1; b > src; --b) {
+        for (int k = 0; k < DRUM_KINDS; ++k) {
+            for (int st = 0; st < MAX_STEPS_PER_BAR; ++st) {
+                p.drum_grid[k][b + 1][st].store(p.drum_grid[k][b][st].load());
+            }
+        }
+    }
+    for (int k = 0; k < DRUM_KINDS; ++k) {
+        for (int st = 0; st < MAX_STEPS_PER_BAR; ++st) {
+            p.drum_grid[k][src + 1][st].store(p.drum_grid[k][src][st].load());
+        }
+    }
+
+    // Melodic: collect dups at bar==src first, then shift bars > src by +1,
+    // then re-add the dups at bar==src+1. The notes-vector cap is enforced by
+    // add_note; over-cap dups drop silently (same policy as record_input).
+    for (int m = 0; m < MELODIC_VOICES; ++m) {
+        auto& notes = p.melodic_notes[m];
+        std::vector<Note> dups;
+        dups.reserve(notes.size());
+        for (const Note& n : notes) {
+            if (n.bar == src) dups.push_back(n);
+        }
+        for (Note& n : notes) {
+            if (n.bar > src) n.bar = static_cast<uint8_t>(n.bar + 1);
+        }
+        for (Note& d : dups) {
+            d.bar = static_cast<uint8_t>(src + 1);
+            add_note(notes, d);
+        }
+        if (!dups.empty()) s.melodic_dirty[m].store(true);
+    }
+
+    // Route the length bump through set_pattern_length so the song's runs of
+    // this pid grow by one too — otherwise the new bar would be invisible in
+    // song mode.
+    set_pattern_length(s, p, old_len + 1);
 }
 
 namespace {
@@ -108,12 +226,17 @@ uint16_t create_new_pattern(SessionState& s) {
     int append_bars = np->length_bars;
     s.patterns.push_back(std::move(np));
     // Append to song. Drop bars that would overflow the song cap.
+    int first_appended = static_cast<int>(s.song.size());
+    int appended = 0;
     for (int b = 0; b < append_bars; ++b) {
         if (static_cast<int>(s.song.size()) >= MAX_SONG_BARS) break;
         s.song.push_back(new_id);
+        ++appended;
     }
     s.current_edit_pattern_id.store(new_id);
     s.edit_bar.store(0);
+    set_id_bit(s.pattern_new_dirty, new_id);
+    for (int i = 0; i < appended; ++i) set_bar_bit(s.song_dirty, first_appended + i);
     return new_id;
 }
 
@@ -148,12 +271,18 @@ uint16_t duplicate_current_pattern(SessionState& s) {
     uint16_t new_id = np->id;
     int append_bars = np->length_bars;
     s.patterns.push_back(std::move(np));
+    int first_appended = static_cast<int>(s.song.size());
+    int appended = 0;
     for (int b = 0; b < append_bars; ++b) {
         if (static_cast<int>(s.song.size()) >= MAX_SONG_BARS) break;
         s.song.push_back(new_id);
+        ++appended;
     }
     s.current_edit_pattern_id.store(new_id);
     s.edit_bar.store(0);
+    set_id_bit(s.pattern_new_dirty, new_id);
+    set_id_bit(s.pattern_meta_dirty, new_id);
+    for (int i = 0; i < appended; ++i) set_bar_bit(s.song_dirty, first_appended + i);
     return new_id;
 }
 
@@ -170,11 +299,58 @@ const Pattern* find_pattern(const SessionState& s, uint16_t id) {
 void song_place_pattern_at_bar(SessionState& s, int bar, uint16_t id) {
     if (bar < 0 || bar >= MAX_SONG_BARS) return;
     std::lock_guard<std::mutex> lk(s.patterns_mutex);
+
+    // Resolve the placed pattern's bar-span (consecutive same-id entries
+    // represent one playback). length_bars defaults to 1 for clear (id=0).
+    int span = 1;
+    if (id != 0) {
+        for (const auto& pp : s.patterns) {
+            if (pp->id == id) { span = std::max<int>(1, pp->length_bars); break; }
+        }
+    }
+
+    // Grow song to at least `bar+1` so we can read the destination.
     while (static_cast<int>(s.song.size()) <= bar) {
         if (static_cast<int>(s.song.size()) >= MAX_SONG_BARS) return;
-        s.song.push_back(0);  // 0 = empty slot
+        s.song.push_back(0);
     }
-    s.song[bar] = id;
+
+    // Decide overwrite vs push-right. If any cell in [bar..bar+span) is
+    // already non-zero (a later block we'd clobber), insert `span` cells at
+    // `bar` and overflow past MAX_SONG_BARS is dropped from the tail.
+    int end = std::min<int>(bar + span, static_cast<int>(s.song.size()));
+    bool overlap = false;
+    for (int i = bar; i < end; ++i) {
+        if (s.song[i] != 0) { overlap = true; break; }
+    }
+
+    if (overlap) {
+        // Insert `span` zero cells at `bar`, then truncate to MAX_SONG_BARS,
+        // then write `id` to [bar..bar+span).
+        s.song.insert(s.song.begin() + bar, span, 0);
+        if (static_cast<int>(s.song.size()) > MAX_SONG_BARS) {
+            s.song.resize(MAX_SONG_BARS);
+        }
+    }
+
+    // Grow to bar+span so the placement always fits (capped at MAX_SONG_BARS).
+    while (static_cast<int>(s.song.size()) < bar + span) {
+        if (static_cast<int>(s.song.size()) >= MAX_SONG_BARS) break;
+        s.song.push_back(0);
+    }
+
+    int write_end = std::min<int>(bar + span, static_cast<int>(s.song.size()));
+    for (int i = bar; i < write_end; ++i) {
+        s.song[i] = id;
+        set_bar_bit(s.song_dirty, i);
+    }
+    if (overlap) {
+        // Mark all cells from the insertion point through end-of-song dirty,
+        // since insert() shifted them.
+        for (int i = write_end; i < static_cast<int>(s.song.size()); ++i) {
+            set_bar_bit(s.song_dirty, i);
+        }
+    }
 }
 
 void record_input(SessionState& s, int track, uint8_t pitch_midi) {

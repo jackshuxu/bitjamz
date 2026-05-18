@@ -526,9 +526,36 @@ bool recv_and_apply_msg_track_root_midi(int sock, SessionState& s, bool is_joine
     return true;
 }
 
+// Claim the lowest-set bit from any of `mask_lanes` 64-bit atomic words,
+// clearing it. Returns the global bit index (lane*64 + position), or -1 if
+// no bit was set.
+static int claim_lowest_bit(std::atomic<uint64_t>* mask, int lanes) {
+    for (int l = 0; l < lanes; ++l) {
+        uint64_t v = mask[l].load();
+        while (v) {
+            // Find lowest set bit.
+#ifdef _MSC_VER
+            unsigned long pos = 0;
+            _BitScanForward64(&pos, v);
+            int b = static_cast<int>(pos);
+#else
+            int b = __builtin_ctzll(v);
+#endif
+            uint64_t bit = static_cast<uint64_t>(1) << b;
+            uint64_t prev = v;
+            if (mask[l].compare_exchange_weak(prev, v & ~bit)) {
+                return l * 64 + b;
+            }
+            v = mask[l].load();
+        }
+    }
+    return -1;
+}
+
 // Returns the number of bytes written to buf (tag + payload), or 0 if
-// nothing dirty. Sends at most one MSG_MELODIC_TRACK or MSG_TRACK_ROOT_MIDI
-// per call; caller invokes repeatedly to drain.
+// nothing dirty. Sends at most one of: MSG_MELODIC_TRACK, MSG_TRACK_ROOT_MIDI,
+// MSG_PATTERN_NEW, MSG_PATTERN_META, MSG_SONG_EDIT per call; caller invokes
+// repeatedly to drain.
 size_t build_pending_aux(SessionState& s, uint8_t* buf, size_t buf_cap) {
     bool joiner_path = s.network_alive.load() && s.is_joiner;
 
@@ -560,6 +587,50 @@ size_t build_pending_aux(SessionState& s, uint8_t* buf, size_t buf_cap) {
         buf[1] = static_cast<uint8_t>(t);
         buf[2] = s.track_root_midi[t];
         return 3;
+    }
+
+    // MSG_PATTERN_NEW: tag(1) + pid(2) + length_bars(1) + time_sig_num(1) = 5
+    int pn = claim_lowest_bit(s.pattern_new_dirty, 4);
+    if (pn >= 0) {
+        Pattern* pat = find_pattern(s, static_cast<uint16_t>(pn));
+        if (pat && buf_cap >= 5) {
+            buf[0] = MSG_PATTERN_NEW;
+            uint16_t pid_n = htons(static_cast<uint16_t>(pn));
+            std::memcpy(buf + 1, &pid_n, 2);
+            buf[3] = pat->length_bars;
+            buf[4] = pat->time_sig_num;
+            return 5;
+        }
+        // Pattern vanished (shouldn't happen); drop the bit and continue.
+    }
+
+    // MSG_PATTERN_META: same shape as MSG_PATTERN_NEW.
+    int pm = claim_lowest_bit(s.pattern_meta_dirty, 4);
+    if (pm >= 0) {
+        Pattern* pat = find_pattern(s, static_cast<uint16_t>(pm));
+        if (pat && buf_cap >= 5) {
+            buf[0] = MSG_PATTERN_META;
+            uint16_t pid_n = htons(static_cast<uint16_t>(pm));
+            std::memcpy(buf + 1, &pid_n, 2);
+            buf[3] = pat->length_bars;
+            buf[4] = pat->time_sig_num;
+            return 5;
+        }
+    }
+
+    // MSG_SONG_EDIT: tag(1) + bar(2) + pid(2) = 5
+    int sb = claim_lowest_bit(s.song_dirty, 2);
+    if (sb >= 0) {
+        uint16_t pid = 0;
+        if (sb < static_cast<int>(s.song.size())) pid = s.song[sb];
+        if (buf_cap >= 5) {
+            buf[0] = MSG_SONG_EDIT;
+            uint16_t bar_n = htons(static_cast<uint16_t>(sb));
+            uint16_t pid_n = htons(pid);
+            std::memcpy(buf + 1, &bar_n, 2);
+            std::memcpy(buf + 3, &pid_n, 2);
+            return 5;
+        }
     }
     return 0;
 }
