@@ -1,6 +1,7 @@
 #include "network.h"
 #include "net_compat.h"
 #include "session.h"
+#include "sync_protocol.h"
 
 #include <atomic>
 #include <cerrno>
@@ -336,15 +337,8 @@ bool recv_and_apply_msg_edit(int sock, SessionState& s, bool is_joiner) {
     if (!recv_all(sock, &bpm_n, sizeof(bpm_n))) return false;
     if (bpm_present) {
         int32_t bpm = ntohl(bpm_n);
-        if (is_joiner) {
-            if (!s.bpm_dirty.load()) {
-                s.bpm = bpm;
-                if (s.bpm_in_flight.load()) s.bpm_in_flight.store(false);
-            }
-        } else {
-            s.bpm = bpm;
-            s.bpm_dirty.store(true);
-        }
+        apply_optimistic_local_edit_scalar(s.bpm, s.bpm_dirty, s.bpm_in_flight,
+                                           static_cast<int>(bpm), is_joiner);
     }
 
     return true;
@@ -518,18 +512,10 @@ bool recv_and_apply_msg_track_root_midi(int sock, SessionState& s, bool is_joine
     if (track_id >= TRACKS) return true;
 
     uint16_t bit = static_cast<uint16_t>(1) << track_id;
-    if (is_joiner) {
-        if (s.track_root_dirty.load() & bit) return true;
-        if (s.track_root_in_flight.load() & bit) {
-            s.track_root_midi[track_id] = midi;
-            s.track_root_in_flight.fetch_and(static_cast<uint16_t>(~bit));
-            return true;
-        }
-        s.track_root_midi[track_id] = midi;
-    } else {
-        s.track_root_midi[track_id] = midi;
-        s.track_root_dirty.fetch_or(bit);
-    }
+    apply_optimistic_local_edit_bitmask(s.track_root_midi[track_id],
+                                        s.track_root_dirty,
+                                        s.track_root_in_flight,
+                                        bit, midi, is_joiner);
     return true;
 }
 

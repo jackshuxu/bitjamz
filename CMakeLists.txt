@@ -102,3 +102,18 @@ else()
     target_compile_options(test_pattern PRIVATE -Wall -Wextra -O2)
 endif()
 add_test(NAME pattern_tests COMMAND test_pattern)
+
+add_executable(test_optimistic_local_edit
+    tests/test_optimistic_local_edit.cpp
+)
+target_include_directories(test_optimistic_local_edit PRIVATE include src)
+if(APPLE)
+elseif(UNIX)
+    target_link_libraries(test_optimistic_local_edit PRIVATE pthread)
+endif()
+if(MSVC)
+    target_compile_options(test_optimistic_local_edit PRIVATE /W3 /O2)
+else()
+    target_compile_options(test_optimistic_local_edit PRIVATE -Wall -Wextra -O2)
+endif()
+add_test(NAME optimistic_local_edit_tests COMMAND test_optimistic_local_edit)
