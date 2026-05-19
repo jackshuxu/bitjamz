@@ -301,34 +301,7 @@ bool recv_and_apply_msg_edit(int sock, SessionState& s, bool is_joiner) {
         uint8_t  bar = hdr[3];
         uint8_t  step = hdr[4];
         uint8_t  v   = hdr[5];
-        if (t >= TRACKS || step >= MAX_STEPS_PER_BAR
-            || bar >= MAX_BARS_PER_PATTERN) continue;
-        if (TRACK_DEFS[t].type != TrackType::DRUM) continue;
-        Pattern* pat = find_pattern(s, pid);
-        if (!pat) continue;
-        int dk = TRACK_DEFS[t].drum_kind;
-
-        uint16_t bit = static_cast<uint16_t>(1) << step;
-        // Only track in_flight against the local edit-focus pattern/bar; for
-        // other patterns we just apply the inbound edit (Rule Y degrades to
-        // last-writer-wins for non-current-focus edits in this Phase 5).
-        bool current_focus = (pid == s.current_edit_pattern_id.load()
-                              && bar == s.edit_bar.load());
-        if (is_joiner && current_focus) {
-            if (s.dirty[t].load() & bit) continue;
-            if (s.in_flight[t].load() & bit) {
-                pat->drum_grid[dk][bar][step] = (v != 0);
-                s.in_flight[t].fetch_and(static_cast<uint16_t>(~bit));
-                continue;
-            }
-            pat->drum_grid[dk][bar][step] = (v != 0);
-        } else if (is_joiner) {
-            pat->drum_grid[dk][bar][step] = (v != 0);
-        } else {
-            // Host: apply + redirty so we relay to peers.
-            pat->drum_grid[dk][bar][step] = (v != 0);
-            if (current_focus) s.dirty[t].fetch_or(bit);
-        }
+        apply_remote_drum_cell(s, pid, t, bar, step, v != 0, is_joiner);
     }
 
     uint8_t bpm_present = 0;

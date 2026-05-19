@@ -1217,13 +1217,9 @@ static bool dispatch_piano_roll(SessionState& s, Event e) {
 // preserved if already present; we don't dedupe — chord stacking is fine).
 static void fill_pattern(SessionState& s, int interval, int start) {
     if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
-        int dk = TRACK_DEFS[cursor_track].drum_kind;
-        uint16_t fill_mask = 0;
-        for (int step = start; step < s.loop_len; step += interval) {
-            current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][step] = true;
-            fill_mask |= static_cast<uint16_t>(1) << step;
-        }
-        s.dirty[cursor_track].fetch_or(fill_mask, std::memory_order_relaxed);
+        fill_local_drum_cells(s, current_edit_pattern(s).id, cursor_track,
+                              s.edit_bar.load(), start, interval,
+                              s.loop_len, /*v=*/true);
         return;
     }
     int midx = TRACK_DEFS[cursor_track].melodic_idx;
@@ -1289,18 +1285,20 @@ static void paste_to_cursor_track(SessionState& s) {
     int db  = s.edit_bar.load();
     Pattern& pat = current_edit_pattern(s);
     if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
-        int dk = TRACK_DEFS[cursor_track].drum_kind;
         if (clip_kind == 0) {
-            for (int st = 0; st < spb; ++st)
-                pat.drum_grid[dk][db][st] = (st < n) && clip_drum[st];
+            for (int st = 0; st < spb; ++st) {
+                bool v = (st < n) && clip_drum[st];
+                set_local_drum_cell(s, pat.id, cursor_track, db, st, v);
+            }
         } else {
-            for (int st = 0; st < spb; ++st) pat.drum_grid[dk][db][st] = false;
+            for (int st = 0; st < spb; ++st)
+                set_local_drum_cell(s, pat.id, cursor_track, db, st, false);
             for (const Note& n2 : clip_notes) {
                 if (n2.start_step < spb)
-                    pat.drum_grid[dk][db][n2.start_step] = true;
+                    set_local_drum_cell(s, pat.id, cursor_track, db,
+                                        n2.start_step, true);
             }
         }
-        s.dirty[cursor_track].fetch_or(0xFFFFu, std::memory_order_relaxed);
     } else {
         int midx = TRACK_DEFS[cursor_track].melodic_idx;
         uint8_t root = s.track_root_midi[cursor_track];
@@ -1333,10 +1331,10 @@ static void paste_to_cursor_track(SessionState& s) {
 static void delete_at_cursor_cell(SessionState& s) {
     if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
         int dk = TRACK_DEFS[cursor_track].drum_kind;
-        if (!current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][cursor_step]) return;
-        current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][cursor_step] = false;
-        s.dirty[cursor_track].fetch_or(static_cast<uint16_t>(1) << cursor_step,
-                                       std::memory_order_relaxed);
+        Pattern& cur = current_edit_pattern(s);
+        if (!cur.drum_grid[dk][s.edit_bar.load()][cursor_step]) return;
+        set_local_drum_cell(s, cur.id, cursor_track,
+                            s.edit_bar.load(), cursor_step, false);
         return;
     }
     int midx = TRACK_DEFS[cursor_track].melodic_idx;
@@ -1403,18 +1401,25 @@ static bool handle_shared_track_command(SessionState& s, Event e) {
         auto now = clk::now();
         int spb = current_spb(s);
         if (now - last_A <= CLEAR_ALL_WINDOW) {
-            for (int k = 0; k < DRUM_KINDS; ++k)
-                for (int st = 0; st < spb; ++st) current_edit_pattern(s).drum_grid[k][s.edit_bar.load()][st].store(false);
-            for (int m = 0; m < MELODIC_VOICES; ++m) current_edit_pattern(s).melodic_notes[m].clear();
-            for (int t = 0; t < TRACKS; ++t) s.dirty[t].fetch_or(0xFFFFu);
+            Pattern& cur = current_edit_pattern(s);
+            int bar = s.edit_bar.load();
+            for (int t = 0; t < TRACKS; ++t) {
+                if (TRACK_DEFS[t].type == TrackType::DRUM) {
+                    fill_local_drum_cells(s, cur.id, t, bar,
+                                          /*start=*/0, /*interval=*/1,
+                                          /*loop_len=*/spb, /*v=*/false);
+                }
+            }
+            for (int m = 0; m < MELODIC_VOICES; ++m) cur.melodic_notes[m].clear();
             for (int m = 0; m < MELODIC_VOICES; ++m) s.melodic_dirty[m].store(true);
             last_A = clk::time_point{};
             return true;
         }
         if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
-            int dk = TRACK_DEFS[cursor_track].drum_kind;
-            for (int st = 0; st < spb; ++st) current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][st].store(false);
-            s.dirty[cursor_track].fetch_or(0xFFFFu, std::memory_order_relaxed);
+            Pattern& cur = current_edit_pattern(s);
+            fill_local_drum_cells(s, cur.id, cursor_track, s.edit_bar.load(),
+                                  /*start=*/0, /*interval=*/1,
+                                  /*loop_len=*/spb, /*v=*/false);
         } else {
             int midx = TRACK_DEFS[cursor_track].melodic_idx;
             current_edit_pattern(s).melodic_notes[midx].clear();
@@ -1508,8 +1513,10 @@ static bool dispatch_grid(SessionState& s, Event e) {
                 if (step >= spb) return true;
                 if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
                     int dk = TRACK_DEFS[cursor_track].drum_kind;
-                    current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][step] = !current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][step];
-                    s.dirty[cursor_track].fetch_or(1u << step, std::memory_order_relaxed);
+                    Pattern& cur = current_edit_pattern(s);
+                    bool nv = !cur.drum_grid[dk][s.edit_bar.load()][step].load();
+                    set_local_drum_cell(s, cur.id, cursor_track,
+                                        s.edit_bar.load(), step, nv);
                 }
                 return true;
             }
@@ -1558,8 +1565,10 @@ static bool dispatch_grid(SessionState& s, Event e) {
         if (e == Event::Character(' ')) {
             if (TRACK_DEFS[cursor_track].type == TrackType::DRUM) {
                 int dk = TRACK_DEFS[cursor_track].drum_kind;
-                current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][cursor_step] = !current_edit_pattern(s).drum_grid[dk][s.edit_bar.load()][cursor_step];
-                s.dirty[cursor_track].fetch_or(1u << cursor_step, std::memory_order_relaxed);
+                Pattern& cur = current_edit_pattern(s);
+                bool nv = !cur.drum_grid[dk][s.edit_bar.load()][cursor_step].load();
+                set_local_drum_cell(s, cur.id, cursor_track,
+                                    s.edit_bar.load(), cursor_step, nv);
             } else {
                 // Place a 1-step note at root pitch. If a note already starts
                 // at this cell on the root pitch, remove it (toggle feel).

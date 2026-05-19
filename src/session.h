@@ -493,6 +493,36 @@ inline Pattern& current_edit_pattern(SessionState& s) {
 // gap before the next block. Overflow past MAX_SONG_BARS is dropped.
 void song_place_pattern_at_bar(SessionState& s, int bar, uint16_t id);
 
+// PRD-002: drum-cell write funnels. Every drum-grid mutation in the codebase
+// goes through one of these three entry points; the shared invariant
+// (atomic store + per-cell dirty/in_flight policy) lives inside the funnels
+// so adding a new policy bit updates one place.
+//
+// set_local_drum_cell: single-cell UI toggle / record_input. Stores the cell
+// and sets one dirty bit. Lock-free — safe on the audio thread.
+void set_local_drum_cell(SessionState& s, uint16_t pid, int track,
+                         int bar, int step, bool v);
+
+// fill_local_drum_cells: UI batch (fill / paste / clear). Walks
+// [start, start+interval, ...) within [0, loop_len), writes each cell, and
+// issues exactly one fetch_or at the end whose mask reflects ONLY the cells
+// actually written (not 0xFFFF). Caller never sees the mask.
+void fill_local_drum_cells(SessionState& s, uint16_t pid, int track, int bar,
+                           int start, int interval, int loop_len, bool v);
+
+// apply_remote_drum_cell: wire path. Owns the full optimistic-local-edit
+// truth table:
+//   joiner+focus+dirty       -> drop
+//   joiner+focus+in_flight   -> apply + clear that in_flight bit
+//   joiner+focus+clean       -> apply
+//   joiner+non-focus         -> apply (dirty/in_flight untouched)
+//   host  +focus             -> apply + set dirty
+//   host  +non-focus         -> apply (dirty untouched)
+// `current_focus` is computed inside the funnel from (current_edit_pattern_id,
+// edit_bar).
+void apply_remote_drum_cell(SessionState& s, uint16_t pid, int track, int bar,
+                            int step, bool v, bool is_joiner);
+
 // Drive the record state machine on a `q` keypress.
 //   OFF (playing)  → RECORDING : no transport changes
 //   OFF (stopped)  → COUNTDOWN : playing←true, play_step←0, countdown_beat←1
