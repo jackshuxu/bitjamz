@@ -477,7 +477,14 @@ bool recv_and_apply_msg_pattern_meta(int sock, SessionState& s, bool is_joiner) 
     if (!recv_all(sock, &tsn, 1)) return false;
     Pattern* pat = find_pattern(s, pid);
     if (!pat) return true;
-    pat->length_bars  = lb;
+    // Route length through the funnel so all four invariants fire (clamp,
+    // pattern_meta_dirty, song-run resize, cursor clamp on shrink). The
+    // pattern_meta_dirty bit it sets is harmless here — the flush builder
+    // re-emits a packet identical to the one we just received, which the
+    // peer will discard as a no-op via the same in_flight gate used for
+    // edits. time_sig_num stays a direct write; it has its own (separate)
+    // invariant set and isn't part of this PRD.
+    set_pattern_length(s, *pat, static_cast<int>(lb));
     pat->time_sig_num = tsn;
     return true;
 }

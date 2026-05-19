@@ -1749,13 +1749,9 @@ Component build_session_ui(ScreenInteractive& screen, SessionState& state) {
             extend_pattern_length(state, 1); return true;
         }
         if (e == Event::Character('[')) {
+            // The cursor clamp now lives inside set_pattern_length; the '['
+            // path no longer needs to know about edit_bar / play_bar.
             shrink_pattern_length(state, 1);
-            // Clamp edit_bar / play_bar into the new range.
-            if (!state.patterns.empty()) {
-                int len = current_edit_pattern(state).length_bars;
-                if (state.edit_bar.load() >= len) state.edit_bar.store(len - 1);
-                if (state.play_bar.load() >= len) state.play_bar.store(0);
-            }
             return true;
         }
         // Phase 3: '.' bumps the time-sig numerator (capped at 8), ','

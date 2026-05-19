@@ -21,6 +21,7 @@ namespace bitjams_net_internal {
                                    const std::vector<Note>& notes,
                                    uint8_t* buf, size_t buf_cap);
     bool   recv_and_apply_msg_melodic_track(int sock, SessionState& s, bool is_joiner);
+    bool   recv_and_apply_msg_pattern_meta(int sock, SessionState& s, bool is_joiner);
     size_t build_pending_aux(SessionState& s, uint8_t* buf, size_t buf_cap);
 }
 
@@ -548,6 +549,81 @@ static void test_msg_melodic_track_roundtrip() {
     std::cout << "test_msg_melodic_track_roundtrip PASSED\n";
 }
 
+// --- PRD-003: recv-path cursor clamp + song-run propagation --------------
+//
+// Before this PRD the wire path wrote length_bars directly, bypassing the
+// funnel. A peer shrinking a pattern would leave the receiver's cursor
+// dangling past the new end and the receiver's `song` runs of that pid at
+// the old (larger) length. Both bugs are inherited-fixed by routing
+// recv_and_apply_msg_pattern_meta through set_pattern_length.
+
+// Helper: hand-build and send a MSG_PATTERN_META body (pid, lb, tsn) — the
+// recv function consumes the body only; the tag byte is stripped by the
+// dispatch loop in the real protocol. We mirror that here.
+static void send_pattern_meta_body(int sock, uint16_t pid, uint8_t lb, uint8_t tsn) {
+    uint16_t pid_n = htons(pid);
+    assert(::send(sock, reinterpret_cast<const char*>(&pid_n), 2, 0) == 2);
+    assert(::send(sock, reinterpret_cast<const char*>(&lb),    1, 0) == 1);
+    assert(::send(sock, reinterpret_cast<const char*>(&tsn),   1, 0) == 1);
+}
+
+// Test 5 of 6: receiver focused on the shrinking pattern with edit_bar past
+// the new end. The funnel must clamp edit_bar to len-1 and play_bar to 0.
+static void test_recv_pattern_meta_shrink_clamps_cursors() {
+    int sv[2];
+    if (!make_socket_pair(sv)) std::abort();
+
+    SessionState dst;
+    // Grow pattern 1 to 3 bars so we can shrink it via the wire.
+    set_pattern_length(dst, *dst.patterns[0], 3);
+    assert(dst.patterns[0]->length_bars == 3);
+    assert(dst.current_edit_pattern_id.load() == 1);
+    dst.edit_bar.store(2);
+    dst.play_bar.store(2);
+
+    // Peer shrinks pattern 1 to length 1 (time_sig untouched at 4).
+    send_pattern_meta_body(sv[0], /*pid=*/1, /*lb=*/1, /*tsn=*/4);
+    assert(bitjams_net_internal::recv_and_apply_msg_pattern_meta(sv[1], dst,
+                                                                 /*is_joiner=*/true));
+    assert(dst.patterns[0]->length_bars == 1);
+    // Funnel invariant 4 inherited for free by the wire path.
+    assert(dst.edit_bar.load() == 0);
+    assert(dst.play_bar.load() == 0);
+
+    close_socket(sv[0]);
+    close_socket(sv[1]);
+    std::cout << "test_recv_pattern_meta_shrink_clamps_cursors PASSED\n";
+}
+
+// Test 6 of 6: receiver's song runs of the shrunk pid must contract by the
+// same delta. Before the funnel routing this was silently skipped on the
+// wire path — receiver's song would drift wider than the actual pattern.
+static void test_recv_pattern_meta_shrink_propagates_to_song() {
+    int sv[2];
+    if (!make_socket_pair(sv)) std::abort();
+
+    SessionState dst;
+    // Grow pattern 1 to 3 bars; the funnel inflates s.song's run of pid=1
+    // from 1 entry to 3 entries.
+    set_pattern_length(dst, *dst.patterns[0], 3);
+    assert(dst.patterns[0]->length_bars == 3);
+    assert(dst.song.size() == 3);
+    assert(dst.song[0] == 1 && dst.song[1] == 1 && dst.song[2] == 1);
+
+    // Peer shrinks pid=1 to length 1.
+    send_pattern_meta_body(sv[0], /*pid=*/1, /*lb=*/1, /*tsn=*/4);
+    assert(bitjams_net_internal::recv_and_apply_msg_pattern_meta(sv[1], dst,
+                                                                 /*is_joiner=*/true));
+    assert(dst.patterns[0]->length_bars == 1);
+    // The song's run of pid=1 must have contracted in step.
+    assert(dst.song.size() == 1);
+    assert(dst.song[0] == 1);
+
+    close_socket(sv[0]);
+    close_socket(sv[1]);
+    std::cout << "test_recv_pattern_meta_shrink_propagates_to_song PASSED\n";
+}
+
 static void test_melodic_track_propagates_host_to_joiner() {
     auto host_state = std::make_shared<SessionState>();
     host_state->session_id = 6060;
@@ -613,6 +689,9 @@ int main() {
     test_collision_different_pitch_unaffected();
     test_msg_state_roundtrip();
     test_msg_melodic_track_roundtrip();
+    // PRD-003: recv-path inherits cursor clamp + song-run propagation.
+    test_recv_pattern_meta_shrink_clamps_cursors();
+    test_recv_pattern_meta_shrink_propagates_to_song();
     test_state_sync();
     test_wrong_room_rejected();
     test_edit_propagates_host_to_joiner();

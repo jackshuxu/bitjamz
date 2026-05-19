@@ -424,6 +424,16 @@ void timing_thread(SessionState& s);
 // `pitch_midi` is unused for drum tracks.
 void record_input(SessionState& s, int track, uint8_t pitch_midi);
 
+// Single point of truth for pattern-length mutations. Every path that
+// changes Pattern::length_bars (UI key, network recv, undo, future "trim
+// trailing empty bars", etc.) MUST route through here so the four
+// invariants stay consistent: clamp to [1, MAX_BARS_PER_PATTERN], mark
+// pattern_meta_dirty, resize the pattern's contiguous runs in s.song by the
+// same delta, and on shrink-of-focused-pattern clamp edit_bar / play_bar
+// (edit_bar to len-1, play_bar to 0). Returns the delta actually applied
+// (0 if clamped to no-op).
+int set_pattern_length(SessionState& s, Pattern& p, int new_len);
+
 // Phase 2: extend the current edit pattern's length by `n` bars. Caps at
 // MAX_BARS_PER_PATTERN. Non-destructive: existing cells/notes past the old
 // end are kept in storage; they were just hidden. No-op if n <= 0 or

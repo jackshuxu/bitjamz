@@ -106,13 +106,19 @@ void shrink_song_runs_for_pid(SessionState& s, uint16_t pid, int delta) {
         i = next;
     }
 }
+}  // namespace
+
 // Single point of truth for pattern-length mutations. ALL code that changes
-// Pattern::length_bars must go through this helper so the three invariants
+// Pattern::length_bars must go through this helper so the four invariants
 // stay consistent:
 //   1. length_bars is clamped to [1, MAX_BARS_PER_PATTERN].
 //   2. pattern_meta_dirty is set so peers learn the new length.
 //   3. every contiguous run of this pattern in s.song grows or shrinks by the
 //      same delta (otherwise song-mode width drifts from pattern width).
+//   4. on shrink of the focused pattern, edit_bar / play_bar are clamped so
+//      the next edit doesn't write into bars the pattern no longer believes
+//      exist. edit_bar clamps to len-1; play_bar resets to 0 (mid-bar
+//      restart is more surprising than a clean restart from the top).
 // Returns the delta actually applied (0 if clamped to no-op).
 int set_pattern_length(SessionState& s, Pattern& p, int new_len) {
     new_len = std::clamp(new_len, 1, static_cast<int>(MAX_BARS_PER_PATTERN));
@@ -122,12 +128,22 @@ int set_pattern_length(SessionState& s, Pattern& p, int new_len) {
     uint16_t pid = p.id;
     p.length_bars = static_cast<uint8_t>(new_len);
     set_id_bit(s.pattern_meta_dirty, pid);
-    std::lock_guard<std::mutex> lk(s.patterns_mutex);
-    if (delta > 0) grow_song_runs_for_pid(s, pid, delta);
-    else            shrink_song_runs_for_pid(s, pid, -delta);
+    {
+        std::lock_guard<std::mutex> lk(s.patterns_mutex);
+        if (delta > 0) grow_song_runs_for_pid(s, pid, delta);
+        else            shrink_song_runs_for_pid(s, pid, -delta);
+    }
+    // Invariant 4: clamp the per-peer cursors after releasing patterns_mutex
+    // (the cursors are atomics and take no lock). Only the focused pattern's
+    // shrink can leave cursors dangling — other-pattern shrinks don't move
+    // this peer's edit window.
+    if (delta < 0 && pid == s.current_edit_pattern_id.load()) {
+        int len = p.length_bars;
+        if (s.edit_bar.load() >= len) s.edit_bar.store(len - 1);
+        if (s.play_bar.load() >= len) s.play_bar.store(0);
+    }
     return delta;
 }
-}  // namespace
 
 void extend_pattern_length(SessionState& s, int n) {
     if (n <= 0 || s.patterns.empty()) return;
