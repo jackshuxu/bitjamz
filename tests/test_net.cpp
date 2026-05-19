@@ -484,7 +484,15 @@ static void test_msg_state_roundtrip() {
     src.patterns[0]->melodic_notes[0].push_back({0, 4, 2, 60, 100});
     src.patterns[0]->melodic_notes[3].push_back({0, 0, 16, 36, 127});
 
-    assert(bitjams_net_internal::send_msg_state(sv[0], src));
+    // The MSG_STATE payload serializes all MAX_PATTERNS=256 patterns and can
+    // exceed the AF_UNIX socketpair kernel buffer (~8 KB on macOS). A
+    // synchronous send on the same thread as the recv would deadlock once the
+    // buffer fills with no one draining it. Run the send on a worker thread
+    // so the main thread can drain via recv_and_apply_msg_state concurrently.
+    bool sent = false;
+    std::thread sender([&]{
+        sent = bitjams_net_internal::send_msg_state(sv[0], src);
+    });
 
     // Consume the leading tag byte to match the protocol prefix.
     uint8_t tag = 0;
@@ -494,6 +502,8 @@ static void test_msg_state_roundtrip() {
 
     SessionState dst;
     assert(bitjams_net_internal::recv_and_apply_msg_state(sv[1], dst));
+    sender.join();
+    assert(sent);
     assert(dst.session_id == 12345);
     assert(dst.bpm == 144);
     assert(dst.patterns[0]->drum_grid[DK_KICK][0][0] == true);
