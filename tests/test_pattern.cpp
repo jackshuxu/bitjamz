@@ -542,6 +542,82 @@ static void test_duplicate_bar_capped_at_max() {
     std::cout << "test_duplicate_bar_capped_at_max PASSED\n";
 }
 
+// --- PRD-003: cursor clamp folded into set_pattern_length ----------------
+//
+// Truth table for the funnel's invariant 4 (cursor clamp on shrink). Each
+// test pins one cell so a future regression — e.g. someone re-introducing a
+// manual clamp in a caller and accidentally drifting from the funnel — is
+// caught at the unit level rather than in playback.
+
+// Cell 1: shrink-focused + edit_bar past end → clamp to len-1.
+static void test_set_pattern_length_shrink_clamps_edit_bar() {
+    SessionState s;
+    Pattern& p = *s.patterns[0];
+    extend_pattern_length(s, 2);  // 1 → 3 bars
+    assert(p.length_bars == 3);
+    s.edit_bar.store(2);
+    // Shrink to length 1 — edit_bar=2 is now past the end.
+    set_pattern_length(s, p, 1);
+    assert(p.length_bars == 1);
+    assert(s.edit_bar.load() == 0);  // clamped to len-1 == 0
+    std::cout << "test_set_pattern_length_shrink_clamps_edit_bar PASSED\n";
+}
+
+// Cell 2: shrink-focused + play_bar past end → reset to 0 (NOT len-1).
+// Pins the asymmetric semantics: play_bar restart from 0 is less surprising
+// than picking up mid-bar inside a freshly resized pattern.
+static void test_set_pattern_length_shrink_clamps_play_bar_to_zero() {
+    SessionState s;
+    Pattern& p = *s.patterns[0];
+    extend_pattern_length(s, 2);  // 1 → 3 bars
+    s.play_bar.store(2);
+    set_pattern_length(s, p, 2);
+    assert(p.length_bars == 2);
+    assert(s.play_bar.load() == 0);  // reset to 0, NOT len-1 == 1
+    std::cout << "test_set_pattern_length_shrink_clamps_play_bar_to_zero PASSED\n";
+}
+
+// Cell 3: shrink-non-focused → cursors on the focused pattern unchanged.
+// The guard `pid == current_edit_pattern_id` exists so peer A focused on
+// pattern X doesn't see its cursor move when peer B shrinks pattern Y.
+static void test_set_pattern_length_shrink_skips_clamp_for_non_focused_pattern() {
+    SessionState s;
+    uint16_t a_id = s.patterns[0]->id;  // pattern A (focused initially)
+    uint16_t b_id = create_new_pattern(s);  // focus moves to B
+    Pattern* pa = find_pattern(s, a_id);
+    Pattern* pb = find_pattern(s, b_id);
+    assert(pa && pb);
+
+    // Grow B then re-focus A. Set A's cursors at positions that would be
+    // valid on B-at-length-3 but past the end of B-at-length-1 — they must
+    // not move when B shrinks because A is focused, not B.
+    set_pattern_length(s, *pb, 3);
+    s.current_edit_pattern_id.store(a_id);
+    s.edit_bar.store(2);
+    s.play_bar.store(2);
+
+    // Shrink B while A is focused: cursors must stay put.
+    set_pattern_length(s, *pb, 1);
+    assert(pb->length_bars == 1);
+    assert(s.edit_bar.load() == 2);
+    assert(s.play_bar.load() == 2);
+    std::cout << "test_set_pattern_length_shrink_skips_clamp_for_non_focused_pattern PASSED\n";
+}
+
+// Cell 4: grow → cursors never move. Clamp logic is shrink-only.
+static void test_set_pattern_length_grow_does_not_touch_cursors() {
+    SessionState s;
+    Pattern& p = *s.patterns[0];
+    assert(p.length_bars == 1);
+    s.edit_bar.store(0);
+    s.play_bar.store(0);
+    set_pattern_length(s, p, 3);
+    assert(p.length_bars == 3);
+    assert(s.edit_bar.load() == 0);
+    assert(s.play_bar.load() == 0);
+    std::cout << "test_set_pattern_length_grow_does_not_touch_cursors PASSED\n";
+}
+
 static void test_create_pattern_then_edit_focus_works() {
     SessionState s;
     uint16_t a = create_new_pattern(s);
@@ -600,6 +676,11 @@ int main() {
     test_us_pattern_meta_marks_dirty_on_edit();
     test_us30_msg_song_edit_marks_dirty_on_commit();
     test_steps_constant_not_referenced_in_cursor_paths();
+    // PRD-003: cursor clamp inside set_pattern_length.
+    test_set_pattern_length_shrink_clamps_edit_bar();
+    test_set_pattern_length_shrink_clamps_play_bar_to_zero();
+    test_set_pattern_length_shrink_skips_clamp_for_non_focused_pattern();
+    test_set_pattern_length_grow_does_not_touch_cursors();
     std::cout << "All pattern tests passed.\n";
     return 0;
 }

@@ -1,6 +1,7 @@
 #include "network.h"
 #include "net_compat.h"
 #include "session.h"
+#include "sync_protocol.h"
 
 #include <atomic>
 #include <cerrno>
@@ -300,34 +301,7 @@ bool recv_and_apply_msg_edit(int sock, SessionState& s, bool is_joiner) {
         uint8_t  bar = hdr[3];
         uint8_t  step = hdr[4];
         uint8_t  v   = hdr[5];
-        if (t >= TRACKS || step >= MAX_STEPS_PER_BAR
-            || bar >= MAX_BARS_PER_PATTERN) continue;
-        if (TRACK_DEFS[t].type != TrackType::DRUM) continue;
-        Pattern* pat = find_pattern(s, pid);
-        if (!pat) continue;
-        int dk = TRACK_DEFS[t].drum_kind;
-
-        uint16_t bit = static_cast<uint16_t>(1) << step;
-        // Only track in_flight against the local edit-focus pattern/bar; for
-        // other patterns we just apply the inbound edit (Rule Y degrades to
-        // last-writer-wins for non-current-focus edits in this Phase 5).
-        bool current_focus = (pid == s.current_edit_pattern_id.load()
-                              && bar == s.edit_bar.load());
-        if (is_joiner && current_focus) {
-            if (s.dirty[t].load() & bit) continue;
-            if (s.in_flight[t].load() & bit) {
-                pat->drum_grid[dk][bar][step] = (v != 0);
-                s.in_flight[t].fetch_and(static_cast<uint16_t>(~bit));
-                continue;
-            }
-            pat->drum_grid[dk][bar][step] = (v != 0);
-        } else if (is_joiner) {
-            pat->drum_grid[dk][bar][step] = (v != 0);
-        } else {
-            // Host: apply + redirty so we relay to peers.
-            pat->drum_grid[dk][bar][step] = (v != 0);
-            if (current_focus) s.dirty[t].fetch_or(bit);
-        }
+        apply_remote_drum_cell(s, pid, t, bar, step, v != 0, is_joiner);
     }
 
     uint8_t bpm_present = 0;
@@ -336,15 +310,8 @@ bool recv_and_apply_msg_edit(int sock, SessionState& s, bool is_joiner) {
     if (!recv_all(sock, &bpm_n, sizeof(bpm_n))) return false;
     if (bpm_present) {
         int32_t bpm = ntohl(bpm_n);
-        if (is_joiner) {
-            if (!s.bpm_dirty.load()) {
-                s.bpm = bpm;
-                if (s.bpm_in_flight.load()) s.bpm_in_flight.store(false);
-            }
-        } else {
-            s.bpm = bpm;
-            s.bpm_dirty.store(true);
-        }
+        apply_optimistic_local_edit_scalar(s.bpm, s.bpm_dirty, s.bpm_in_flight,
+                                           static_cast<int>(bpm), is_joiner);
     }
 
     return true;
@@ -477,7 +444,14 @@ bool recv_and_apply_msg_pattern_meta(int sock, SessionState& s, bool is_joiner) 
     if (!recv_all(sock, &tsn, 1)) return false;
     Pattern* pat = find_pattern(s, pid);
     if (!pat) return true;
-    pat->length_bars  = lb;
+    // Route length through the funnel so all four invariants fire (clamp,
+    // pattern_meta_dirty, song-run resize, cursor clamp on shrink). The
+    // pattern_meta_dirty bit it sets is harmless here — the flush builder
+    // re-emits a packet identical to the one we just received, which the
+    // peer will discard as a no-op via the same in_flight gate used for
+    // edits. time_sig_num stays a direct write; it has its own (separate)
+    // invariant set and isn't part of this PRD.
+    set_pattern_length(s, *pat, static_cast<int>(lb));
     pat->time_sig_num = tsn;
     return true;
 }
@@ -511,18 +485,10 @@ bool recv_and_apply_msg_track_root_midi(int sock, SessionState& s, bool is_joine
     if (track_id >= TRACKS) return true;
 
     uint16_t bit = static_cast<uint16_t>(1) << track_id;
-    if (is_joiner) {
-        if (s.track_root_dirty.load() & bit) return true;
-        if (s.track_root_in_flight.load() & bit) {
-            s.track_root_midi[track_id] = midi;
-            s.track_root_in_flight.fetch_and(static_cast<uint16_t>(~bit));
-            return true;
-        }
-        s.track_root_midi[track_id] = midi;
-    } else {
-        s.track_root_midi[track_id] = midi;
-        s.track_root_dirty.fetch_or(bit);
-    }
+    apply_optimistic_local_edit_bitmask(s.track_root_midi[track_id],
+                                        s.track_root_dirty,
+                                        s.track_root_in_flight,
+                                        bit, midi, is_joiner);
     return true;
 }
 

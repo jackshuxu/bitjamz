@@ -1,4 +1,5 @@
 #include "session.h"
+#include "sync_protocol.h"
 
 #include <algorithm>
 #include <atomic>
@@ -106,13 +107,91 @@ void shrink_song_runs_for_pid(SessionState& s, uint16_t pid, int delta) {
         i = next;
     }
 }
+}  // namespace
+
+namespace {
+// Shared private core for the three drum-cell write funnels. Range-checks
+// every coordinate, looks up the Pattern by id, and stores the cell. Returns
+// false on out-of-range / unknown pid (caller bails); returns true on a
+// successful store regardless of whether the value changed. Lock-free.
+bool write_drum_cell(SessionState& s, uint16_t pid, int track, int bar,
+                     int step, bool v) {
+    if (track < 0 || track >= TRACKS) return false;
+    if (bar < 0 || bar >= MAX_BARS_PER_PATTERN) return false;
+    if (step < 0 || step >= MAX_STEPS_PER_BAR) return false;
+    const TrackDef& td = TRACK_DEFS[track];
+    if (td.type != TrackType::DRUM) return false;
+    Pattern* pat = find_pattern(s, pid);
+    if (!pat) return false;
+    pat->drum_grid[td.drum_kind][bar][step].store(v);
+    return true;
+}
+}  // namespace
+
+void set_local_drum_cell(SessionState& s, uint16_t pid, int track,
+                         int bar, int step, bool v) {
+    if (!write_drum_cell(s, pid, track, bar, step, v)) return;
+    s.dirty[track].fetch_or(static_cast<uint16_t>(1u << step),
+                            std::memory_order_relaxed);
+}
+
+void fill_local_drum_cells(SessionState& s, uint16_t pid, int track, int bar,
+                           int start, int interval, int loop_len, bool v) {
+    if (interval <= 0) return;
+    uint16_t mask = 0;
+    for (int step = start; step < loop_len; step += interval) {
+        if (step < 0 || step >= MAX_STEPS_PER_BAR) continue;
+        if (!write_drum_cell(s, pid, track, bar, step, v)) continue;
+        mask |= static_cast<uint16_t>(1u << step);
+    }
+    if (mask) s.dirty[track].fetch_or(mask, std::memory_order_relaxed);
+}
+
+void apply_remote_drum_cell(SessionState& s, uint16_t pid, int track, int bar,
+                            int step, bool v, bool is_joiner) {
+    if (track < 0 || track >= TRACKS) return;
+    if (bar < 0 || bar >= MAX_BARS_PER_PATTERN) return;
+    if (step < 0 || step >= MAX_STEPS_PER_BAR) return;
+    const TrackDef& td = TRACK_DEFS[track];
+    if (td.type != TrackType::DRUM) return;
+    Pattern* pat = find_pattern(s, pid);
+    if (!pat) return;
+
+    bool current_focus = (pid == s.current_edit_pattern_id.load()
+                          && bar == s.edit_bar.load());
+    uint16_t bit = static_cast<uint16_t>(1u << step);
+
+    if (current_focus) {
+        // Focus path: delegate to the optimistic-local-edit bitmask helper
+        // from sync_protocol.h. We mirror the atomic drum cell into a local
+        // bool, let the helper apply its truth table, then write back if it
+        // changed. This keeps the joiner-drop / in_flight-clear / host-dirty
+        // policy in exactly one place (PRD-004's helper).
+        std::atomic<bool>& cell = pat->drum_grid[td.drum_kind][bar][step];
+        bool mirror = cell.load();
+        bool before = mirror;
+        apply_optimistic_local_edit_bitmask<bool>(
+            mirror, s.dirty[track], s.in_flight[track], bit, (v != 0),
+            is_joiner);
+        if (mirror != before) cell.store(mirror);
+    } else {
+        // Non-focus path: apply, but never touch dirty/in_flight. Preserves
+        // the asymmetry called out in PRD Risk #3.
+        pat->drum_grid[td.drum_kind][bar][step].store(v != 0);
+    }
+}
+
 // Single point of truth for pattern-length mutations. ALL code that changes
-// Pattern::length_bars must go through this helper so the three invariants
+// Pattern::length_bars must go through this helper so the four invariants
 // stay consistent:
 //   1. length_bars is clamped to [1, MAX_BARS_PER_PATTERN].
 //   2. pattern_meta_dirty is set so peers learn the new length.
 //   3. every contiguous run of this pattern in s.song grows or shrinks by the
 //      same delta (otherwise song-mode width drifts from pattern width).
+//   4. on shrink of the focused pattern, edit_bar / play_bar are clamped so
+//      the next edit doesn't write into bars the pattern no longer believes
+//      exist. edit_bar clamps to len-1; play_bar resets to 0 (mid-bar
+//      restart is more surprising than a clean restart from the top).
 // Returns the delta actually applied (0 if clamped to no-op).
 int set_pattern_length(SessionState& s, Pattern& p, int new_len) {
     new_len = std::clamp(new_len, 1, static_cast<int>(MAX_BARS_PER_PATTERN));
@@ -122,12 +201,22 @@ int set_pattern_length(SessionState& s, Pattern& p, int new_len) {
     uint16_t pid = p.id;
     p.length_bars = static_cast<uint8_t>(new_len);
     set_id_bit(s.pattern_meta_dirty, pid);
-    std::lock_guard<std::mutex> lk(s.patterns_mutex);
-    if (delta > 0) grow_song_runs_for_pid(s, pid, delta);
-    else            shrink_song_runs_for_pid(s, pid, -delta);
+    {
+        std::lock_guard<std::mutex> lk(s.patterns_mutex);
+        if (delta > 0) grow_song_runs_for_pid(s, pid, delta);
+        else            shrink_song_runs_for_pid(s, pid, -delta);
+    }
+    // Invariant 4: clamp the per-peer cursors after releasing patterns_mutex
+    // (the cursors are atomics and take no lock). Only the focused pattern's
+    // shrink can leave cursors dangling — other-pattern shrinks don't move
+    // this peer's edit window.
+    if (delta < 0 && pid == s.current_edit_pattern_id.load()) {
+        int len = p.length_bars;
+        if (s.edit_bar.load() >= len) s.edit_bar.store(len - 1);
+        if (s.play_bar.load() >= len) s.play_bar.store(0);
+    }
     return delta;
 }
-}  // namespace
 
 void extend_pattern_length(SessionState& s, int n) {
     if (n <= 0 || s.patterns.empty()) return;
@@ -378,8 +467,7 @@ void record_input(SessionState& s, int track, uint8_t pitch_midi) {
                                       pat.length_bars - 1);
     const TrackDef& td = TRACK_DEFS[track];
     if (td.type == TrackType::DRUM) {
-        pat.drum_grid[td.drum_kind][target_bar][target_step] = true;
-        s.dirty[track].fetch_or(static_cast<uint16_t>(1) << target_step);
+        set_local_drum_cell(s, pat.id, track, target_bar, target_step, true);
         return;
     }
     int midx = td.melodic_idx;
