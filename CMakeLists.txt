@@ -20,6 +20,7 @@ add_executable(bitjams
     src/audio.cpp
     src/session.cpp
     src/ui.cpp
+    src/ui_layout.cpp
     src/network.cpp
 )
 

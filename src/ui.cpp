@@ -10,15 +10,27 @@
 #include <vector>
 
 #include <ftxui/dom/elements.hpp>
+#include <ftxui/screen/terminal.hpp>
+#include <memory>
 
 #include "audio.h"
 #include "session.h"
+#include "ui_layout.h"
 
 using namespace ftxui;
 
+// ---- layout dimensions ---------------------------------------------------
+//
+// Three full-width borderRounded windows stacked vertically, plus a bare
+// status strip below them. Heights below include the 2 rows of border each
+// window takes for its frame. Tune these here.
+static constexpr int VIS_BODY_ROWS  = 7;                 // visualizer body rows
+static constexpr int TOP_WIN_H      = VIS_BODY_ROWS + 2; // visualizer + border
+static constexpr int SONG_WIN_H     = 6;                 // header + bar row + legend + border
+static constexpr int STATUS_STRIP_H = 1;                 // bare hbox, no border
+
 // ---- nav state ------------------------------------------------------------
 
-enum class NavState { GRID, KEYBOARD, PARAM_PAGE, PIANO_ROLL };
 static NavState nav_state = NavState::GRID;
 static bool     seq_mode  = false;  // GRID sub-mode: 8-step window for drum cell toggles
 
@@ -183,7 +195,7 @@ static bool track_is_silenced(const SessionState& s, int t) {
 // ---- visualizer (unchanged) ----------------------------------------------
 
 static constexpr int VIS_W = 3 + STEPS * 3;
-static constexpr int VIS_H = 7;
+static constexpr int VIS_H = VIS_BODY_ROWS;
 
 static Element render_visualizer() {
     static float vis_grid[VIS_H][VIS_W] = {};
@@ -1620,92 +1632,94 @@ static void commit_song_digit(SessionState& s, int pid) {
         song_place_pattern_at_bar(s, bar, static_cast<uint16_t>(pid));
     }
 }
-static Element render_song_mode_view(SessionState& s) {
+// Compact one-row song arrangement, sized to live inside the bottom window.
+static Element render_song_strip(SessionState& s) {
     Elements lines;
-    char head[160];
-    std::snprintf(head, sizeof(head),
-                  "  SONG MODE  bpm: %d  song bars: %zu  cursor bar: %d  %s",
-                  s.bpm, s.song.size(), s.song_view_cursor_bar.load() + 1,
-                  s.playing.load() ? "▶" : "■");
-    lines.push_back(text("bitjams") | bold | color(COL_PURPLE));
-    lines.push_back(text(head) | color(COL_PURPLE));
-    lines.push_back(text(""));
-
-    int cursor_bar = s.song_view_cursor_bar.load();
+    int cursor_bar    = s.song_view_cursor_bar.load();
     int play_song_bar = s.play_song_bar.load();
-    int per_row = 16;
-    int rows = static_cast<int>((s.song.size() + per_row - 1) / per_row);
-    if (rows < 1) rows = 1;
+    bool focused      = s.song_view_focused.load();
 
-    for (int r = 0; r < rows; ++r) {
-        // bar numbers
-        Elements num_row;
-        Elements blk_row;
-        for (int c = 0; c < per_row; ++c) {
-            int bar = r * per_row + c;
-            char buf[8];
-            std::snprintf(buf, sizeof(buf), " %3d ", bar + 1);
-            Element n = text(buf) | color(COL_BRIGHT);
-            num_row.push_back(n);
+    int bars = static_cast<int>(s.song.size());
+    int slots = std::max(bars, 1);
 
-            Element cell;
-            if (bar < static_cast<int>(s.song.size())) {
-                uint16_t pid = s.song[bar];
-                char cbuf[8];
-                if (pid == 0)         std::snprintf(cbuf, sizeof(cbuf), "  ·  ");
-                else                  std::snprintf(cbuf, sizeof(cbuf), " P%02u ", static_cast<unsigned>(pid));
-                cell = text(cbuf);
-                if (bar == play_song_bar && s.playing.load()) cell = cell | color(COL_HEAD) | bold;
-                else if (pid != 0)                            cell = cell | color(COL_GREEN);
-                else                                          cell = cell | color(COL_DIM);
-            } else {
-                cell = text("  -  ") | color(COL_DIM);
-            }
-            if (bar == cursor_bar) cell = cell | inverted;
-            blk_row.push_back(cell);
+    Elements num_row;
+    Elements blk_row;
+    for (int c = 0; c < slots; ++c) {
+        char nbuf[8];
+        std::snprintf(nbuf, sizeof(nbuf), " %2d ", c + 1);
+        num_row.push_back(text(nbuf) | color(COL_BRIGHT));
+
+        Element cell;
+        if (c < bars) {
+            uint16_t pid = s.song[c];
+            char cbuf[8];
+            if (pid == 0) std::snprintf(cbuf, sizeof(cbuf), "  · ");
+            else          std::snprintf(cbuf, sizeof(cbuf), " P%02u",
+                                        static_cast<unsigned>(pid));
+            cell = text(cbuf);
+            if (c == play_song_bar && s.playing.load()) cell = cell | color(COL_HEAD) | bold;
+            else if (pid != 0)                          cell = cell | color(COL_GREEN);
+            else                                        cell = cell | color(COL_DIM);
+        } else {
+            cell = text("  - ") | color(COL_DIM);
         }
-        lines.push_back(hbox(std::move(num_row)));
-        lines.push_back(hbox(std::move(blk_row)));
-        lines.push_back(text(""));
+        if (focused && c == cursor_bar) cell = cell | inverted;
+        blk_row.push_back(cell);
     }
+    lines.push_back(hbox(std::move(num_row)));
+    lines.push_back(hbox(std::move(blk_row)));
 
-    // Pattern legend
-    {
-        Elements legend;
-        legend.push_back(text("  patterns:  ") | color(COL_DIM));
-        for (const auto& p : s.patterns) {
-            char buf[20];
-            std::snprintf(buf, sizeof(buf), "P%02u(%db) ",
-                          static_cast<unsigned>(p->id), p->length_bars);
-            legend.push_back(text(buf) | color(COL_GREEN));
-        }
-        lines.push_back(hbox(std::move(legend)));
+    Elements legend;
+    legend.push_back(text(" patterns: ") | color(COL_DIM));
+    for (const auto& p : s.patterns) {
+        char buf[20];
+        std::snprintf(buf, sizeof(buf), "P%02u(%db) ",
+                      static_cast<unsigned>(p->id), p->length_bars);
+        legend.push_back(text(buf) | color(COL_GREEN));
     }
-    lines.push_back(text("  arrows: move cursor   0-9: type pattern id   shift+tab: seq view")
-                    | color(COL_DIM));
-
+    lines.push_back(hbox(std::move(legend)));
     return vbox(std::move(lines));
 }
 
 Component build_session_ui(ScreenInteractive& screen, SessionState& state) {
     auto root = Renderer([&state] {
-        Element page;
-        if (state.song_view_focused.load()) {
-            page = render_song_mode_view(state);
-        } else if (nav_state == NavState::PARAM_PAGE) {
+        bool song_focused = state.song_view_focused.load();
+
+        Element middle_body;
+        if (nav_state == NavState::PARAM_PAGE) {
             ensure_cursor_visible(state);
-            page = (TRACK_DEFS[cursor_track].type == TrackType::MELODIC)
-                 ? render_melodic_param_page(state, cursor_track)
-                 : render_drum_param_page(state, cursor_track);
+            middle_body = (TRACK_DEFS[cursor_track].type == TrackType::MELODIC)
+                        ? render_melodic_param_page(state, cursor_track)
+                        : render_drum_param_page(state, cursor_track);
         } else if (nav_state == NavState::PIANO_ROLL) {
-            page = render_piano_roll(state);
+            middle_body = render_piano_roll(state);
         } else {
-            page = render_grid_view(state);
+            // GRID and KEYBOARD share the sequencer view.
+            middle_body = render_grid_view(state);
         }
-        return vbox({
-            render_visualizer(),
-            page,
-        });
+
+        const std::string mid_title = view_title(nav_state, song_focused);
+
+        Element top_win = window(text(" BITJAMZ ") | bold | color(COL_PURPLE),
+                                 render_visualizer())
+                        | size(HEIGHT, EQUAL, TOP_WIN_H);
+
+        Element mid_win = window(text(" " + mid_title + " ") | bold | color(COL_PURPLE),
+                                 middle_body | yflex)
+                        | yflex;
+
+        Element bot_win = window(text(" Song ") | bold | color(COL_PURPLE),
+                                 render_song_strip(state))
+                        | size(HEIGHT, EQUAL, SONG_WIN_H);
+
+        int term_w = Terminal::Size().dimx;
+        if (term_w <= 0) term_w = 80;
+        const std::string strip = compose_status_strip(
+            status_items_for(nav_state, song_focused), term_w);
+        Element status = text(strip) | color(COL_DIM)
+                       | size(HEIGHT, EQUAL, STATUS_STRIP_H);
+
+        return vbox({ top_win, mid_win, bot_win, status });
     });
 
     auto with_events = CatchEvent(root, [&screen, &state](Event e) -> bool {
