@@ -194,14 +194,24 @@ static bool track_is_silenced(const SessionState& s, int t) {
 
 // ---- visualizer (unchanged) ----------------------------------------------
 
-static constexpr int VIS_W = 3 + STEPS * 3;
 static constexpr int VIS_H = VIS_BODY_ROWS;
 
 static Element render_visualizer() {
-    static float vis_grid[VIS_H][VIS_W] = {};
+    // Width tracks terminal width minus the two border columns of the
+    // enclosing window. The grid is reallocated on resize so the cloud of
+    // dots fills the box edge-to-edge instead of sitting in a narrow band.
+    int term_w = Terminal::Size().dimx - 2;
+    if (term_w < 8)   term_w = 8;
+    if (term_w > 400) term_w = 400;
+
+    static std::vector<std::vector<float>> vis_grid(VIS_H,
+                                                    std::vector<float>(term_w, 0.f));
+    if ((int)vis_grid[0].size() != term_w) {
+        vis_grid.assign(VIS_H, std::vector<float>(term_w, 0.f));
+    }
 
     for (int row = 0; row < VIS_H; ++row)
-        for (int col = 0; col < VIS_W; ++col)
+        for (int col = 0; col < term_w; ++col)
             vis_grid[row][col] *= 0.68f;
 
     int wp    = vis_wp.load(std::memory_order_acquire);
@@ -215,16 +225,16 @@ static Element render_visualizer() {
         const auto& s = vis_buf[(wp - i + VIS_BUF) & (VIS_BUF - 1)];
         float mid  = (s.l + s.r) * MID_SCALE;
         float side = (s.l - s.r) * SIDE_SCALE;
-        int gx = (int)((mid  + 1.f) * 0.5f * (VIS_W - 1));
+        int gx = (int)((mid  + 1.f) * 0.5f * (term_w - 1));
         int gy = (int)((side + 1.f) * 0.5f * (VIS_H - 1));
-        if ((unsigned)gx < (unsigned)VIS_W && (unsigned)gy < (unsigned)VIS_H)
+        if ((unsigned)gx < (unsigned)term_w && (unsigned)gy < (unsigned)VIS_H)
             vis_grid[gy][gx] = std::min(1.f, vis_grid[gy][gx] + 0.12f);
     }
 
     Elements rows;
     for (int row = 0; row < VIS_H; ++row) {
         Elements cells;
-        for (int col = 0; col < VIS_W; ++col) {
+        for (int col = 0; col < term_w; ++col) {
             float v = vis_grid[row][col];
             if      (v > 0.65f) cells.push_back(text("█") | color(COL_BRIGHT));
             else if (v > 0.30f) cells.push_back(text("•") | color(COL_PURPLE));
@@ -233,7 +243,6 @@ static Element render_visualizer() {
         }
         rows.push_back(hbox(std::move(cells)));
     }
-    rows.push_back(text(""));
     return vbox(std::move(rows));
 }
 
