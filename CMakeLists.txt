@@ -120,6 +120,18 @@ else()
 endif()
 add_test(NAME drum_funnel_tests COMMAND test_drum_funnel)
 
+add_executable(test_ui_layout
+    tests/test_ui_layout.cpp
+    src/ui_layout.cpp
+)
+target_include_directories(test_ui_layout PRIVATE include src)
+if(MSVC)
+    target_compile_options(test_ui_layout PRIVATE /W3 /O2)
+else()
+    target_compile_options(test_ui_layout PRIVATE -Wall -Wextra -O2)
+endif()
+add_test(NAME ui_layout_tests COMMAND test_ui_layout)
+
 add_executable(test_optimistic_local_edit
     tests/test_optimistic_local_edit.cpp
 )
