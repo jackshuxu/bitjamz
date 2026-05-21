@@ -10,15 +10,27 @@
 #include <vector>
 
 #include <ftxui/dom/elements.hpp>
+#include <ftxui/screen/terminal.hpp>
+#include <memory>
 
 #include "audio.h"
 #include "session.h"
+#include "ui_layout.h"
 
 using namespace ftxui;
 
+// ---- layout dimensions ---------------------------------------------------
+//
+// Three full-width borderRounded windows stacked vertically, plus a bare
+// status strip below them. Heights below include the 2 rows of border each
+// window takes for its frame. Tune these here.
+static constexpr int VIS_BODY_ROWS  = 7;                 // visualizer body rows
+static constexpr int TOP_WIN_H      = VIS_BODY_ROWS + 2; // visualizer + border
+static constexpr int SONG_WIN_H     = 6;                 // header + bar row + legend + border
+static constexpr int STATUS_STRIP_H = 1;                 // bare hbox, no border
+
 // ---- nav state ------------------------------------------------------------
 
-enum class NavState { GRID, KEYBOARD, PARAM_PAGE, PIANO_ROLL };
 static NavState nav_state = NavState::GRID;
 static bool     seq_mode  = false;  // GRID sub-mode: 8-step window for drum cell toggles
 
@@ -151,11 +163,11 @@ static int track_for_mpc_key(char c) {
 
 // ---- color palette --------------------------------------------------------
 
-static const Color COL_PURPLE = Color::RGB(125,  86, 244);
-static const Color COL_DIM    = Color::RGB( 60,  40, 120);
-static const Color COL_BRIGHT = Color::RGB(200, 180, 255);
-static const Color COL_HEAD   = Color::RGB(255, 220, 100);
-static const Color COL_GREEN  = Color::RGB( 80, 220, 120);
+static const Color COL_PURPLE = Color::RGB(165, 130, 255);
+static const Color COL_DIM    = Color::RGB(150, 120, 215);
+static const Color COL_BRIGHT = Color::RGB(220, 200, 255);
+static const Color COL_HEAD   = Color::RGB(230, 170, 255);
+static const Color COL_GREEN  = Color::RGB(190, 150, 255);
 
 // ---- cursor / track navigation -------------------------------------------
 
@@ -182,14 +194,24 @@ static bool track_is_silenced(const SessionState& s, int t) {
 
 // ---- visualizer (unchanged) ----------------------------------------------
 
-static constexpr int VIS_W = 3 + STEPS * 3;
-static constexpr int VIS_H = 7;
+static constexpr int VIS_H = VIS_BODY_ROWS;
 
 static Element render_visualizer() {
-    static float vis_grid[VIS_H][VIS_W] = {};
+    // Width tracks terminal width minus the two border columns of the
+    // enclosing window. The grid is reallocated on resize so the cloud of
+    // dots fills the box edge-to-edge instead of sitting in a narrow band.
+    int term_w = Terminal::Size().dimx - 2;
+    if (term_w < 8)   term_w = 8;
+    if (term_w > 400) term_w = 400;
+
+    static std::vector<std::vector<float>> vis_grid(VIS_H,
+                                                    std::vector<float>(term_w, 0.f));
+    if ((int)vis_grid[0].size() != term_w) {
+        vis_grid.assign(VIS_H, std::vector<float>(term_w, 0.f));
+    }
 
     for (int row = 0; row < VIS_H; ++row)
-        for (int col = 0; col < VIS_W; ++col)
+        for (int col = 0; col < term_w; ++col)
             vis_grid[row][col] *= 0.68f;
 
     int wp    = vis_wp.load(std::memory_order_acquire);
@@ -203,16 +225,16 @@ static Element render_visualizer() {
         const auto& s = vis_buf[(wp - i + VIS_BUF) & (VIS_BUF - 1)];
         float mid  = (s.l + s.r) * MID_SCALE;
         float side = (s.l - s.r) * SIDE_SCALE;
-        int gx = (int)((mid  + 1.f) * 0.5f * (VIS_W - 1));
+        int gx = (int)((mid  + 1.f) * 0.5f * (term_w - 1));
         int gy = (int)((side + 1.f) * 0.5f * (VIS_H - 1));
-        if ((unsigned)gx < (unsigned)VIS_W && (unsigned)gy < (unsigned)VIS_H)
+        if ((unsigned)gx < (unsigned)term_w && (unsigned)gy < (unsigned)VIS_H)
             vis_grid[gy][gx] = std::min(1.f, vis_grid[gy][gx] + 0.12f);
     }
 
     Elements rows;
     for (int row = 0; row < VIS_H; ++row) {
         Elements cells;
-        for (int col = 0; col < VIS_W; ++col) {
+        for (int col = 0; col < term_w; ++col) {
             float v = vis_grid[row][col];
             if      (v > 0.65f) cells.push_back(text("█") | color(COL_BRIGHT));
             else if (v > 0.30f) cells.push_back(text("•") | color(COL_PURPLE));
@@ -221,7 +243,6 @@ static Element render_visualizer() {
         }
         rows.push_back(hbox(std::move(cells)));
     }
-    rows.push_back(text(""));
     return vbox(std::move(rows));
 }
 
@@ -1620,95 +1641,155 @@ static void commit_song_digit(SessionState& s, int pid) {
         song_place_pattern_at_bar(s, bar, static_cast<uint16_t>(pid));
     }
 }
-static Element render_song_mode_view(SessionState& s) {
+// Compact one-row song arrangement, sized to live inside the bottom window.
+static Element render_song_strip(SessionState& s) {
     Elements lines;
-    char head[160];
-    std::snprintf(head, sizeof(head),
-                  "  SONG MODE  bpm: %d  song bars: %zu  cursor bar: %d  %s",
-                  s.bpm, s.song.size(), s.song_view_cursor_bar.load() + 1,
-                  s.playing.load() ? "▶" : "■");
-    lines.push_back(text("bitjams") | bold | color(COL_PURPLE));
-    lines.push_back(text(head) | color(COL_PURPLE));
-    lines.push_back(text(""));
-
-    int cursor_bar = s.song_view_cursor_bar.load();
+    int cursor_bar    = s.song_view_cursor_bar.load();
     int play_song_bar = s.play_song_bar.load();
-    int per_row = 16;
-    int rows = static_cast<int>((s.song.size() + per_row - 1) / per_row);
-    if (rows < 1) rows = 1;
+    bool focused      = s.song_view_focused.load();
 
-    for (int r = 0; r < rows; ++r) {
-        // bar numbers
-        Elements num_row;
-        Elements blk_row;
-        for (int c = 0; c < per_row; ++c) {
-            int bar = r * per_row + c;
-            char buf[8];
-            std::snprintf(buf, sizeof(buf), " %3d ", bar + 1);
-            Element n = text(buf) | color(COL_BRIGHT);
-            num_row.push_back(n);
+    int bars = static_cast<int>(s.song.size());
+    int slots = std::max(bars, 1);
 
-            Element cell;
-            if (bar < static_cast<int>(s.song.size())) {
-                uint16_t pid = s.song[bar];
-                char cbuf[8];
-                if (pid == 0)         std::snprintf(cbuf, sizeof(cbuf), "  ·  ");
-                else                  std::snprintf(cbuf, sizeof(cbuf), " P%02u ", static_cast<unsigned>(pid));
-                cell = text(cbuf);
-                if (bar == play_song_bar && s.playing.load()) cell = cell | color(COL_HEAD) | bold;
-                else if (pid != 0)                            cell = cell | color(COL_GREEN);
-                else                                          cell = cell | color(COL_DIM);
-            } else {
-                cell = text("  -  ") | color(COL_DIM);
-            }
-            if (bar == cursor_bar) cell = cell | inverted;
-            blk_row.push_back(cell);
+    Elements num_row;
+    Elements blk_row;
+    for (int c = 0; c < slots; ++c) {
+        char nbuf[8];
+        std::snprintf(nbuf, sizeof(nbuf), " %2d ", c + 1);
+        num_row.push_back(text(nbuf) | color(COL_BRIGHT));
+
+        Element cell;
+        if (c < bars) {
+            uint16_t pid = s.song[c];
+            char cbuf[8];
+            if (pid == 0) std::snprintf(cbuf, sizeof(cbuf), "  · ");
+            else          std::snprintf(cbuf, sizeof(cbuf), " P%02u",
+                                        static_cast<unsigned>(pid));
+            cell = text(cbuf);
+            if (c == play_song_bar && s.playing.load()) cell = cell | color(COL_HEAD) | bold;
+            else if (pid != 0)                          cell = cell | color(COL_GREEN);
+            else                                        cell = cell | color(COL_DIM);
+        } else {
+            cell = text("  - ") | color(COL_DIM);
         }
-        lines.push_back(hbox(std::move(num_row)));
-        lines.push_back(hbox(std::move(blk_row)));
-        lines.push_back(text(""));
+        if (focused && c == cursor_bar) cell = cell | inverted;
+        blk_row.push_back(cell);
     }
+    lines.push_back(hbox(std::move(num_row)));
+    lines.push_back(hbox(std::move(blk_row)));
 
-    // Pattern legend
-    {
-        Elements legend;
-        legend.push_back(text("  patterns:  ") | color(COL_DIM));
-        for (const auto& p : s.patterns) {
-            char buf[20];
-            std::snprintf(buf, sizeof(buf), "P%02u(%db) ",
-                          static_cast<unsigned>(p->id), p->length_bars);
-            legend.push_back(text(buf) | color(COL_GREEN));
-        }
-        lines.push_back(hbox(std::move(legend)));
+    Elements legend;
+    legend.push_back(text(" patterns: ") | color(COL_DIM));
+    for (const auto& p : s.patterns) {
+        char buf[20];
+        std::snprintf(buf, sizeof(buf), "P%02u(%db) ",
+                      static_cast<unsigned>(p->id), p->length_bars);
+        legend.push_back(text(buf) | color(COL_GREEN));
     }
-    lines.push_back(text("  arrows: move cursor   0-9: type pattern id   shift+tab: seq view")
-                    | color(COL_DIM));
-
+    lines.push_back(hbox(std::move(legend)));
     return vbox(std::move(lines));
 }
 
-Component build_session_ui(ScreenInteractive& screen, SessionState& state) {
-    auto root = Renderer([&state] {
-        Element page;
-        if (state.song_view_focused.load()) {
-            page = render_song_mode_view(state);
-        } else if (nav_state == NavState::PARAM_PAGE) {
-            ensure_cursor_visible(state);
-            page = (TRACK_DEFS[cursor_track].type == TrackType::MELODIC)
-                 ? render_melodic_param_page(state, cursor_track)
-                 : render_drum_param_page(state, cursor_track);
-        } else if (nav_state == NavState::PIANO_ROLL) {
-            page = render_piano_roll(state);
-        } else {
-            page = render_grid_view(state);
+// Centered floating help overlay, populated from help_entries(). The dispatch
+// layer below is responsible for toggling visibility and for swallowing all
+// other keys while it is open.
+static Element render_help_modal() {
+    Elements rows;
+    rows.push_back(text("BITJAMZ — keybindings") | bold | color(COL_PURPLE));
+    rows.push_back(text("? or Esc to close") | color(COL_DIM));
+    rows.push_back(text(""));
+
+    for (const auto& section : help_sections()) {
+        rows.push_back(text(section) | bold | color(COL_BRIGHT));
+        for (const auto& e : help_entries()) {
+            if (e.section != section) continue;
+            Elements line;
+            line.push_back(text("  "));
+            line.push_back(text(e.key) | color(COL_GREEN)
+                                       | size(WIDTH, EQUAL, 22));
+            line.push_back(text("  "));
+            line.push_back(text(e.description) | color(COL_DIM));
+            rows.push_back(hbox(std::move(line)));
         }
-        return vbox({
-            render_visualizer(),
-            page,
-        });
+        rows.push_back(text(""));
+    }
+
+    return vbox(std::move(rows))
+         | borderRounded
+         | color(COL_PURPLE)
+         | size(WIDTH, EQUAL, 72)
+         | clear_under;
+}
+
+Component build_session_ui(ScreenInteractive& screen, SessionState& state) {
+    // Local visibility flag for the help overlay. Shared via shared_ptr so
+    // both the renderer lambda and the event handler reference the same cell.
+    auto show_help = std::make_shared<bool>(false);
+
+    auto root = Renderer([&state, show_help] {
+        bool song_focused = state.song_view_focused.load();
+
+        Element middle_body;
+        if (nav_state == NavState::PARAM_PAGE) {
+            ensure_cursor_visible(state);
+            middle_body = (TRACK_DEFS[cursor_track].type == TrackType::MELODIC)
+                        ? render_melodic_param_page(state, cursor_track)
+                        : render_drum_param_page(state, cursor_track);
+        } else if (nav_state == NavState::PIANO_ROLL) {
+            middle_body = render_piano_roll(state);
+        } else {
+            // GRID and KEYBOARD share the sequencer view.
+            middle_body = render_grid_view(state);
+        }
+
+        const std::string mid_title = view_title(nav_state, song_focused);
+
+        Element top_win = window(text(" BITJAMZ ") | bold | color(COL_PURPLE),
+                                 render_visualizer())
+                        | color(COL_PURPLE)
+                        | size(HEIGHT, EQUAL, TOP_WIN_H);
+
+        Element mid_win = window(text(" " + mid_title + " ") | bold | color(COL_PURPLE),
+                                 middle_body | yflex)
+                        | color(COL_PURPLE)
+                        | yflex;
+
+        Element bot_win = window(text(" Song ") | bold | color(COL_PURPLE),
+                                 render_song_strip(state))
+                        | color(COL_PURPLE)
+                        | size(HEIGHT, EQUAL, SONG_WIN_H);
+
+        int term_w = Terminal::Size().dimx;
+        if (term_w <= 0) term_w = 80;
+        const std::string strip = compose_status_strip(
+            status_items_for(nav_state, song_focused), term_w);
+        Element status = text(strip) | color(COL_DIM)
+                       | size(HEIGHT, EQUAL, STATUS_STRIP_H);
+
+        Element page = vbox({ top_win, mid_win, bot_win, status });
+        if (*show_help) {
+            page = dbox({ page, render_help_modal() | center });
+        }
+        return page;
     });
 
-    auto with_events = CatchEvent(root, [&screen, &state](Event e) -> bool {
+    auto with_events = CatchEvent(root, [&screen, &state, show_help](Event e) -> bool {
+        // Help modal: ? toggles open, ? or Esc closes. While open, all other
+        // character events are swallowed so the user cannot accidentally
+        // edit through the overlay. Non-character events (refresh ticks,
+        // resize) pass through so the screen keeps redrawing.
+        if (*show_help) {
+            if (e == Event::Character('?') || e == Event::Escape) {
+                *show_help = false;
+                return true;
+            }
+            if (e.is_character()) return true;
+            return false;
+        }
+        if (e == Event::Character('?')) {
+            *show_help = true;
+            return true;
+        }
         // Global keys first.
         // Quit moved to shift+Q. Lowercase q drives record (PRD).
         if (e == Event::Character('Q')) {
@@ -1927,7 +2008,7 @@ static const char* const BITJAMS_LOGO[] = {
 };
 static constexpr int BITJAMS_LOGO_LINES = sizeof(BITJAMS_LOGO) / sizeof(BITJAMS_LOGO[0]);
 
-static const Color COL_PURPLE_DIM = Color::RGB(80, 55, 160);
+static const Color COL_PURPLE_DIM = Color::RGB(140, 110, 220);
 
 static const char* const BITJAMS_LOGO_UNDERLINE =
     "       ──── ──── ──── ──── ──── ──── ──── ────";

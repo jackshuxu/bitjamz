@@ -69,7 +69,10 @@ jobs:
       - name: Build test targets
         run: cmake --build build-tsan --target test_net test_record
 
+      # TSAN only instruments the network / record tests (the threaded code
+      # paths). Filter ctest so it does not try to run executables this job
+      # never built.
       - name: Test
-        run: ctest --test-dir build-tsan --output-on-failure
+        run: ctest --test-dir build-tsan --output-on-failure -R "net_tests|record_tests"
 
 
