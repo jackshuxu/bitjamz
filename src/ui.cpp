@@ -163,11 +163,11 @@ static int track_for_mpc_key(char c) {
 
 // ---- color palette --------------------------------------------------------
 
-static const Color COL_PURPLE = Color::RGB(125,  86, 244);
-static const Color COL_DIM    = Color::RGB( 60,  40, 120);
-static const Color COL_BRIGHT = Color::RGB(200, 180, 255);
-static const Color COL_HEAD   = Color::RGB(255, 220, 100);
-static const Color COL_GREEN  = Color::RGB( 80, 220, 120);
+static const Color COL_PURPLE = Color::RGB(165, 130, 255);
+static const Color COL_DIM    = Color::RGB(150, 120, 215);
+static const Color COL_BRIGHT = Color::RGB(220, 200, 255);
+static const Color COL_HEAD   = Color::RGB(230, 170, 255);
+static const Color COL_GREEN  = Color::RGB(190, 150, 255);
 
 // ---- cursor / track navigation -------------------------------------------
 
@@ -1707,6 +1707,7 @@ static Element render_help_modal() {
 
     return vbox(std::move(rows))
          | borderRounded
+         | color(COL_PURPLE)
          | size(WIDTH, EQUAL, 72)
          | clear_under;
 }
@@ -1736,14 +1737,17 @@ Component build_session_ui(ScreenInteractive& screen, SessionState& state) {
 
         Element top_win = window(text(" BITJAMZ ") | bold | color(COL_PURPLE),
                                  render_visualizer())
+                        | color(COL_PURPLE)
                         | size(HEIGHT, EQUAL, TOP_WIN_H);
 
         Element mid_win = window(text(" " + mid_title + " ") | bold | color(COL_PURPLE),
                                  middle_body | yflex)
+                        | color(COL_PURPLE)
                         | yflex;
 
         Element bot_win = window(text(" Song ") | bold | color(COL_PURPLE),
                                  render_song_strip(state))
+                        | color(COL_PURPLE)
                         | size(HEIGHT, EQUAL, SONG_WIN_H);
 
         int term_w = Terminal::Size().dimx;
@@ -1995,7 +1999,7 @@ static const char* const BITJAMS_LOGO[] = {
 };
 static constexpr int BITJAMS_LOGO_LINES = sizeof(BITJAMS_LOGO) / sizeof(BITJAMS_LOGO[0]);
 
-static const Color COL_PURPLE_DIM = Color::RGB(80, 55, 160);
+static const Color COL_PURPLE_DIM = Color::RGB(140, 110, 220);
 
 static const char* const BITJAMS_LOGO_UNDERLINE =
     "       ──── ──── ──── ──── ──── ──── ──── ────";
