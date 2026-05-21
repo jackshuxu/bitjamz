@@ -1681,8 +1681,42 @@ static Element render_song_strip(SessionState& s) {
     return vbox(std::move(lines));
 }
 
+// Centered floating help overlay, populated from help_entries(). The dispatch
+// layer below is responsible for toggling visibility and for swallowing all
+// other keys while it is open.
+static Element render_help_modal() {
+    Elements rows;
+    rows.push_back(text("BITJAMZ — keybindings") | bold | color(COL_PURPLE));
+    rows.push_back(text("? or Esc to close") | color(COL_DIM));
+    rows.push_back(text(""));
+
+    for (const auto& section : help_sections()) {
+        rows.push_back(text(section) | bold | color(COL_BRIGHT));
+        for (const auto& e : help_entries()) {
+            if (e.section != section) continue;
+            Elements line;
+            line.push_back(text("  "));
+            line.push_back(text(e.key) | color(COL_GREEN)
+                                       | size(WIDTH, EQUAL, 22));
+            line.push_back(text("  "));
+            line.push_back(text(e.description) | color(COL_DIM));
+            rows.push_back(hbox(std::move(line)));
+        }
+        rows.push_back(text(""));
+    }
+
+    return vbox(std::move(rows))
+         | borderRounded
+         | size(WIDTH, EQUAL, 72)
+         | clear_under;
+}
+
 Component build_session_ui(ScreenInteractive& screen, SessionState& state) {
-    auto root = Renderer([&state] {
+    // Local visibility flag for the help overlay. Shared via shared_ptr so
+    // both the renderer lambda and the event handler reference the same cell.
+    auto show_help = std::make_shared<bool>(false);
+
+    auto root = Renderer([&state, show_help] {
         bool song_focused = state.song_view_focused.load();
 
         Element middle_body;
@@ -1719,10 +1753,30 @@ Component build_session_ui(ScreenInteractive& screen, SessionState& state) {
         Element status = text(strip) | color(COL_DIM)
                        | size(HEIGHT, EQUAL, STATUS_STRIP_H);
 
-        return vbox({ top_win, mid_win, bot_win, status });
+        Element page = vbox({ top_win, mid_win, bot_win, status });
+        if (*show_help) {
+            page = dbox({ page, render_help_modal() | center });
+        }
+        return page;
     });
 
-    auto with_events = CatchEvent(root, [&screen, &state](Event e) -> bool {
+    auto with_events = CatchEvent(root, [&screen, &state, show_help](Event e) -> bool {
+        // Help modal: ? toggles open, ? or Esc closes. While open, all other
+        // character events are swallowed so the user cannot accidentally
+        // edit through the overlay. Non-character events (refresh ticks,
+        // resize) pass through so the screen keeps redrawing.
+        if (*show_help) {
+            if (e == Event::Character('?') || e == Event::Escape) {
+                *show_help = false;
+                return true;
+            }
+            if (e.is_character()) return true;
+            return false;
+        }
+        if (e == Event::Character('?')) {
+            *show_help = true;
+            return true;
+        }
         // Global keys first.
         // Quit moved to shift+Q. Lowercase q drives record (PRD).
         if (e == Event::Character('Q')) {

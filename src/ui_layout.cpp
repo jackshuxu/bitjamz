@@ -208,3 +208,96 @@ std::string compose_status_strip(const std::vector<StatusItem>& items, int width
     return out;
 }
 
+// ---- help modal ----------------------------------------------------------
+
+const std::vector<HelpEntry>& help_entries() {
+    static const std::vector<HelpEntry> kEntries = {
+        // Global ------------------------------------------------------------
+        {"Global", "p",          "Play / pause"},
+        {"Global", "q",          "Toggle record (with count-in)"},
+        {"Global", "Shift+Q",    "Quit"},
+        {"Global", "\\",         "Toggle metronome"},
+        {"Global", "=",          "BPM up (+5)"},
+        {"Global", "-",          "BPM down (-5)"},
+        {"Global", "]",          "Extend pattern by one bar"},
+        {"Global", "[",          "Shrink pattern by one bar"},
+        {"Global", ".",          "Time-signature numerator +1"},
+        {"Global", ",",          "Time-signature numerator -1"},
+        {"Global", "+",          "Create new blank pattern"},
+        {"Global", "*",          "Duplicate current pattern"},
+        {"Global", "Shift+L",    "Toggle pattern-loop (local override)"},
+        {"Global", "Shift+F",    "Toggle follow-mode"},
+        {"Global", "Shift+B",    "Duplicate current bar"},
+        {"Global", "Shift+Tab",  "Toggle between Sequencer and Song views"},
+        {"Global", "Shift+left/right", "Bar-edge jump (two-press pages bar)"},
+        {"Global", "Home/End",   "Bar-edge jump (fallback)"},
+        {"Global", "?",          "Open / close this help"},
+
+        // Grid --------------------------------------------------------------
+        {"Grid", "Space",        "Toggle step / place note"},
+        {"Grid", "arrows",       "Move cursor"},
+        {"Grid", "1-9",          "Fill row with N hits"},
+        {"Grid", "Backspace",    "Delete cell"},
+        {"Grid", "r t y u v b n m f g h j", "Trigger + focus track"},
+        {"Grid", "Tab",          "Open Synth (param page)"},
+        {"Grid", "Enter",        "Open Piano Roll"},
+        {"Grid", "k",            "Enter Keyboard mode"},
+        {"Grid", "s",            "Toggle step (8-step window) mode"},
+        {"Grid", "S",            "Solo current track"},
+        {"Grid", "M",            "Mute current track"},
+        {"Grid", "C",            "Copy"},
+        {"Grid", "V",            "Paste"},
+        {"Grid", "D",            "Clear current track"},
+        {"Grid", "Shift+A then D", "Clear all tracks"},
+
+        // Piano Roll --------------------------------------------------------
+        {"Piano Roll", "Space",     "Place / delete note at cursor"},
+        {"Piano Roll", "arrows",    "Move cursor (step / pitch)"},
+        {"Piano Roll", "z / x",     "Octave down / up"},
+        {"Piano Roll", "n",         "Toggle jam (synth-only) mode"},
+        {"Piano Roll", "C",         "Copy note under cursor"},
+        {"Piano Roll", "V",         "Paste note at cursor"},
+        {"Piano Roll", "Backspace", "Delete note at cursor"},
+        {"Piano Roll", "Esc",       "Back to Sequencer"},
+
+        // Keyboard Mode -----------------------------------------------------
+        {"Keyboard Mode", "a w s e d f t g y h u j k o l", "Pitch input"},
+        {"Keyboard Mode", "z / x",     "Octave down / up"},
+        {"Keyboard Mode", "Space",     "Release held note"},
+        {"Keyboard Mode", "n",         "Toggle jam (synth-only) mode"},
+        {"Keyboard Mode", "Backspace", "Delete last recorded note"},
+        {"Keyboard Mode", "left/right", "Resize held note"},
+        {"Keyboard Mode", "Enter",     "Open Piano Roll"},
+        {"Keyboard Mode", "Tab",       "Open Synth (param page)"},
+        {"Keyboard Mode", "Esc",       "Back to Sequencer"},
+        {"Keyboard Mode", "S",         "Solo current track"},
+        {"Keyboard Mode", "M",         "Mute current track"},
+        {"Keyboard Mode", "D",         "Clear current track"},
+        {"Keyboard Mode", "Shift+A then D", "Clear all tracks"},
+        {"Keyboard Mode", "1-9",       "Fill row with N hits"},
+
+        // Param Page (Synth) ------------------------------------------------
+        {"Param Page", "o",      "Cycle oscillator type"},
+        {"Param Page", "[ / ]",  "Transpose root pitch down / up"},
+        {"Param Page", "Tab",    "Back to Sequencer"},
+
+        // Song --------------------------------------------------------------
+        {"Song", "left/right",   "Move song cursor"},
+        {"Song", "0-9",          "Type pattern id (1-2 digits)"},
+        {"Song", "Shift+Tab",    "Back to Sequencer"},
+    };
+    return kEntries;
+}
+
+const std::vector<std::string>& help_sections() {
+    static const std::vector<std::string> kSections = {
+        "Global",
+        "Grid",
+        "Piano Roll",
+        "Keyboard Mode",
+        "Param Page",
+        "Song",
+    };
+    return kSections;
+}
+

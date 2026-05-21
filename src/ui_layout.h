@@ -52,3 +52,19 @@ std::vector<StatusItem> status_items_for(NavState ns, bool song_view_focused);
 // to the far right — even at minimum viable width it stays visible.
 std::string compose_status_strip(const std::vector<StatusItem>& items, int width);
 
+// ---- help modal ----------------------------------------------------------
+
+struct HelpEntry {
+    std::string section;       // "Global", "Grid", "Piano Roll", etc.
+    std::string key;           // visible key, e.g. "Shift+Tab"
+    std::string description;   // what it does
+};
+
+// Every keybinding registered by the dispatch handlers, grouped by section.
+// Source of truth for both the help modal rendering and the completeness
+// test.
+const std::vector<HelpEntry>& help_entries();
+
+// Section labels rendered by the help modal, in display order.
+const std::vector<std::string>& help_sections();
+
